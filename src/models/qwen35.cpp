@@ -37,8 +37,8 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const uint32_t stage_start = params.prima_layer_start;
-    const uint32_t stage_end = params.prima_layer_end == 0 ? n_layer : params.prima_layer_end;
+    const uint32_t stage_start = params.potluck_layer_start;
+    const uint32_t stage_end = params.potluck_layer_end == 0 ? n_layer : params.potluck_layer_end;
     GGML_ASSERT(stage_start <= stage_end && stage_end <= (uint32_t) n_layer);
 
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
@@ -146,8 +146,8 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
-    const uint32_t stage_start = cparams.prima_layer_start;
-    const uint32_t stage_end = cparams.prima_layer_end == 0 ? n_layer : cparams.prima_layer_end;
+    const uint32_t stage_start = cparams.potluck_layer_start;
+    const uint32_t stage_end = cparams.potluck_layer_end == 0 ? n_layer : cparams.potluck_layer_end;
     GGML_ASSERT(stage_start <= stage_end && stage_end <= (uint32_t) n_layer);
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());

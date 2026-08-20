@@ -1,15 +1,18 @@
-#include "prima-distributed-transport.h"
+#include "potluck-transport.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <vector>
 
-namespace prima {
+namespace potluck {
 namespace {
 
 constexpr size_t frame_prefix_bytes = sizeof(uint64_t);
@@ -37,6 +40,40 @@ uint64_t decode_u64_le(const uint8_t * data) {
 } // namespace
 
 tcp_channel::tcp_channel(int fd) : fd_(fd) {}
+
+namespace {
+
+int env_timeout_s(const char * name, int dflt) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return dflt;
+    }
+    char * end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    return (end == v || n <= 0) ? dflt : static_cast<int>(n);
+}
+
+} // namespace
+
+int handshake_timeout_s() {
+    return env_timeout_s("POTLUCK_TIMEOUT_HANDSHAKE_S", 60);
+}
+
+int decode_timeout_s() {
+    return env_timeout_s("POTLUCK_TIMEOUT_DECODE_S", 300);
+}
+
+void tcp_channel::set_timeouts(int rcv_seconds, int snd_seconds) {
+    if (fd_ < 0) {
+        return;
+    }
+    struct timeval tv;
+    tv.tv_sec = rcv_seconds;
+    tv.tv_usec = 0;
+    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    tv.tv_sec = snd_seconds;
+    ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
 
 tcp_channel::~tcp_channel() {
     close_socket(fd_);
@@ -121,29 +158,35 @@ bool tcp_channel::receive(message & message, std::string & error) {
 }
 
 tcp_channel tcp_channel::connect_host(const std::string & host, uint16_t port, std::string & error) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        error = socket_error("socket");
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * results = nullptr;
+    const std::string port_text = std::to_string(port);
+    const int lookup = ::getaddrinfo(host.c_str(), port_text.c_str(), &hints, &results);
+    if (lookup != 0) {
+        error = "connect: " + std::string(::gai_strerror(lookup));
         return {};
     }
 
-    sockaddr_in address = {};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1) {
-        error = "connect: host must be an IPv4 address";
+    std::string last_error = "connect: no addresses resolved";
+    for (addrinfo * result = results; result != nullptr; result = result->ai_next) {
+        const int fd = ::socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+        if (fd < 0) {
+            last_error = socket_error("socket");
+            continue;
+        }
+        if (::connect(fd, result->ai_addr, result->ai_addrlen) == 0) {
+            ::freeaddrinfo(results);
+            return tcp_channel(fd);
+        }
+        last_error = socket_error("connect");
         int owned_fd = fd;
         close_socket(owned_fd);
-        return {};
     }
-
-    if (::connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0) {
-        error = socket_error("connect");
-        int owned_fd = fd;
-        close_socket(owned_fd);
-        return {};
-    }
-    return tcp_channel(fd);
+    ::freeaddrinfo(results);
+    error = last_error;
+    return {};
 }
 
 tcp_channel tcp_channel::connect_loopback(uint16_t port, std::string & error) {
@@ -209,9 +252,21 @@ tcp_listener tcp_listener::bind_host(const std::string & host, uint16_t port) {
     }
     return tcp_listener(fd, ntohs(address.sin_port));
 }
-
 tcp_listener tcp_listener::bind_loopback(uint16_t port) {
     return bind_host("127.0.0.1", port);
+}
+tcp_channel tcp_listener::accept(std::string & error) {
+    const int peer = ::accept(fd_, nullptr, nullptr);
+    if (peer < 0) {
+        error = socket_error("accept");
+        return {};
+    }
+    tcp_channel channel(peer);
+    // The accepted side of the handshake: the peer must deliver its config
+    // (or connect and request one) within the handshake window or the worker
+    // surfaces an error instead of parking silently.
+    channel.set_timeouts(handshake_timeout_s(), handshake_timeout_s());
+    return channel;
 }
 
 bool tcp_listener::valid() const {
@@ -222,14 +277,6 @@ uint16_t tcp_listener::port() const {
     return port_;
 }
 
-tcp_channel tcp_listener::accept(std::string & error) {
-    const int peer = ::accept(fd_, nullptr, nullptr);
-    if (peer < 0) {
-        error = socket_error("accept");
-        return {};
-    }
-    return tcp_channel(peer);
-}
 
 tcp_channel connect_retry(const std::string & host, uint16_t port, int attempts,
                           int delay_ms, std::string & error) {
@@ -248,4 +295,4 @@ tcp_channel connect_retry(const std::string & host, uint16_t port, int attempts,
     return {};
 }
 
-} // namespace prima
+} // namespace potluck

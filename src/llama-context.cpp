@@ -140,8 +140,8 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
-    cparams.prima_layer_start = params.prima_layer_start;
-    cparams.prima_layer_end   = params.prima_layer_end;
+    cparams.potluck_layer_start = params.potluck_layer_start;
+    cparams.potluck_layer_end   = params.potluck_layer_end;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2042,7 +2042,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
 
-    bool has_logits     = true;
+    // A potluck stage that ends before the final layer has no LM head, so no
+    // logits rows exist even though the embeddings context marks every entry
+    // as an output (which forces n_outputs_max to cover the whole batch).
+    // Skipping the logits buffer keeps the output buffer at n_embd_out rows
+    // per entry instead of n_vocab floats per entry (~508 MiB at n_batch=512).
+    bool has_logits     = !(cparams.potluck_layer_end != 0 &&
+                            cparams.potluck_layer_end < hparams.n_layer());
     bool has_embd       = cparams.embeddings;
     bool has_embd_nextn = cparams.embeddings_nextn;
 
@@ -3551,8 +3557,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
-        /*.prima_layer_start          =*/ 0,
-        /*.prima_layer_end            =*/ 0,
+        /*.potluck_layer_start          =*/ 0,
+        /*.potluck_layer_end            =*/ 0,
     };
 
     return result;

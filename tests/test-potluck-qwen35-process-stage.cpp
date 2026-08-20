@@ -1,5 +1,5 @@
 #include "llama.h"
-#include "prima-distributed-transport.h"
+#include "potluck-transport.h"
 
 #include <algorithm>
 #include <cassert>
@@ -77,15 +77,15 @@ llama_context_params context_params(uint32_t start, uint32_t end, bool embedding
     params.n_batch = 1;
     params.n_ubatch = 1;
     params.embeddings = embeddings;
-    params.prima_layer_start = start;
-    params.prima_layer_end = end;
+    params.potluck_layer_start = start;
+    params.potluck_layer_end = end;
     return params;
 }
 
 llama_model_params model_params(uint32_t start, uint32_t end) {
     llama_model_params params = llama_model_default_params();
-    params.prima_layer_start = start;
-    params.prima_layer_end = end;
+    params.potluck_layer_start = start;
+    params.potluck_layer_end = end;
     return params;
 }
 
@@ -101,9 +101,9 @@ int run_worker(const options & opts) {
     constexpr uint32_t split = 12;
     // Bind before loading the split: the Metal kernel compile takes minutes on
     // some machines, and the head's connect-retry budget is only 60 s. This
-    // mirrors the real prima-worker, which binds its listener before model
+    // mirrors the real potluck-worker, which binds its listener before model
     // init so the head can connect during setup and its commands queue up.
-    prima::tcp_listener listener = prima::tcp_listener::bind_host(opts.host, opts.port);
+    potluck::tcp_listener listener = potluck::tcp_listener::bind_host(opts.host, opts.port);
     CHECK(listener.valid());
     std::printf("LISTENING %u\n", listener.port());
     std::fflush(stdout);
@@ -117,17 +117,17 @@ int run_worker(const options & opts) {
     // (and other garbage traffic) may hit this port; discard those connections
     // and keep listening until the real head connects with a valid frame.
     std::string error;
-    prima::tcp_channel peer;
+    potluck::tcp_channel peer;
     for (;;) {
         peer = listener.accept(error);
         if (!peer.valid()) {
             std::fprintf(stderr, "worker accept failed: %s\n", error.c_str());
             return 1;
         }
-        prima::message incoming;
+        potluck::message incoming;
         if (peer.receive(incoming, error)) {
-            if (incoming.type == prima::message_type::hidden_state &&
-                incoming.dtype == prima::data_type::f32 &&
+            if (incoming.type == potluck::message_type::hidden_state &&
+                incoming.dtype == potluck::data_type::f32 &&
                 incoming.shape == std::vector<uint64_t>({1, n_embd})) {
                 break;  // real head connection
             }
@@ -136,16 +136,16 @@ int run_worker(const options & opts) {
         } else {
             std::fprintf(stderr, "worker: discarding connection: %s\n", error.c_str());
         }
-        peer = prima::tcp_channel{};  // close the bogus socket and retry
+        peer = potluck::tcp_channel{};  // close the bogus socket and retry
     }
 
-    prima::message incoming;
+    potluck::message incoming;
     if (!peer.receive(incoming, error)) {
         std::fprintf(stderr, "worker receive failed: %s\n", error.c_str());
         return 1;
     }
-    CHECK(incoming.type == prima::message_type::hidden_state);
-    CHECK(incoming.dtype == prima::data_type::f32);
+    CHECK(incoming.type == potluck::message_type::hidden_state);
+    CHECK(incoming.dtype == potluck::data_type::f32);
     CHECK(incoming.shape == std::vector<uint64_t>({1, n_embd}));
 
     llama_context * context = llama_init_from_model(model, context_params(split, 0, false));
@@ -158,8 +158,8 @@ int run_worker(const options & opts) {
                 return 1;
             }
         }
-        CHECK(incoming.type == prima::message_type::hidden_state);
-        CHECK(incoming.dtype == prima::data_type::f32);
+        CHECK(incoming.type == potluck::message_type::hidden_state);
+        CHECK(incoming.dtype == potluck::data_type::f32);
         CHECK(incoming.sequence == static_cast<uint64_t>(7 + step));
         CHECK(incoming.shape == std::vector<uint64_t>({1, n_embd}));
         set_hidden_batch(batch, incoming.payload, n_embd);
@@ -169,11 +169,11 @@ int run_worker(const options & opts) {
         CHECK(logits != nullptr);
 
         const uint32_t token = static_cast<uint32_t>(argmax(logits, n_vocab));
-        prima::message response;
-        response.type = prima::message_type::token;
+        potluck::message response;
+        response.type = potluck::message_type::token;
         response.rank = 1;
         response.sequence = incoming.sequence;
-        response.dtype = prima::data_type::i32;
+        response.dtype = potluck::data_type::i32;
         response.shape = {1};
         response.payload.resize(sizeof(token));
         std::memcpy(response.payload.data(), &token, sizeof(token));
@@ -200,9 +200,9 @@ int run_head(const options & opts) {
     // the connection for a few seconds instead of failing on the first refused
     // attempt. This is a robustness fix for the two-process launch, not a change
     // to the distributed protocol.
-    prima::tcp_channel client;
+    potluck::tcp_channel client;
     for (int attempt = 0; attempt < 600; ++attempt) {
-        client = prima::tcp_channel::connect_host(opts.host, opts.port, error);
+        client = potluck::tcp_channel::connect_host(opts.host, opts.port, error);
         if (client.valid()) {
             break;
         }
@@ -221,11 +221,11 @@ int run_head(const options & opts) {
     const float * hidden = llama_get_embeddings_ith(first, 0);
     CHECK(hidden != nullptr);
 
-    prima::message request;
-    request.type = prima::message_type::hidden_state;
+    potluck::message request;
+    request.type = potluck::message_type::hidden_state;
     request.rank = 0;
     request.sequence = 7;
-    request.dtype = prima::data_type::f32;
+    request.dtype = potluck::data_type::f32;
     request.shape = {1, n_embd};
     request.payload.resize(sizeof(float) * n_embd);
     std::memcpy(request.payload.data(), hidden, request.payload.size());
@@ -244,9 +244,9 @@ int run_head(const options & opts) {
         }
         CHECK(client.send(request, error));
 
-        prima::message response;
+        potluck::message response;
         CHECK(client.receive(response, error));
-        CHECK(response.type == prima::message_type::token);
+        CHECK(response.type == potluck::message_type::token);
         CHECK(response.sequence == request.sequence);
         CHECK(response.payload.size() == sizeof(uint32_t));
         uint32_t network_token = 0;

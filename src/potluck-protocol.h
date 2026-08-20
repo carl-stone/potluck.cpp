@@ -5,10 +5,10 @@
 #include <string>
 #include <vector>
 
-namespace prima {
+namespace potluck {
 
-constexpr uint32_t protocol_magic = 0x50524d41; // "PRMA"
-constexpr uint16_t protocol_version = 4;
+constexpr uint32_t protocol_magic = 0x50544c4b; // "PTLK"
+constexpr uint16_t protocol_version = 5;
 constexpr size_t max_payload_bytes = 256u * 1024u * 1024u;
 
 enum class message_type : uint16_t {
@@ -58,6 +58,8 @@ struct node_config {
     uint32_t n_workers = 0;
     uint32_t index = 0;            // this worker's stage index in [0, n_workers)
     uint32_t n_ctx = 0;
+    uint32_t n_seq_max = 1;   // context sequences (1 unless the head runs --batch N)
+    uint32_t n_ubatch = 512;   // multi-token internal batches; prompts still cross once
     std::vector<uint32_t> bounds;  // size n_workers+1; worker i owns [bounds[i], bounds[i+1])
     std::vector<node_addr> workers; // the full chain, workers[0] == the far head
     bool tail = false;             // last stage: reports tokens back to the head
@@ -72,6 +74,24 @@ struct node_config {
     // Empty means the default static contiguous-window pipeline.
     std::vector<std::pair<uint32_t, uint32_t>> ring;
 };
+// Per-stage metrics returned by a live benchmark request. The coordinator
+// sends an empty profile_result message; workers aggregate these records while
+// keeping the decode chain alive for subsequent HTTP requests.
+struct worker_bench_metrics {
+    uint32_t index = 0;
+    uint32_t start = 0;
+    uint32_t end = 0;
+    float decode_tok_s = 0.0f;
+    float peak_rss_mb = 0.0f;
+    uint64_t decoded_positions = 0;
+};
+
+bool encode_worker_bench_metrics(const std::vector<worker_bench_metrics> & metrics,
+                                 std::vector<uint8_t> & out);
+bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
+                                 std::vector<worker_bench_metrics> & metrics,
+                                 std::string & error);
+
 
 // Returns an empty vector when the message cannot be encoded safely.
 std::vector<uint8_t> encode_frame(const message & message);
@@ -92,25 +112,27 @@ bool decode_config(const uint8_t * data, size_t size, node_config & config, std:
 // `hidden` must be non-empty. `clear` != 0 tells each stage to reset its KV
 // (llama_kv_cache_clear) before decoding: speculative decoding re-prefills the
 // committed prefix from scratch every round so it is correct even for
-// recurrent/hybrid targets whose state cannot be rolled back by trimming.
-// `trim_to` >= 0 likewise drops KV positions >= trim_to before decoding; pass
-// -1 when it is not needed (dynamic batching only ever advances positions).
+// `n_logits` (0..n) is how many TRAILING entries request logits; only those
+// rows count against n_outputs_max. A batched prefill needs just the last
+// entry (whose argmax is discarded anyway); dynamic-batching rounds need
+// every entry (each is a distinct sequence's next-token prediction).
+// `clear` and `trim_to` are the requested KV reset/trim (`trim_to < 0` when
+// it is not needed (dynamic batching only ever advances positions).
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
                           const std::vector<int32_t> & tokens,
                           const float * hidden, size_t n_embd,
-                          int32_t clear, int32_t trim_to,
+                          int32_t clear, int32_t trim_to, uint32_t n_logits,
                           std::vector<uint8_t> & out);
 
 // Decode a batch payload into tokens (n_embd == 0) or hidden states
-// (n_embd == this stage's embedding width). `clear` and `trim_to` are the
-// requested KV reset/trim (< 0 for trim = none). Returns false on any mismatch.
+// (n_embd == this stage's embedding width). Returns false on any mismatch.
 bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
-                          int32_t & clear, int32_t & trim_to,
+                          int32_t & clear, int32_t & trim_to, uint32_t & n_logits,
                           std::vector<int32_t> & pos,
                           std::vector<int32_t> & seq,
                           std::vector<int32_t> & tokens,
                           std::vector<float> & hidden,
                           std::string & error);
 
-} // namespace prima
+} // namespace potluck

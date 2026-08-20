@@ -1,0 +1,75 @@
+name: potluck.cpp build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'README.md'
+      - 'docs/**'
+      - 'dev/**'
+      - 'scripts/**'
+      - '**/CMakeLists.txt'
+      - '**/*.h'
+      - '**/*.cpp'
+      - 'tests/potluck/**'
+  pull_request:
+    paths:
+      - '.github/workflows/build.yml'
+      - 'README.md'
+      - 'docs/**'
+      - 'dev/**'
+      - 'scripts/**'
+      - '**/CMakeLists.txt'
+      - '**/*.h'
+      - '**/*.cpp'
+      - 'tests/potluck/**'
+
+concurrency:
+  group: potluck-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DLLAMA_BUILD_TESTS=ON
+          -DLLAMA_BUILD_TOOLS=ON
+          -DLLAMA_BUILD_SERVER=ON
+          -DLLAMA_BUILD_EXAMPLES=OFF
+          -DLLAMA_BUILD_APP=OFF
+          -DPOTLUCK_HIGHS=OFF
+          -DGGML_NATIVE=OFF
+
+      - name: Build required binaries
+        run: >-
+          cmake --build build --config Release --parallel
+          --target potluck-head potluck-worker potluck-server potluck-shard llama-cli
+
+      - name: Download 0.8B fixture
+        run: |
+          mkdir -p models
+          curl --fail --location --retry 5 --retry-delay 5 \
+            -o models/Qwen3.5-0.8B-Q4_0.gguf \
+            https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_0.gguf
+
+      - name: Run potluck acceptance suite
+        env:
+          POTLUCK_TIMEOUT_HANDSHAKE_S: 60
+          POTLUCK_TIMEOUT_DECODE_S: 300
+        run: bash tests/potluck/run_all.sh

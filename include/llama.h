@@ -340,9 +340,9 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
 
-        // [EXPERIMENTAL] prima-style static stage range. A zero end means the full model.
-        uint32_t prima_layer_start;
-        uint32_t prima_layer_end;
+        // [EXPERIMENTAL] potluck-style static stage range. A zero end means the full model.
+        uint32_t potluck_layer_start;
+        uint32_t potluck_layer_end;
     };
 
     struct llama_sampler_seq_config {
@@ -413,9 +413,9 @@ extern "C" {
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
 
-        // [EXPERIMENTAL] prima-style static stage range. A zero end means the full model.
-        uint32_t prima_layer_start;
-        uint32_t prima_layer_end;
+        // [EXPERIMENTAL] potluck-style static stage range. A zero end means the full model.
+        uint32_t potluck_layer_start;
+        uint32_t potluck_layer_end;
     };
 
     struct llama_model_tensor_override {

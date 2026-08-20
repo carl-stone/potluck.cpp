@@ -1,5 +1,5 @@
 #include "llama.h"
-#include "prima-distributed-transport.h"
+#include "potluck-transport.h"
 
 #include <algorithm>
 #include <cassert>
@@ -54,15 +54,15 @@ llama_context_params context_params(uint32_t start, uint32_t end, bool embedding
     params.n_batch = 1;
     params.n_ubatch = 1;
     params.embeddings = embeddings;
-    params.prima_layer_start = start;
-    params.prima_layer_end = end;
+    params.potluck_layer_start = start;
+    params.potluck_layer_end = end;
     return params;
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
-    const std::string model_path = argc > 1 ? argv[1] : "/tmp/prima.cpp/models/Qwen3.5-0.8B-Q4_0.gguf";
+    const std::string model_path = argc > 1 ? argv[1] : "/tmp/potluck.cpp/models/Qwen3.5-0.8B-Q4_0.gguf";
 
     llama_backend_init();
     llama_model_params model_params = llama_model_default_params();
@@ -74,19 +74,19 @@ int main(int argc, char ** argv) {
     const llama_token input = llama_vocab_bos(llama_model_get_vocab(model));
     const uint32_t split = llama_model_n_layer(model) / 2;
 
-    prima::tcp_listener listener = prima::tcp_listener::bind_loopback(0);
+    potluck::tcp_listener listener = potluck::tcp_listener::bind_loopback(0);
     CHECK(listener.valid());
 
     int remote_token = -1;
     std::thread stage_thread([&] {
         std::string error;
-        prima::tcp_channel peer = listener.accept(error);
+        potluck::tcp_channel peer = listener.accept(error);
         CHECK(peer.valid());
 
-        prima::message incoming;
+        potluck::message incoming;
         CHECK(peer.receive(incoming, error));
-        CHECK(incoming.type == prima::message_type::hidden_state);
-        CHECK(incoming.dtype == prima::data_type::f32);
+        CHECK(incoming.type == potluck::message_type::hidden_state);
+        CHECK(incoming.dtype == potluck::data_type::f32);
         CHECK(incoming.shape == std::vector<uint64_t>({1, n_embd}));
 
         llama_context * second = llama_init_from_model(model, context_params(split, 0, false));
@@ -98,11 +98,11 @@ int main(int argc, char ** argv) {
         CHECK(logits != nullptr);
         remote_token = argmax(logits, n_vocab);
 
-        prima::message response;
-        response.type = prima::message_type::token;
+        potluck::message response;
+        response.type = potluck::message_type::token;
         response.rank = 1;
         response.sequence = incoming.sequence;
-        response.dtype = prima::data_type::i32;
+        response.dtype = potluck::data_type::i32;
         response.shape = {1};
         response.payload.resize(sizeof(uint32_t));
         const uint32_t token = static_cast<uint32_t>(remote_token);
@@ -114,7 +114,7 @@ int main(int argc, char ** argv) {
     });
 
     std::string error;
-    prima::tcp_channel client = prima::tcp_channel::connect_loopback(listener.port(), error);
+    potluck::tcp_channel client = potluck::tcp_channel::connect_loopback(listener.port(), error);
     CHECK(client.valid());
 
     llama_context * first = llama_init_from_model(model, context_params(0, split, true));
@@ -125,19 +125,19 @@ int main(int argc, char ** argv) {
     const float * hidden = llama_get_embeddings_ith(first, 0);
     CHECK(hidden != nullptr);
 
-    prima::message request;
-    request.type = prima::message_type::hidden_state;
+    potluck::message request;
+    request.type = potluck::message_type::hidden_state;
     request.rank = 0;
     request.sequence = 7;
-    request.dtype = prima::data_type::f32;
+    request.dtype = potluck::data_type::f32;
     request.shape = {1, n_embd};
     request.payload.resize(sizeof(float) * n_embd);
     std::memcpy(request.payload.data(), hidden, request.payload.size());
     CHECK(client.send(request, error));
 
-    prima::message response;
+    potluck::message response;
     CHECK(client.receive(response, error));
-    CHECK(response.type == prima::message_type::token);
+    CHECK(response.type == potluck::message_type::token);
     CHECK(response.sequence == request.sequence);
     CHECK(response.payload.size() == sizeof(uint32_t));
     uint32_t network_token = 0;

@@ -1,11 +1,11 @@
 #pragma once
 
-#include "prima-distributed-protocol.h"
+#include "potluck-protocol.h"
 
 #include <cstdint>
 #include <string>
 
-namespace prima {
+namespace potluck {
 
 class tcp_channel {
 public:
@@ -21,6 +21,10 @@ public:
     bool valid() const;
     bool send(const message & message, std::string & error);
     bool receive(message & message, std::string & error);
+
+    // SO_RCVTIMEO / SO_SNDTIMEO in seconds. A stalled peer then surfaces as a
+    // read/write error instead of a forever-blocking recv()/send().
+    void set_timeouts(int rcv_seconds, int snd_seconds);
 
     static tcp_channel connect_host(const std::string & host, uint16_t port, std::string & error);
     static tcp_channel connect_loopback(uint16_t port, std::string & error);
@@ -55,10 +59,17 @@ private:
     tcp_listener(int fd, uint16_t port);
 };
 
+
+// Socket timeouts in seconds. Handshake covers config exchange (workers may
+// still be loading weights); decode covers per-token round trips on slow
+// hardware. Overridable: POTLUCK_TIMEOUT_HANDSHAKE_S / POTLUCK_TIMEOUT_DECODE_S.
+int handshake_timeout_s();
+int decode_timeout_s();
+
 // connect_host that retries for up to `attempts` times, sleeping `delay_ms`
 // between failures. Neighbor stages in a chain start asynchronously (each does
 // its own Metal/backend init), so peers may not be listening yet when we try.
 tcp_channel connect_retry(const std::string & host, uint16_t port, int attempts,
                           int delay_ms, std::string & error);
 
-} // namespace prima
+} // namespace potluck

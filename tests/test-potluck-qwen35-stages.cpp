@@ -52,22 +52,22 @@ llama_context_params context_params(uint32_t start, uint32_t end, bool embedding
     params.n_batch = 1;
     params.n_ubatch = 1;
     params.embeddings = embeddings;
-    params.prima_layer_start = start;
-    params.prima_layer_end = end;
+    params.potluck_layer_start = start;
+    params.potluck_layer_end = end;
     return params;
 }
 
 llama_model_params model_params(uint32_t start, uint32_t end) {
     llama_model_params params = llama_model_default_params();
-    params.prima_layer_start = start;
-    params.prima_layer_end = end;
+    params.potluck_layer_start = start;
+    params.potluck_layer_end = end;
     return params;
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
-    const std::string model_path = argc > 1 ? argv[1] : "/tmp/prima.cpp/models/Qwen3.5-0.8B-Q4_0.gguf";
+    const std::string model_path = argc > 1 ? argv[1] : "/tmp/potluck.cpp/models/Qwen3.5-0.8B-Q4_0.gguf";
 
     llama_backend_init();
     llama_model_params full_params = model_params(0, 0);

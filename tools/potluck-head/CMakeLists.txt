@@ -1,17 +1,17 @@
-option(PRIMA_HIGHS "Build prima-head with the HiGHS LP scheduler (--lp)" ON)
+option(POTLUCK_HIGHS "Build potluck-head with the HiGHS LP scheduler (--lp)" ON)
 
-add_executable(prima-head
+add_executable(potluck-head
     main.cpp
-    ../../src/prima-distributed-protocol.cpp
-    ../../src/prima-distributed-transport.cpp
+    ../../src/potluck-protocol.cpp
+    ../../src/potluck-transport.cpp
 )
 
-target_include_directories(prima-head PRIVATE
+target_include_directories(potluck-head PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../prima-stage
+    ${PROJECT_SOURCE_DIR}/common
 )
 
-if (PRIMA_HIGHS)
+if (POTLUCK_HIGHS)
     set(HIGHS_BUILD_TESTS OFF)
     set(HIGHS_BUILD_EXAMPLES OFF)
     set(HIGHS_BUILD_SHARED OFF)
@@ -25,8 +25,8 @@ if (PRIMA_HIGHS)
         # tree. A reverse-check succeeds when the patch is already applied.
         PATCH_COMMAND sh -c "git apply --reverse --check ${CMAKE_CURRENT_SOURCE_DIR}/highs-zstr-cstdint.patch || git apply ${CMAKE_CURRENT_SOURCE_DIR}/highs-zstr-cstdint.patch")
     FetchContent_MakeAvailable(highs)
-    target_compile_definitions(prima-head PRIVATE PRIMA_HIGHS=1)
-    target_link_libraries(prima-head PRIVATE llama highs::highs)
+    target_compile_definitions(potluck-head PRIVATE POTLUCK_HIGHS=1)
+    target_link_libraries(potluck-head PRIVATE llama highs::highs)
 else()
-    target_link_libraries(prima-head PRIVATE llama)
+    target_link_libraries(potluck-head PRIVATE llama)
 endif()

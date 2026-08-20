@@ -1,4 +1,4 @@
-// prima-head: coordinator for a prima-style layer pipeline.
+// potluck-head: coordinator for a potluck-style layer pipeline.
 //
 // Reads a chain of worker nodes from a config file (host:port one per line),
 // automatically tessellates the full model's layers into one contiguous window
@@ -8,24 +8,27 @@
 // harness (the 0.8B fixture fits on one machine); it is not used in the
 // pipeline's data path.
 //
-// Usage: prima-head <model.gguf> <workers_file> [n_predict] [host] [-ngl N]
+// Usage: potluck-head <model.gguf> <workers_file> [n_predict] [host] [-ngl N]
 
-#include "llama.h"
-#include "prima-distributed-transport.h"
-#include "prima_runtime.h"
+#include "llama-ext.h"
+#include "potluck-transport.h"
+#include "potluck_runtime.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <string>
 #include <vector>
+#include <sys/resource.h>
 
-#if defined(PRIMA_HIGHS)
+
+#if defined(POTLUCK_HIGHS)
 #include "Highs.h"
 #endif
 
@@ -35,6 +38,18 @@ void fail(const char * what) {
     std::fprintf(stderr, "head: %s\n", what);
     std::_Exit(1); // skip ggml-metal teardown, which asserts on failure paths
 }
+double peak_rss_mb() {
+    rusage usage = {};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) {
+        return 0.0;
+    }
+#if defined(__APPLE__)
+    return static_cast<double>(usage.ru_maxrss) / (1024.0 * 1024.0);
+#else
+    return static_cast<double>(usage.ru_maxrss) / 1024.0;
+#endif
+}
+
 
 // Builds the identical sampler chain the tail worker builds from the same
 // config. temp <= 0 is greedy; otherwise temp -> (optional top-p) -> seed.
@@ -60,30 +75,48 @@ std::vector<llama_token> run_full(const std::string & model_path,
                                   const std::vector<llama_token> & prompt,
                                   uint32_t n_predict, uint32_t & n_embd,
                                   uint32_t & n_vocab, uint32_t & n_layer,
-                                  int32_t n_gpu_layers,
-                                  float temp, float top_p, uint32_t seed) {
+                                  uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch,
+                                  const std::vector<uint32_t> * gpu_layers,
+                                  bool gpu_head,
+                                  float temp, float top_p, uint32_t seed,
+                                  bool sequential_prefill = false, bool single_thread = false) {
     // The reference runs the full model through the same stage construction as
     // the workers so both share identical numerics (two independently-built
     // llama_contexts of the same model can differ at float-epsilon on Metal,
     // which flips greedy near-ties and makes an exact cross-construction
-    // comparison meaningless).
+    // comparison meaningless). It must also share the chain's n_ctx /
+    // n_seq_max / n_ubatch: a different ubatch changes batched numerics.
     std::string serr;
-    prima::stage_model sm;
-    if (!prima::stage_load(sm, model_path, 0, 0, /*embeddings=*/false, 2048,
-                           serr, /*tail=*/true, n_gpu_layers)) {
+    potluck::stage_model sm;
+    if (!potluck::stage_load(sm, model_path, 0, 0, /*embeddings=*/false, n_ctx, n_seq_max, n_ubatch,
+                           serr, /*tail=*/true, /*n_gpu_layers=*/0, gpu_layers, gpu_head,
+                           single_thread)) {
         fail(("reference stage load failed: " + serr).c_str());
     }
     n_embd = sm.n_embd;
     n_vocab = sm.n_vocab;
     n_layer = sm.n_layer;
-
     llama_sampler * sampler = make_sampler(temp, top_p, seed);
-    for (int i = 0; i < static_cast<int>(prompt.size()); ++i) {
-        if (prima::stage_decode_token(sm, prompt[i], static_cast<uint32_t>(i)) != 0) {
-            fail("full prefill decode failed");
+    if (!prompt.empty()) {
+        if (sequential_prefill) {
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                if (potluck::stage_decode_token(sm, prompt[i], static_cast<uint32_t>(i)) != 0) {
+                    fail("full sequential prefill decode failed");
+                }
+            }
+        } else {
+            std::vector<int32_t> pos(prompt.size());
+            std::vector<int32_t> seq(prompt.size(), 0);
+            std::vector<int32_t> tok(prompt.size());
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                pos[i] = static_cast<int32_t>(i);
+                tok[i] = static_cast<int32_t>(prompt[i]);
+            }
+            if (potluck::stage_decode_tokens_batch(sm, tok.data(), pos.data(), seq.data(),
+                                                   static_cast<uint32_t>(prompt.size()), /*n_logits=*/static_cast<uint32_t>(prompt.size())) != 0) {
+                fail("full batched prefill decode failed");
+            }
         }
-        // Consume one RNG draw per position, matching the chain tail.
-        (void)llama_sampler_sample(sampler, sm.ctx, -1);
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(sm.model);
@@ -94,7 +127,7 @@ std::vector<llama_token> run_full(const std::string & model_path,
     llama_token prev = prompt.back();
     uint32_t pos = static_cast<uint32_t>(prompt.size());
     for (uint32_t step = 0; step < n_predict; ++step) {
-        if (prima::stage_decode_token(sm, prev, pos) != 0) {
+        if (potluck::stage_decode_token(sm, prev, pos) != 0) {
             fail("full generation decode failed");
         }
         const llama_token next = static_cast<llama_token>(llama_sampler_sample(sampler, sm.ctx, -1));
@@ -110,7 +143,7 @@ std::vector<llama_token> run_full(const std::string & model_path,
 }
 
 struct worker_entry {
-    prima::node_addr addr;
+    potluck::node_addr addr;
     uint32_t weight = 1;     // integer capability score (default 1)
     bool has_ram = false;    // optional per-machine RAM budget present
     bool has_vram = false;   // optional per-machine VRAM budget present
@@ -190,7 +223,7 @@ std::vector<worker_entry> read_workers(const std::string & path) {
 // amount of work; the result is a measured per-device capability, independent
 // of the eventual tessellation. Returns speeds[i] for workers[i].
 std::vector<float> profile_workers(const std::vector<worker_entry> & workers,
-                                   uint32_t n_layer) {
+                                   uint32_t n_layer, uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch) {
     const uint32_t n = static_cast<uint32_t>(workers.size());
     std::vector<uint32_t> ub(n + 1, 0);
     for (uint32_t w = 0; w < n; ++w) {
@@ -198,7 +231,7 @@ std::vector<float> profile_workers(const std::vector<worker_entry> & workers,
     }
     ub[n] = n_layer;
 
-    std::vector<prima::node_addr> addrs;
+    std::vector<potluck::node_addr> addrs;
     addrs.reserve(workers.size());
     for (const auto & w : workers) {
         addrs.push_back(w.addr);
@@ -207,30 +240,35 @@ std::vector<float> profile_workers(const std::vector<worker_entry> & workers,
     std::vector<float> speeds(n, 0.0f);
     std::string error;
     for (uint32_t i = 0; i < n; ++i) {
-        prima::tcp_channel ch = prima::connect_retry(workers[i].addr.host, workers[i].addr.port, 300, 100, error);
+        potluck::tcp_channel ch = potluck::connect_retry(workers[i].addr.host, workers[i].addr.port, 300, 100, error);
         if (!ch.valid()) {
             fail("cannot connect to worker for profiling");
         }
-        prima::node_config cfg;
+        potluck::node_config cfg;
         cfg.n_workers = n;
         cfg.index = i;
-        cfg.n_ctx = 2048;
+        cfg.n_ctx = n_ctx;
+        cfg.n_seq_max = n_seq_max;
+        cfg.n_ubatch = n_ubatch;
         cfg.bounds = ub;
         cfg.workers = addrs;
         cfg.tail = false;
         std::vector<uint8_t> payload;
-        if (!prima::encode_config(cfg, payload)) {
+        if (!potluck::encode_config(cfg, payload)) {
             fail("cannot encode profile config");
         }
-        prima::message m;
-        m.type = prima::message_type::node_config;
+        potluck::message m;
+        m.type = potluck::message_type::node_config;
         m.sequence = 0;
         m.payload = std::move(payload);
         if (!ch.send(m, error)) {
             fail("cannot send profile config");
         }
-        prima::message res;
-        if (!ch.receive(res, error) || res.type != prima::message_type::profile_result ||
+        potluck::message res;
+        if (!ch.receive(res, error)) {
+            fail(error.c_str());
+        }
+        if (res.type != potluck::message_type::profile_result ||
             res.payload.size() != sizeof(float)) {
             fail("worker did not return a profile result");
         }
@@ -242,7 +280,27 @@ std::vector<float> profile_workers(const std::vector<worker_entry> & workers,
     return speeds;
 }
 
-#if defined(PRIMA_HIGHS)
+std::vector<potluck::worker_bench_metrics> request_worker_metrics(
+        potluck::tcp_channel & stage0, std::string & error) {
+    potluck::message request;
+    request.type = potluck::message_type::profile_result;
+    if (!stage0.send(request, error)) {
+        fail("cannot request worker benchmark metrics");
+    }
+    potluck::message response;
+    if (!stage0.receive(response, error) ||
+        response.type != potluck::message_type::profile_result) {
+        fail(error.empty() ? "worker benchmark metrics response missing" : error.c_str());
+    }
+    std::vector<potluck::worker_bench_metrics> metrics;
+    if (!potluck::decode_worker_bench_metrics(response.payload.data(), response.payload.size(),
+                                               metrics, error)) {
+        fail(error.c_str());
+    }
+    return metrics;
+}
+
+#if defined(POTLUCK_HIGHS)
 // §5 HiGHS LP allocation. Decide w[m] (layers) and n[m] (GPU-offloaded
 // layers) per worker so the slowest stage's wall time per token is minimized,
 // subject to the workers file's per-machine budgets:
@@ -391,15 +449,16 @@ lp_plan lp_allocate(const std::vector<worker_entry> & workers, uint32_t n_layer,
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
-        fail("usage: prima-head <model.gguf> <workers_file> [n_predict] [host] "
-             "[-p PROMPT] [--temp F] [--top-p F] [--seed N] [--no-parity-check] "
-             "[--gpu-layers K] [--gpu-mem MB] [--profile --out PATH] [--drop-slowest N] "
+        fail("usage: potluck-head <model.gguf> <workers_file> [n_predict] [host] "
+             "[-p PROMPT] [--temp F] [--top-p F] [--seed N] [--parity-check] "
+             "[--ctx N] [--batch N] [--gpu-layers K] [--gpu-mem MB] "
+             "[--profile|--bench --out PATH] [--drop-slowest N] "
              "[--ring W0,W1,..] [--lp] [--stream] [--chat MSG]");
     }
     const std::string model_path = argv[1];
     const std::string workers_file = argv[2];
-    const uint32_t n_predict = argc > 3 ? static_cast<uint32_t>(std::stoi(argv[3])) : 48;
-    const std::string head_host = argc > 4 ? argv[4] : "127.0.0.1";
+    uint32_t n_predict = 48;
+    std::string head_host = "127.0.0.1";
     std::vector<std::string> prompt_texts;
     std::string draft_path; // §11: proposal model for speculative decoding
     uint32_t draft_n = 4;   // §11: draft length per verify round
@@ -409,17 +468,32 @@ int main(int argc, char ** argv) {
     float temp = 0.0f;
     float top_p = 0.0f;
     uint32_t seed = 0;
-    bool no_parity_check = false;
+    uint32_t n_ctx = 4096;   // context length, decided once for the whole cluster
+    uint32_t n_seq_max = 1;  // context sequences; --batch N raises it to N
+    uint32_t n_ubatch = 1; // one-token static chain numerics; batch mode overrides internally
+    bool parity_check = false;
     bool profile_mode = false;
+    bool bench_mode = false;
     bool lp_mode = false; // §5: solve the tessellation with the HiGHS LP
     bool stream_mode = false; // §13: print each generated token as it is produced
     bool chat_mode = false;   // §13: apply the model's chat template before generating
     std::vector<uint32_t> ring_sizes; // --ring W0,W1,..: per-rank piped-ring window sizes
-    uint32_t drop_slowest = 0; // with --profile: drop the N slowest devices
+    std::vector<uint32_t> forced_bounds; // --bounds A,B,...: explicit shard windows
+    uint32_t drop_slowest = 0;
     std::string out_path;
-    for (int i = 5; i < argc; ++i) {
+    int positional = 0;
+    for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-p" || arg == "--prompt") {
+        if (!arg.empty() && arg[0] != '-') {
+            if (positional == 0) {
+                n_predict = static_cast<uint32_t>(std::stoul(arg));
+            } else if (positional == 1) {
+                head_host = arg;
+            } else {
+                fail("too many positional arguments");
+            }
+            ++positional;
+        } else if (arg == "-p" || arg == "--prompt") {
             if (i + 1 >= argc) {
                 fail("missing value for -p/--prompt");
             }
@@ -445,12 +519,20 @@ int main(int argc, char ** argv) {
             // §12: serve this many concurrent one-turn requests through one
             // chain. Each request is one -p prompt; all are decoded together
             // in every round, and each must produce the tokens of its
-            // isolated run.
+            // isolated run. The context is sized for exactly this many
+            // sequences (n_seq_max), not a fixed 64.
             if (i + 1 >= argc) {
                 fail("missing value for --batch");
             }
             const int32_t v = std::stoi(argv[++i]);
             batch_n = static_cast<uint32_t>(v < 1 ? 1 : v);
+            n_seq_max = batch_n;
+        } else if (arg == "--ctx") {
+            if (i + 1 >= argc) {
+                fail("missing value for --ctx");
+            }
+            const int32_t v = std::stoi(argv[++i]);
+            n_ctx = static_cast<uint32_t>(v < 1 ? 4096 : v);
         } else if (arg == "--temp") {
             if (i + 1 >= argc) {
                 fail("missing value for --temp");
@@ -466,13 +548,11 @@ int main(int argc, char ** argv) {
                 fail("missing value for --seed");
             }
             seed = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (arg == "--no-parity-check") {
-            // Sampled generation is not bit-identical to a monolithic
-            // reference (split-graph vs monolith logits differ ~1e-2 and a
-            // temperature/top-p sampler flips near-tie samples), so this mode
-            // does not require the exact token match. It still prints both
-            // streams and the generated text.
-            no_parity_check = true;
+        } else if (arg == "--parity-check") {
+            // Opt-in: load and run a full-model in-process reference and
+            // require the chain to match it token for token. Off by default;
+            // the head must never load the whole model unless asked.
+            parity_check = true;
         } else if (arg == "--gpu-mem") {
             if (i + 1 >= argc) {
                 fail("missing value for --gpu-mem");
@@ -487,6 +567,24 @@ int main(int argc, char ** argv) {
             }
             const int32_t v = std::stoi(argv[++i]);
             gpu_layers_total = static_cast<uint32_t>(v < 0 ? 0 : v);
+        } else if (arg == "--bounds") {
+            if (i + 1 >= argc) {
+                fail("missing value for --bounds");
+            }
+            const std::string spec = argv[++i];
+            size_t at = 0;
+            for (;;) {
+                const size_t comma = spec.find(',', at);
+                const std::string value = spec.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+                if (value.empty()) {
+                    fail("--bounds needs comma-separated integers");
+                }
+                forced_bounds.push_back(static_cast<uint32_t>(std::stoul(value)));
+                if (comma == std::string::npos) {
+                    break;
+                }
+                at = comma + 1;
+            }
         } else if (arg == "--ring") {
             if (i + 1 >= argc) {
                 fail("missing value for --ring");
@@ -519,6 +617,8 @@ int main(int argc, char ** argv) {
             lp_mode = true;
         } else if (arg == "--profile") {
             profile_mode = true;
+        } else if (arg == "--bench") {
+            bench_mode = true;
         } else if (arg == "--stream") {
             // §13: stream the generated tokens to stdout as they are produced
             // (one detokenized piece per token, flushed) instead of printing
@@ -546,7 +646,14 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     // Tokenize each prompt (BOS-prefixed), matching the reference harness.
+    // no_alloc keeps every hparam (n_layer, n_embd, ...) and the vocab +
+    // chat template but allocates only dummy weight buffers and skips all
+    // tensor data I/O, so the head reads just the GGUF metadata section.
+    // (vocab_only skips hparams entirely and breaks n_layer accessors.)
     llama_model_params mparams = llama_model_default_params();
+    mparams.no_alloc      = true;
+    mparams.load_mode     = LLAMA_LOAD_MODE_NONE;
+    mparams.check_tensors = false;
     llama_model * meta = llama_model_load_from_file(model_path.c_str(), mparams);
     if (meta == nullptr) {
         fail("cannot load model for tokenization");
@@ -603,7 +710,7 @@ int main(int argc, char ** argv) {
         }
         const uint32_t n_pl = static_cast<uint32_t>(llama_model_n_layer(meta));
         std::vector<worker_entry> pworkers = read_workers(workers_file);
-        std::vector<float> speeds = profile_workers(pworkers, n_pl);
+        std::vector<float> speeds = profile_workers(pworkers, n_pl, n_ctx, n_seq_max, n_ubatch);
         float mn = *std::min_element(speeds.begin(), speeds.end());
         if (mn <= 0.0f) {
             mn = 1.0f;
@@ -672,25 +779,21 @@ int main(int argc, char ** argv) {
     // directly. The offload count is a model-level boundary: layers [0,K) go
     // to GPU, split across stages by their window, and the monolithic
     // reference offloads the same K so reference and chain share placement.
+    // Bytes-per-layer comes from the GGUF file size on disk: the head's meta
+    // model is no_alloc, so llama_model_size() reports 0.
     const uint32_t n_layer_meta = static_cast<uint32_t>(llama_model_n_layer(meta));
     uint32_t K = std::min<uint32_t>(gpu_layers_total, n_layer_meta);
     if (gpu_mem_mb > 0.0f) {
-        const uint64_t bytes_per_layer = std::max<uint64_t>(1, llama_model_size(meta) / n_layer_meta);
+        const uint64_t bytes_per_layer = std::max<uint64_t>(1, potluck::model_file_bytes(model_path) / n_layer_meta);
         K = static_cast<uint32_t>((static_cast<uint64_t>(gpu_mem_mb * 1024.0f * 1024.0f)) / bytes_per_layer);
         K = std::min(K, n_layer_meta);
     }
-
-    // Full-model reference (not the pipeline data path). §11/§12 skip it:
-    // speculative decoding compares the spec stream against the chain's own
-    // no-spec stream (the test script runs both), and batching compares each
-    // concurrent request against its isolated per-request reference computed
-    // through run_full below.
-    uint32_t n_embd = 0, n_vocab = 0, n_layer = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_vocab = 0;
+    uint32_t n_layer = 0;
     std::vector<llama_token> reference;
-    if (draft_path.empty() && batch_n == 0) {
-        reference = run_full(model_path, prompt, n_predict, n_embd, n_vocab, n_layer,
-                             static_cast<int32_t>(K), temp, top_p, seed);
-    }
+
+
     if (n_embd == 0) {
         n_embd = static_cast<uint32_t>(llama_model_n_embd(meta));
         n_vocab = static_cast<uint32_t>(llama_vocab_n_tokens(llama_model_get_vocab(meta)));
@@ -706,7 +809,7 @@ int main(int argc, char ** argv) {
 
     // §3 piped ring. The model's layers are covered by a set of windows, one
     // per rank per cycle; within a cycle the windows are owned in ring order
-    // (rank 1, 2, .., n-1, 0, mirroring prima's this_layer_is_mine). Each rank
+    // (rank 1, 2, .., n-1, 0, mirroring potluck's this_layer_is_mine). Each rank
     // therefore owns several disjoint windows, and a single token's forward
     // pass hops between ranks' windows multiple times. The coordinator routes
     // every hop (request/response over one channel per worker); the worker
@@ -754,44 +857,59 @@ int main(int argc, char ** argv) {
         std::printf("\n");
 
         // Connect one channel per worker and hand each its window list.
-        std::vector<prima::tcp_channel> channels;
+        std::vector<potluck::tcp_channel> channels;
         channels.reserve(n_workers);
         std::string error;
         for (uint32_t i = 0; i < n_workers; ++i) {
-            prima::tcp_channel ch = prima::connect_retry(workers[i].addr.host, workers[i].addr.port, 300, 100, error);
+            potluck::tcp_channel ch = potluck::connect_retry(workers[i].addr.host, workers[i].addr.port, 300, 100, error);
             if (!ch.valid()) {
                 fail("cannot connect to ring worker");
             }
-            prima::node_config cfg;
+            potluck::node_config cfg;
             cfg.n_workers = n_workers;
+            cfg.n_ctx = n_ctx;
+            cfg.n_seq_max = n_seq_max;
+            cfg.n_ubatch = n_ubatch;
             cfg.index = i;
-            cfg.n_ctx = 2048;
-            cfg.seed = seed;
             cfg.temp = temp;
             cfg.top_p = top_p;
             cfg.bounds.assign(n_workers + 1, 0);
+            cfg.bounds.back() = n_layer;
             for (const auto & w : workers) {
                 cfg.workers.push_back(w.addr);
             }
             cfg.ring = per_rank[i];
             std::vector<uint8_t> payload;
-            if (!prima::encode_config(cfg, payload)) {
+            if (!potluck::encode_config(cfg, payload)) {
                 fail("cannot encode ring config");
             }
-            prima::message m;
-            m.type = prima::message_type::node_config;
+            potluck::message m;
+            m.type = potluck::message_type::node_config;
             m.payload = std::move(payload);
             if (!ch.send(m, error)) {
                 fail("cannot send ring config");
             }
-            prima::message ready;
-            if (!ch.receive(ready, error) || ready.type != prima::message_type::ready) {
+            potluck::message ready;
+            if (!ch.receive(ready, error)) {
+                fail(error.c_str());
+            }
+            if (ready.type != potluck::message_type::ready) {
                 fail("ring worker never became ready");
             }
             channels.push_back(std::move(ch));
         }
         std::printf("head: ring ready (%u workers)\n", n_workers);
         std::fflush(stdout);
+        if (parity_check && draft_path.empty()) {
+            std::vector<uint32_t> ring_gpu_layers;
+            ring_gpu_layers.reserve(K);
+            for (uint32_t layer = 0; layer < K; ++layer) {
+                ring_gpu_layers.push_back(layer);
+            }
+            reference = run_full(model_path, prompt, n_predict, n_embd, n_vocab, n_layer,
+                                n_ctx, n_seq_max, n_ubatch, &ring_gpu_layers,
+                                K == n_layer, temp, top_p, seed, true, false);
+        }
 
         auto drive_position = [&](const uint8_t * input, size_t input_size, bool input_is_token, uint32_t pos,
                                   uint8_t * out, size_t out_size) -> bool {
@@ -799,23 +917,23 @@ int main(int argc, char ** argv) {
             for (size_t wi = 0; wi < route.size(); ++wi) {
                 const ring_win & rw = route[wi];
                 const bool want_token = (wi + 1 == route.size());
-                prima::message req;
-                req.type = (rw.start == 0) ? prima::message_type::token : prima::message_type::hidden_state;
+                potluck::message req;
+                req.type = (rw.start == 0) ? potluck::message_type::token : potluck::message_type::hidden_state;
                 req.flags = route_local[wi] | (want_token ? 0x10000u : 0u);
                 req.sequence = pos;
                 req.payload = std::move(in);
                 if (!channels[rw.owner].send(req, error)) {
                     return false;
                 }
-                prima::message res;
+                potluck::message res;
                 if (!channels[rw.owner].receive(res, error)) {
                     return false;
                 }
                 const bool res_token = (rw.end == n_layer);
-                if (res_token && res.type != prima::message_type::token) {
+                if (res_token && res.type != potluck::message_type::token) {
                     return false;
                 }
-                if (!res_token && res.type != prima::message_type::hidden_state) {
+                if (!res_token && res.type != potluck::message_type::hidden_state) {
                     return false;
                 }
                 in = std::move(res.payload);
@@ -827,10 +945,10 @@ int main(int argc, char ** argv) {
             return true;
         };
 
-        // Prefill: route each prompt position through the whole ring. The
-        // ceiling window samples (and discards) each position, keeping the RNG
-        // in lock-step with the reference's prefill draws.
-        for (int i = 0; i < static_cast<int>(prompt.size()); ++i) {
+
+        // Prefill: ring routing is a per-position pipe. Batched prefill does
+        // not apply because each position must cross every window in order.
+        for (size_t i = 0; i < prompt.size(); ++i) {
             uint32_t tok = static_cast<uint32_t>(prompt[i]);
             uint8_t out[sizeof(uint32_t)];
             if (!drive_position(reinterpret_cast<uint8_t *>(&tok), sizeof(tok), true,
@@ -874,7 +992,7 @@ int main(int argc, char ** argv) {
         if (match) {
             std::printf("RING PASSED: %zu windows across %u workers, %zu generated tokens match full model\n",
                         route.size(), n_workers, chain_tokens.size());
-        } else if (no_parity_check) {
+        } else if (!parity_check) {
             std::printf("RING RUN: chain differs from monolithic reference (expected when sampling); "
                         "%zu generated tokens, all in-vocab\n", chain_tokens.size());
         } else {
@@ -892,18 +1010,29 @@ int main(int argc, char ** argv) {
     // With --lp (§5) a HiGHS LP solves the allocation instead: minimize the
     // slowest stage's wall time per token subject to the per-machine RAM/VRAM
     // budgets in the workers file.
-#if defined(PRIMA_HIGHS)
-    const double layer_bytes = static_cast<double>(std::max<uint64_t>(1, llama_model_size(meta) / n_layer_meta));
+#if defined(POTLUCK_HIGHS)
+    const double layer_bytes = static_cast<double>(std::max<uint64_t>(1, potluck::model_file_bytes(model_path) / n_layer_meta));
     const double kv_bytes =
         2.0 * static_cast<double>(llama_model_n_head_kv(meta)) *
         (llama_model_n_head(meta) > 0 ? static_cast<double>(llama_model_n_embd(meta)) / llama_model_n_head(meta) : 0.0) *
-        2048 * 4.0; // f32 KV estimate: 2 arrays x kv-heads x head-dim x n_ctx x 4B
+        static_cast<double>(n_ctx) * 4.0; // f32 KV estimate: 2 arrays x kv-heads x head-dim x n_ctx x 4B
 #endif
     std::vector<uint32_t> bounds(n_workers + 1);
     bounds[0] = 0;
     std::vector<int32_t> lp_ngl; // §5 deterministic per-worker offload caps
-    if (lp_mode) {
-#if defined(PRIMA_HIGHS)
+    if (!forced_bounds.empty()) {
+        if (lp_mode || forced_bounds.size() != n_workers + 1 ||
+            forced_bounds.front() != 0 || forced_bounds.back() != n_layer) {
+            fail("--bounds must contain n_workers+1 strictly increasing values from 0 to n_layer and cannot be combined with --lp");
+        }
+        for (size_t i = 1; i < forced_bounds.size(); ++i) {
+            if (forced_bounds[i] <= forced_bounds[i - 1]) {
+                fail("--bounds values must be strictly increasing");
+            }
+        }
+        bounds = forced_bounds;
+    } else if (lp_mode) {
+#if defined(POTLUCK_HIGHS)
         lp_plan plan = lp_allocate(workers, n_layer, layer_bytes, kv_bytes);
         if (!plan.feasible) {
             fail("LP allocation infeasible: the per-machine RAM/VRAM budgets cannot hold the model; "
@@ -938,7 +1067,7 @@ int main(int argc, char ** argv) {
         std::printf("] makespan=%.1f\n", plan.makespan);
         std::fflush(stdout);
 #else
-        fail("--lp requires a HiGHS build (reconfigure with -DPRIMA_HIGHS=ON)");
+        fail("--lp requires a HiGHS build (reconfigure with -DPOTLUCK_HIGHS=ON)");
 #endif
     } else {
         uint64_t total_weight = 0;
@@ -959,20 +1088,22 @@ int main(int argc, char ** argv) {
     }
 
     // Bind the result listener the tail stage will connect back to.
-    prima::tcp_listener result_listener = prima::tcp_listener::bind_host(head_host, 0);
+    potluck::tcp_listener result_listener = potluck::tcp_listener::bind_host(head_host, 0);
     if (!result_listener.valid()) {
         fail("cannot bind result listener");
     }
 
-    prima::node_config config;
+    potluck::node_config config;
     config.n_workers = n_workers;
     config.index = 0;
-    config.n_ctx = 2048;
+    config.n_ctx = n_ctx;
+    config.n_seq_max = n_seq_max;
+    config.n_ubatch = n_ubatch;
     config.seed = seed;
     config.temp = temp;
     config.top_p = top_p;
     config.bounds = bounds;
-    std::vector<prima::node_addr> worker_addrs;
+    std::vector<potluck::node_addr> worker_addrs;
     worker_addrs.reserve(workers.size());
     for (const worker_entry & w : workers) {
         worker_addrs.push_back(w.addr);
@@ -996,6 +1127,27 @@ int main(int argc, char ** argv) {
         const int64_t clamped = off < 0 ? 0 : (off > static_cast<int64_t>(win) ? static_cast<int64_t>(win) : off);
         config.ngl[w] = static_cast<int32_t>(clamped);
     }
+    // Build the exact layer map used by the workers for the in-process
+    // reference. A plain n_gpu_layers count cannot represent LP placement
+    // when a later window is CPU-only, and it would also put the LM head on
+    // the wrong device. Match each block tensor and the tail head explicitly.
+    std::vector<uint32_t> reference_gpu_layers;
+    bool reference_gpu_head = false;
+    for (uint32_t w = 0; w < n_workers; ++w) {
+        const uint32_t off = config.ngl[w] > 0 ? static_cast<uint32_t>(config.ngl[w]) : 0;
+        for (uint32_t layer = bounds[w]; layer < bounds[w] + off; ++layer) {
+            reference_gpu_layers.push_back(layer);
+        }
+        if (w + 1 == n_workers && off > 0) {
+            reference_gpu_head = true;
+        }
+    }
+    if (parity_check && draft_path.empty() && batch_n == 0) {
+        reference = run_full(model_path, prompt, n_predict, n_embd, n_vocab, n_layer,
+                             n_ctx, n_seq_max, n_ubatch, &reference_gpu_layers,
+                             reference_gpu_head, temp, top_p, seed,
+                             std::getenv("POTLUCK_SEQ_PREFILL") != nullptr, false);
+    }
     config.tail = false;
     config.head_link.host = head_host;
     config.head_link.port = result_listener.port();
@@ -1015,39 +1167,53 @@ int main(int argc, char ** argv) {
 
     // Connect to stage 0 and hand it the whole chain schedule.
     std::string error;
-    prima::tcp_channel stage0 = prima::connect_retry(workers[0].addr.host, workers[0].addr.port, 600, 100, error);
+    potluck::tcp_channel stage0 = potluck::connect_retry(workers[0].addr.host, workers[0].addr.port, 600, 100, error);
     if (!stage0.valid()) {
         fail("cannot connect to worker 0");
     }
+    stage0.set_timeouts(potluck::handshake_timeout_s(), potluck::handshake_timeout_s());
     std::vector<uint8_t> config_payload;
-    if (!prima::encode_config(config, config_payload)) {
+    if (!potluck::encode_config(config, config_payload)) {
         fail("cannot encode global config");
     }
-    prima::message cfg;
-    cfg.type = prima::message_type::node_config;
+    potluck::message cfg;
+    cfg.type = potluck::message_type::node_config;
     cfg.payload = std::move(config_payload);
     if (!stage0.send(cfg, error)) {
         fail("cannot send config to worker 0");
     }
 
-    // Accept the tail's back-link and wait for chain-wide readiness.
-    prima::tcp_channel result = result_listener.accept(error);
+    // Wait for stage 0 to report chain-wide readiness before accepting the
+    // result back-link. Every worker propagates readiness only after its
+    // downstream peer is wired, so this receive has the handshake timeout and
+    // cannot park forever when a downstream worker rejects its shard.
+    potluck::message ready;
+    if (!stage0.receive(ready, error)) {
+        fail(error.c_str());
+    }
+    if (ready.type != potluck::message_type::ready) {
+        fail("chain never became ready");
+    }
+    potluck::tcp_channel result = result_listener.accept(error);
     if (!result.valid()) {
         fail("tail never connected back");
-    }
-    prima::message ready;
-    if (!stage0.receive(ready, error) || ready.type != prima::message_type::ready) {
-        fail("chain never became ready");
     }
     std::printf("head: chain ready\n");
     std::fflush(stdout);
 
+    // Handshake done: switch both chain channels to decode windows.
+    stage0.set_timeouts(potluck::decode_timeout_s(), potluck::decode_timeout_s());
+    result.set_timeouts(potluck::decode_timeout_s(), potluck::decode_timeout_s());
+
     // Drive the chain: tokens (stage 0) in, predicted token (tail) out.
+    double prefill_seconds = 0.0;
+    double decode_seconds = 0.0;
+    uint64_t coordinator_payload_bytes = 0;
     auto drive = [&](llama_token token, uint32_t pos) -> llama_token {
-        prima::message in;
-        in.type = prima::message_type::token;
+        potluck::message in;
+        in.type = potluck::message_type::token;
         in.sequence = pos;
-        in.dtype = prima::data_type::i32;
+        in.dtype = potluck::data_type::i32;
         in.shape = {1};
         uint32_t raw = static_cast<uint32_t>(token);
         in.payload.resize(sizeof(raw));
@@ -1055,30 +1221,19 @@ int main(int argc, char ** argv) {
         if (!stage0.send(in, error)) {
             fail("cannot send token to stage 0");
         }
-        prima::message out;
+        potluck::message out;
         if (!result.receive(out, error)) {
-            fail("result channel closed");
+            fail(error.c_str());
         }
-        if (out.type != prima::message_type::token || out.payload.size() != sizeof(uint32_t)) {
+        if (out.type != potluck::message_type::token || out.payload.size() != sizeof(uint32_t)) {
             fail("unexpected result message");
         }
+        coordinator_payload_bytes += in.payload.size() + out.payload.size();
         uint32_t next = 0;
         std::memcpy(&next, out.payload.data(), sizeof(next));
         return static_cast<llama_token>(next);
     };
 
-    // Prefill (single-request path): every stage advances its state for each
-    // prompt position. §12 does its own (batched) prefill; §11 drives the
-    // chain sequentially too, because verification is done draft-by-draft
-    // against the live chain (see the --draft branch below).
-    // The chain drives the prompt one token at a time in the single-request
-    // path; §11 needs this state so its verification runs against the same
-    // context the plain path uses.
-    if (batch_n == 0) {
-        for (int i = 0; i < static_cast<int>(prompt.size()); ++i) {
-            (void)drive(prompt[i], static_cast<uint32_t>(i));
-        }
-    }
 
     // §11/§12 batched drive: one round decodes many (pos, seq, token) entries
     // in a single pass per stage; the tail returns the target argmax for every
@@ -1086,28 +1241,31 @@ int main(int argc, char ** argv) {
     auto drive_batch = [&](const std::vector<int32_t> & pos,
                            const std::vector<int32_t> & seq,
                            const std::vector<int32_t> & tok,
-                           int32_t clear, int32_t trim_to) -> std::vector<int32_t> {
-        prima::message in;
-        in.type = prima::message_type::batch_decode;
+                           int32_t clear, int32_t trim_to, uint32_t n_logits) -> std::vector<int32_t> {
+        potluck::message in;
+        in.type = potluck::message_type::batch_decode;
         in.sequence = pos.empty() ? 0 : static_cast<uint64_t>(pos.back());
-        if (!prima::encode_batch_payload(pos, seq, tok, nullptr, 0, clear, trim_to, in.payload)) {
+        if (!potluck::encode_batch_payload(pos, seq, tok, nullptr, 0, clear, trim_to, n_logits, in.payload)) {
             fail("cannot encode batch request");
         }
         if (!stage0.send(in, error)) {
             fail("cannot send batch to stage 0");
         }
-        prima::message out;
+        potluck::message out;
         if (!result.receive(out, error)) {
-            fail("batch result channel closed");
+            fail(error.c_str());
         }
-        if (out.type != prima::message_type::batch_result) {
+        coordinator_payload_bytes += in.payload.size() + out.payload.size();
+        if (out.type != potluck::message_type::batch_result) {
             fail("unexpected batch result");
         }
         std::vector<int32_t> rpos, rseq, rtok;
         std::vector<float> rhidden;
         int32_t clear_ignored = 0, trim_ignored = -1;
-        if (!prima::decode_batch_payload(out.payload.data(), out.payload.size(), 0,
-                                         clear_ignored, trim_ignored, rpos, rseq, rtok, rhidden, error)) {
+        uint32_t n_logits_ignored = 0;
+        if (!potluck::decode_batch_payload(out.payload.data(), out.payload.size(), 0,
+                                         clear_ignored, trim_ignored, n_logits_ignored,
+                                         rpos, rseq, rtok, rhidden, error)) {
             fail("cannot decode batch result");
         }
         if (rpos.size() != pos.size() || rtok.size() != pos.size()) {
@@ -1115,6 +1273,30 @@ int main(int argc, char ** argv) {
         }
         return rtok;
     };
+
+    // §5 batched prefill (single-request path): the whole prompt goes down
+    // the chain as one batch_decode message — one llama_decode per stage.
+    const auto prefill_start = std::chrono::steady_clock::now();
+    if (batch_n == 0) {
+        if (!prompt.empty()) {
+            if (std::getenv("POTLUCK_SEQ_PREFILL") != nullptr) {
+                for (size_t i = 0; i < prompt.size(); ++i) {
+                    (void) drive(prompt[i], static_cast<uint32_t>(i));
+                }
+            } else {
+                std::vector<int32_t> pos(prompt.size());
+                std::vector<int32_t> seq(prompt.size(), 0);
+                std::vector<int32_t> tok(prompt.size());
+                for (size_t i = 0; i < prompt.size(); ++i) {
+                    pos[i] = static_cast<int32_t>(i);
+                    tok[i] = static_cast<int32_t>(prompt[i]);
+                }
+                (void) drive_batch(pos, seq, tok, /*clear=*/1, /*trim_to=*/-1, /*n_logits=*/1);
+            }
+        }
+    }
+    prefill_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - prefill_start).count();
 
     const llama_token eos_ = llama_vocab_eos(vocab);
 
@@ -1141,7 +1323,8 @@ int main(int argc, char ** argv) {
             convs[c].prompt = prompts[c];
             uint32_t fe = 0, fv = 0, fl = 0;
             convs[c].ref = run_full(model_path, prompts[c], n_predict, fe, fv, fl,
-                                    static_cast<int32_t>(K), 0.0f, 1.0f, seed);
+                                    n_ctx, n_seq_max, n_ubatch, &reference_gpu_layers,
+                                    reference_gpu_head, 0.0f, 1.0f, seed);
         }
         // Preload the prompts one position at a time, one entry per request
         // that has a token at that position. Each request's state then
@@ -1163,7 +1346,7 @@ int main(int argc, char ** argv) {
                     btok.push_back(static_cast<int32_t>(convs[c].prompt[p]));
                 }
             }
-            (void)drive_batch(bpos, bseq, btok, 0, -1);
+            (void)drive_batch(bpos, bseq, btok, 0, -1, static_cast<uint32_t>(bpos.size()));
         }
 
         std::vector<llama_token> prev(n_req);
@@ -1186,7 +1369,8 @@ int main(int argc, char ** argv) {
                 bseq.push_back(static_cast<int32_t>(c));
                 btok.push_back(static_cast<int32_t>(prev[c]));
             }
-            const std::vector<int32_t> results = drive_batch(bpos, bseq, btok, 0, -1);
+            const std::vector<int32_t> results = drive_batch(bpos, bseq, btok, 0, -1,
+                                                             static_cast<uint32_t>(bpos.size()));
             for (uint32_t c = 0; c < n_req; ++c) {
                 if (done[c]) {
                     continue;
@@ -1244,11 +1428,11 @@ int main(int argc, char ** argv) {
             fail("--draft model load failed");
         }
         llama_context_params dcpx = llama_context_default_params();
-        dcpx.n_ctx = 4096;
+        dcpx.n_ctx = n_ctx;
         dcpx.n_batch = 1;
         dcpx.n_ubatch = 1;
-        dcpx.n_seq_max = 64;
-        dcpx.n_outputs_max = 64;
+        dcpx.n_seq_max = n_seq_max;
+        dcpx.n_outputs_max = n_seq_max;
         llama_context * dctx = llama_init_from_model(dm, dcpx);
         if (dctx == nullptr) {
             fail("--draft context init failed");
@@ -1300,7 +1484,7 @@ int main(int argc, char ** argv) {
                     fail("draft produced no logits");
                 }
                 const uint32_t dv = std::min<uint32_t>(n_vocab_dft, n_vocab);
-                const llama_token tok = static_cast<llama_token>(prima::argmax_token(dlogits, dv));
+                const llama_token tok = static_cast<llama_token>(potluck::argmax_token(dlogits, dv));
                 drafts.push_back(tok);
                 if (tok == eos_) {
                     break;
@@ -1362,6 +1546,7 @@ int main(int argc, char ** argv) {
     }
     llama_token prev = prompt.back();
     uint32_t pos = static_cast<uint32_t>(prompt.size());
+    const auto decode_start = std::chrono::steady_clock::now();
     for (uint32_t step = 0; step < n_predict; ++step) {
         const llama_token next = drive(prev, pos);
         chain_tokens.push_back(next);
@@ -1380,8 +1565,56 @@ int main(int argc, char ** argv) {
         prev = next;
         ++pos;
     }
+    decode_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - decode_start).count();
     if (stream_mode) {
         std::printf("\n");
+        std::fflush(stdout);
+    }
+
+    if (bench_mode) {
+        const double prefill_tps = prefill_seconds > 0.0
+            ? prompt.size() / prefill_seconds : 0.0;
+        const double decode_tps = decode_seconds > 0.0
+            ? chain_tokens.size() / decode_seconds : 0.0;
+        const double total_seconds = prefill_seconds + decode_seconds;
+        const double aggregate_tps = total_seconds > 0.0
+            ? chain_tokens.size() / total_seconds : 0.0;
+        const double bytes_per_token = chain_tokens.empty()
+            ? 0.0 : static_cast<double>(coordinator_payload_bytes) / chain_tokens.size();
+        std::string metrics_error;
+        const std::vector<potluck::worker_bench_metrics> metrics =
+            request_worker_metrics(stage0, metrics_error);
+        if (metrics.size() != workers.size()) {
+            fail("worker benchmark metrics count mismatch");
+        }
+        std::vector<float> worker_speed(workers.size(), 0.0f);
+        std::vector<float> worker_rss(workers.size(), 0.0f);
+        for (const auto & metric : metrics) {
+            if (metric.index >= workers.size()) {
+                fail("worker benchmark metrics index out of range");
+            }
+            worker_speed[metric.index] = metric.decode_tok_s;
+            worker_rss[metric.index] = metric.peak_rss_mb;
+        }
+        const float max_worker_rss = worker_rss.empty()
+            ? 0.0f : *std::max_element(worker_rss.begin(), worker_rss.end());
+        const uint64_t model_bytes = potluck::model_file_bytes(model_path);
+        std::printf("bench worker host window       weight-bytes gpu-layers decode-tok/s peak-rss-mb\n");
+        for (size_t i = 0; i < workers.size(); ++i) {
+            const uint64_t bytes = model_bytes * (bounds[i + 1] - bounds[i]) /
+                std::max<uint32_t>(1, n_layer);
+            std::printf("bench %6zu %-15s [%u,%u) %12llu %10d %12.2f %11.1f\n", i,
+                        workers[i].addr.host.c_str(), bounds[i], bounds[i + 1],
+                        static_cast<unsigned long long>(bytes), config.ngl[i],
+                        worker_speed[i], worker_rss[i]);
+        }
+        std::printf("bench cluster prefill-tok/s %.2f decode-tok/s %.2f aggregate-tok/s %.2f "
+                    "ms/token %.2f wire-bytes/token %.1f coordinator-peak-rss-mb %.1f "
+                    "worker-peak-rss-mb-max %.1f\n",
+                    prefill_tps, decode_tps, aggregate_tps,
+                    aggregate_tps > 0.0 ? 1000.0 / aggregate_tps : 0.0,
+                    bytes_per_token, peak_rss_mb(), max_worker_rss);
         std::fflush(stdout);
     }
 
@@ -1398,7 +1631,7 @@ int main(int argc, char ** argv) {
 
 
     // Detokenize and render the chain's generated text (matching the old
-    // prima-stage behavior). No special tokens; retry with a bigger buffer if
+    // potluck-stage behavior). No special tokens; retry with a bigger buffer if
     // the first estimate was too small.
     {
         std::vector<char> buf(1024);
@@ -1425,8 +1658,8 @@ int main(int argc, char ** argv) {
     if (match) {
         std::printf("CHAIN PASSED: %u workers, split %u->%u, %zu generated tokens match full model\n",
                     n_workers, bounds[0], bounds[n_workers], chain_tokens.size());
-    } else if (no_parity_check) {
-        std::printf("SAMPLER RUN: chain differs from monolithic reference (expected when sampling); "
+    } else if (!parity_check) {
+        std::printf("CHAIN RUN: no --parity-check, so no full-model reference was loaded; "
                     "%zu generated tokens, all in-vocab\n", chain_tokens.size());
     } else {
         std::fprintf(stderr, "head: MISMATCH: chain differs from full model\n");

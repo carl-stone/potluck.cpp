@@ -154,7 +154,7 @@ public:
     const int64_t n_embd = 0;
 };
 
-// Input used by a prima-style intermediate stage. It intentionally owns only
+// Input used by a potluck-style intermediate stage. It intentionally owns only
 // the hidden-state tensor; unlike llm_graph_input_embd_h it has no unused
 // token-embedding input that the scheduler would need to allocate.
 class llm_graph_input_hidden : public llm_graph_input_i {
@@ -857,8 +857,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
-            cparams.prima_layer_start      == other.cparams.prima_layer_start      &&
-            cparams.prima_layer_end        == other.cparams.prima_layer_end        &&
+            cparams.potluck_layer_start      == other.cparams.potluck_layer_start      &&
+            cparams.potluck_layer_end        == other.cparams.potluck_layer_end        &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1299,6 +1299,8 @@ struct llm_graph_context {
                uint32_t   rs_size,
                 int32_t   rs_zero,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    bool has_recr_in_window() const;
 
     llm_graph_input_rs * build_rs_inp() const;
 

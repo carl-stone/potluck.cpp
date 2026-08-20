@@ -1,9 +1,9 @@
-#include "prima-distributed-protocol.h"
+#include "potluck-protocol.h"
 
 #include <cstring>
 #include <limits>
 
-namespace prima {
+namespace potluck {
 namespace {
 
 constexpr size_t frame_prefix_bytes = sizeof(uint64_t);
@@ -164,7 +164,9 @@ bool decode_frame(const uint8_t * data, size_t size, message & output, std::stri
         return false;
     }
     if (version != protocol_version) {
-        error = "unsupported protocol version";
+        error = "protocol version mismatch: local " + std::to_string(protocol_version) +
+                ", peer " + std::to_string(version) +
+                "; rebuild both sides from the same commit";
         return false;
     }
     if (!valid_message_type(type)) {
@@ -205,7 +207,7 @@ bool decode_frame(const uint8_t * data, size_t size, message & output, std::stri
 }
 // ---------------------------------------------------------------------------
 // Node schedule (config) encoding. All integers are little-endian.
-//   u32 n_workers, u32 index, u32 start, u32 end, u32 n_ctx
+//   u32 n_workers, u32 index, u32 n_ctx, u32 n_seq_max, u32 n_ubatch
 //   u8  tail
 //   u8  has_head_link; if set: u16 head_port + u16 host_len + host bytes
 //   u8  downstream;    if set: u16 port + u16 host_len + host bytes
@@ -255,6 +257,8 @@ bool encode_config(const node_config & config, std::vector<uint8_t> & out) {
     append_u32(out, config.n_workers);
     append_u32(out, config.index);
     append_u32(out, config.n_ctx);
+    append_u32(out, config.n_seq_max);
+    append_u32(out, config.n_ubatch);
     out.push_back(config.tail ? 1 : 0);
     append_u16(out, config.head_link.port);
     append_str(out, config.head_link.host);
@@ -295,7 +299,9 @@ bool decode_config(const uint8_t * data, size_t size, node_config & config, std:
 
     if (!read_u32(data, size, offset, config.n_workers, error) ||
         !read_u32(data, size, offset, config.index, error) ||
-        !read_u32(data, size, offset, config.n_ctx, error)) {
+        !read_u32(data, size, offset, config.n_ctx, error) ||
+        !read_u32(data, size, offset, config.n_seq_max, error) ||
+        !read_u32(data, size, offset, config.n_ubatch, error)) {
         return false;
     }
 
@@ -374,11 +380,68 @@ bool decode_config(const uint8_t * data, size_t size, node_config & config, std:
     return true;
 }
 
+bool encode_worker_bench_metrics(const std::vector<worker_bench_metrics> & metrics,
+                                 std::vector<uint8_t> & out) {
+    constexpr uint32_t metrics_magic = 0x314d4245; // "EBM1"
+    if (metrics.size() > (max_payload_bytes - 8) / 28) {
+        return false;
+    }
+    out.clear();
+    out.reserve(8 + metrics.size() * 28);
+    append_u32(out, metrics_magic);
+    append_u32(out, static_cast<uint32_t>(metrics.size()));
+    for (const worker_bench_metrics & metric : metrics) {
+        append_u32(out, metric.index);
+        append_u32(out, metric.start);
+        append_u32(out, metric.end);
+        append_f32(out, metric.decode_tok_s);
+        append_f32(out, metric.peak_rss_mb);
+        append_u64(out, metric.decoded_positions);
+    }
+    return true;
+}
+
+bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
+                                 std::vector<worker_bench_metrics> & metrics,
+                                 std::string & error) {
+    constexpr uint32_t metrics_magic = 0x314d4245; // "EBM1"
+    metrics.clear();
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint32_t count = 0;
+    if (!read_u32(data, size, offset, magic, error) ||
+        !read_u32(data, size, offset, count, error)) {
+        return false;
+    }
+    if (magic != metrics_magic) {
+        error = "invalid worker benchmark metrics magic";
+        return false;
+    }
+    if (count > (max_payload_bytes - 8) / 28 ||
+        size != 8 + static_cast<size_t>(count) * 28) {
+        error = "worker benchmark metrics size mismatch";
+        return false;
+    }
+    metrics.resize(count);
+    for (worker_bench_metrics & metric : metrics) {
+        if (!read_u32(data, size, offset, metric.index, error) ||
+            !read_u32(data, size, offset, metric.start, error) ||
+            !read_u32(data, size, offset, metric.end, error) ||
+            !read_f32(data, size, offset, metric.decode_tok_s, error) ||
+            !read_f32(data, size, offset, metric.peak_rss_mb, error) ||
+            !read_u64(data, size, offset, metric.decoded_positions, error)) {
+            return false;
+        }
+    }
+    return offset == size;
+}
+
+
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
                           const std::vector<int32_t> & tokens,
                           const float * hidden, size_t n_embd,
-                          int32_t clear, int32_t trim_to,
+                          int32_t clear, int32_t trim_to, uint32_t n_logits,
                           std::vector<uint8_t> & out) {
     const bool has_tokens = !tokens.empty();
     const bool has_hidden = hidden != nullptr && n_embd > 0;
@@ -386,7 +449,7 @@ bool encode_batch_payload(const std::vector<int32_t> & pos,
         return false; // exactly one data array must be provided
     }
     const size_t n = pos.size();
-    if (n == 0 || seq.size() != n) {
+    if (n == 0 || seq.size() != n || n_logits > n) {
         return false;
     }
     const size_t n_data = has_tokens ? n : n * n_embd;
@@ -394,10 +457,11 @@ bool encode_batch_payload(const std::vector<int32_t> & pos,
         return false;
     }
     out.clear();
-    out.reserve(12 + 8 * n + 4 * n_data);
+    out.reserve(16 + 8 * n + 4 * n_data);
     append_u32(out, static_cast<uint32_t>(n));
     append_u32(out, static_cast<uint32_t>(clear));
     append_u32(out, static_cast<uint32_t>(trim_to));
+    append_u32(out, n_logits);
     for (int32_t v : pos) {
         append_u32(out, static_cast<uint32_t>(v));
     }
@@ -416,7 +480,7 @@ bool encode_batch_payload(const std::vector<int32_t> & pos,
 }
 
 bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
-                          int32_t & clear, int32_t & trim_to,
+                          int32_t & clear, int32_t & trim_to, uint32_t & n_logits,
                           std::vector<int32_t> & pos,
                           std::vector<int32_t> & seq,
                           std::vector<int32_t> & tokens,
@@ -428,6 +492,7 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
     hidden.clear();
     clear = 0;
     trim_to = -1;
+    n_logits = 0;
     size_t offset = 0;
     uint32_t n = 0;
     if (!read_u32(data, size, offset, n, error) || n == 0) {
@@ -436,7 +501,12 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
     const size_t n_entries = n;
     uint32_t raw_clear = 0, raw_trim = 0;
     if (!read_u32(data, size, offset, raw_clear, error) ||
-        !read_u32(data, size, offset, raw_trim, error)) {
+        !read_u32(data, size, offset, raw_trim, error) ||
+        !read_u32(data, size, offset, n_logits, error)) {
+        return false;
+    }
+    if (n_logits > n_entries) {
+        error = "batch n_logits exceeds entry count";
         return false;
     }
     clear = static_cast<int32_t>(raw_clear);
@@ -482,4 +552,4 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
     return true;
 }
 
-} // namespace prima
+} // namespace potluck

@@ -1550,7 +1550,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors(params.prima_layer_start != 0 || params.prima_layer_end != 0);
+    ml.done_getting_tensors(params.potluck_layer_start != 0 || params.potluck_layer_end != 0);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -2091,8 +2091,8 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
-    const uint32_t prima_stage_start = cparams.prima_layer_start;
-    const uint32_t prima_stage_end = cparams.prima_layer_end == 0 ? hparams.n_layer() : cparams.prima_layer_end;
+    const uint32_t stage_start = cparams.potluck_layer_start;
+    const uint32_t stage_end = cparams.potluck_layer_end == 0 ? hparams.n_layer() : cparams.potluck_layer_end;
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2298,10 +2298,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01) {
                         filter_attn = [&](uint32_t il) {
-                            return il >= prima_stage_start && il < prima_stage_end && !hparams.is_recr(il);
+                            return il >= stage_start && il < stage_end && !hparams.is_recr(il);
                         };
                         filter_recr = [&](uint32_t il) {
-                            return il >= prima_stage_start && il < prima_stage_end && hparams.is_recr(il);
+                            return il >= stage_start && il < stage_end && hparams.is_recr(il);
                         };
                     }
 
@@ -2497,8 +2497,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.prima_layer_start           =*/ 0,
-        /*.prima_layer_end             =*/ 0,
+        /*.potluck_layer_start           =*/ 0,
+        /*.potluck_layer_end             =*/ 0,
     };
 
     return result;

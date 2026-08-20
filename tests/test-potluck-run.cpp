@@ -1,4 +1,4 @@
-// test-prima-run: end-to-end correctness for the finished prima-stage pipeline.
+// test-potluck-run: end-to-end correctness for the finished potluck-stage pipeline.
 //
 // Strategy (greedy, deterministic):
 //   1. Load the full model and run prompt prefill + n_predict autoregressive
@@ -9,12 +9,12 @@
 //   3. Assert the two sequences are identical, and print the generated text.
 //
 // Supports an in-process remote stage (no sockets) for speed and a separate
-// process / loopback variant is covered by test-prima-qwen35-network-stage.
+// process / loopback variant is covered by test-potluck-qwen35-network-stage.
 //
-// Usage: test-prima-run <model.gguf> [split] [n_predict]
+// Usage: test-potluck-run <model.gguf> [split] [n_predict]
 
 #include "llama.h"
-#include "prima_runtime.h"
+#include "potluck_runtime.h"
 
 #include <algorithm>
 #include <cassert>
@@ -89,7 +89,7 @@ std::vector<llama_token> run_full(const std::string & model_path,
         CHECK(llama_decode(ctx, batch) == 0);
         const float * logits = llama_get_logits_ith(ctx, 0);
         CHECK(logits != nullptr);
-        const llama_token next = static_cast<llama_token>(prima::argmax_token(logits, n_vocab));
+        const llama_token next = static_cast<llama_token>(potluck::argmax_token(logits, n_vocab));
         generated.push_back(next);
         if (next == eos) break;
         prev = next;
@@ -112,11 +112,13 @@ std::vector<llama_token> run_split(const std::string & model_path,
                                    uint32_t n_embd, uint32_t n_vocab, uint32_t n_layer) {
     CHECK(split > 0 && split < n_layer);
 
-    prima::stage_model head;
+    potluck::stage_model head;
     std::string error;
-    CHECK(prima::stage_load(head, model_path, 0, split, /*embeddings=*/true, /*n_ctx=*/2048, error));
-    prima::stage_model remote;
-    CHECK(prima::stage_load(remote, model_path, split, 0, /*embeddings=*/false, /*n_ctx=*/2048, error));
+    CHECK(potluck::stage_load(head, model_path, 0, split, /*embeddings=*/true, /*n_ctx=*/2048,
+                              /*n_seq_max=*/1, /*n_ubatch=*/1, error));
+    potluck::stage_model remote;
+    CHECK(potluck::stage_load(remote, model_path, split, 0, /*embeddings=*/false, /*n_ctx=*/2048,
+                              /*n_seq_max=*/1, /*n_ubatch=*/1, error, /*tail=*/true));
 
     const llama_vocab * vocab = llama_model_get_vocab(head.model);
     const llama_token eos = llama_vocab_eos(vocab);
@@ -124,17 +126,17 @@ std::vector<llama_token> run_split(const std::string & model_path,
     auto run_remote = [&](uint32_t pos) -> llama_token {
         const float * hidden = llama_get_embeddings_ith(head.ctx, 0);
         CHECK(hidden != nullptr);
-        CHECK(prima::stage_decode_hidden(remote, hidden, pos) == 0);
+        CHECK(potluck::stage_decode_hidden(remote, hidden, pos) == 0);
         const float * logits = llama_get_logits_ith(remote.ctx, 0);
         CHECK(logits != nullptr);
-        return static_cast<llama_token>(prima::argmax_token(logits, n_vocab));
+        return static_cast<llama_token>(potluck::argmax_token(logits, n_vocab));
     };
 
     // Prefill: feed tokens to the head. Decoding token at position i produces a
     // hidden state that predicts token i+1, so resolve the remote token for every
     // prefix position (sequences 0..size-1) to keep its recurrent state in sync.
     for (int i = 0; i < static_cast<int>(prompt_tokens.size()); ++i) {
-        CHECK(prima::stage_decode_token(head, prompt_tokens[i], static_cast<uint32_t>(i)) == 0);
+        CHECK(potluck::stage_decode_token(head, prompt_tokens[i], static_cast<uint32_t>(i)) == 0);
         (void)run_remote(static_cast<uint32_t>(i));
     }
 
@@ -143,7 +145,7 @@ std::vector<llama_token> run_split(const std::string & model_path,
     llama_token prev = prompt_tokens.back();
     uint32_t pos = static_cast<uint32_t>(prompt_tokens.size());
     for (uint32_t step = 0; step < n_predict; ++step) {
-        CHECK(prima::stage_decode_token(head, prev, pos) == 0);
+        CHECK(potluck::stage_decode_token(head, prev, pos) == 0);
         const llama_token next = run_remote(pos);
         generated.push_back(next);
         if (next == eos) break;
@@ -151,8 +153,8 @@ std::vector<llama_token> run_split(const std::string & model_path,
         ++pos;
     }
 
-    prima::stage_free(remote);
-    prima::stage_free(head);
+    potluck::stage_free(remote);
+    potluck::stage_free(head);
     return generated;
 }
 
@@ -219,7 +221,7 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
-    std::printf("prima-run test passed (split=%u, generated=%zu tokens)\n", split, split_tokens.size());
+    std::printf("potluck-run test passed (split=%u, generated=%zu tokens)\n", split, split_tokens.size());
     llama_model_free(meta);
     llama_backend_free();
     return 0;

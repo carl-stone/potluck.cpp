@@ -3,7 +3,7 @@
 # "head" (connects). CTest cannot launch a second process for a single test, so
 # this script runs both roles and tears the worker down.
 #
-# Usage: test-prima-qwen35-process-stage.sh <binary> <model> [port]
+# Usage: test-potluck-qwen35-process-stage.sh <binary> <model> [port]
 set -e
 
 BIN="$1"
