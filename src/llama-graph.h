@@ -154,6 +154,21 @@ public:
     const int64_t n_embd = 0;
 };
 
+// Input used by a prima-style intermediate stage. It intentionally owns only
+// the hidden-state tensor; unlike llm_graph_input_embd_h it has no unused
+// token-embedding input that the scheduler would need to allocate.
+class llm_graph_input_hidden : public llm_graph_input_i {
+public:
+    llm_graph_input_hidden(int64_t n_embd) : n_embd(n_embd) {}
+    virtual ~llm_graph_input_hidden() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * h = nullptr; // F32 [n_embd, n_tokens]
+    const int64_t n_embd = 0;
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -842,6 +857,8 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.prima_layer_start      == other.cparams.prima_layer_start      &&
+            cparams.prima_layer_end        == other.cparams.prima_layer_end        &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1115,6 +1132,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_hidden() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

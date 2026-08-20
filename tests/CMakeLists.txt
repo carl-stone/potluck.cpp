@@ -349,3 +349,50 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# ---------------------------------------------------------------------------
+# prima.cpp static pipeline tests (single machine, Qwen3.5)
+# ---------------------------------------------------------------------------
+
+# Shared implementation of the prima protocol + transport (POSIX TCP).
+add_library(prima-distributed STATIC
+    ${PROJECT_SOURCE_DIR}/src/prima-distributed-protocol.cpp
+    ${PROJECT_SOURCE_DIR}/src/prima-distributed-transport.cpp)
+target_include_directories(prima-distributed PUBLIC ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(prima-distributed PUBLIC llama)
+
+# Pure protocol + transport unit tests (no model required).
+llama_build_and_test(test-prima-protocol.cpp)
+target_link_libraries(test-prima-protocol PRIVATE prima-distributed)
+llama_build_and_test(test-prima-transport.cpp)
+target_link_libraries(test-prima-transport PRIVATE prima-distributed)
+
+# In-process stage correctness: split the model across two stage-local contexts
+# and compare the greedy first token against the unsplit full model.
+# NOTE: llama_* symbols are already provided transitively by llama-common
+# (pulled in by llama_build_and_test). Do NOT also link `llama` directly here
+# or the binary will contain two copies of libllama (ODR/static-state corruption
+# under -O3 -DNDEBUG).
+llama_build_and_test(test-prima-qwen35-stages.cpp ARGS ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
+
+# Separate-process stage correctness over a TCP loopback channel. This one
+# needs two processes (a "worker" that binds and a "head" that connects), so
+# CTest drives both roles through a shell script instead of a single add_test.
+add_executable(test-prima-qwen35-process-stage test-prima-qwen35-process-stage.cpp)
+target_link_libraries(test-prima-qwen35-process-stage PRIVATE prima-distributed)
+add_test(NAME test-prima-qwen35-process-stage
+         COMMAND ${PROJECT_SOURCE_DIR}/tests/test-prima-qwen35-process-stage.sh
+                 $<TARGET_FILE:test-prima-qwen35-process-stage>
+                 ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
+set_property(TEST test-prima-qwen35-process-stage PROPERTY LABELS main)
+set_property(TEST test-prima-qwen35-process-stage PROPERTY TIMEOUT 1800)
+
+# Separate-process two-stage test that forwards hidden states for two decode
+# steps and compares both returned tokens with a full-model reference.
+llama_build_and_test(test-prima-qwen35-network-stage.cpp ARGS ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
+target_link_libraries(test-prima-qwen35-network-stage PRIVATE prima-distributed)
+
+# Full pipeline: prompt prefill + multi-token greedy generation across a split,
+# compared token-for-token against the unsplit full model.
+llama_build_and_test(test-prima-run.cpp)
+target_include_directories(test-prima-run PRIVATE ${PROJECT_SOURCE_DIR}/tools/prima-stage)

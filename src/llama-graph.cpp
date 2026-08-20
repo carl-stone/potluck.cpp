@@ -117,10 +117,20 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (h      &&      h->ne[1] == params.ubatch.n_tokens);
 
     return res;
+}
+
+void llm_graph_input_hidden::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(ubatch->embd);
+    GGML_ASSERT(n_embd == h->ne[0]);
+    ggml_backend_tensor_set(h, ubatch->embd, 0, ubatch->n_tokens*n_embd*ggml_element_size(h));
+}
+
+bool llm_graph_input_hidden::can_reuse(const llm_graph_params & params) {
+    return params.ubatch.embd && h && h->ne[1] == params.ubatch.n_tokens;
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -2367,6 +2377,20 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
     ggml_build_forward_expand(gf, cur);
 
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_hidden() const {
+    auto inp = std::make_unique<llm_graph_input_hidden>(hparams.n_embd);
+
+    inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, ubatch.n_tokens);
+    cb(inp->h, "inp_hidden", -1);
+    ggml_set_input(inp->h);
+
+    ggml_tensor * cur = inp->h;
+    res->t_inp_embd = cur;
+    res->add_input(std::move(inp));
+    ggml_build_forward_expand(gf, cur);
     return cur;
 }
 

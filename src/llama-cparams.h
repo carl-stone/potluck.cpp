@@ -54,6 +54,10 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // [EXPERIMENTAL] prima-style static stage range. A zero end means the full model.
+    uint32_t prima_layer_start = 0;
+    uint32_t prima_layer_end   = 0;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

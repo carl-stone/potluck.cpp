@@ -37,19 +37,27 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
+    const uint32_t stage_start = params.prima_layer_start;
+    const uint32_t stage_end = params.prima_layer_end == 0 ? n_layer : params.prima_layer_end;
+    GGML_ASSERT(stage_start <= stage_end && stage_end <= (uint32_t) n_layer);
+
     const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
     const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    if (stage_start == 0) {
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    }
 
     // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+    if (stage_end == (uint32_t) n_layer) {
+        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+        output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
 
-    // if output is NULL, init from the input tok embed
-    if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+        // if output is NULL, init from the input tok embed
+        if (output == NULL) {
+            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+        }
     }
 
     auto load_block_trunk = [&](int il, int flags) {
@@ -119,7 +127,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
-    for (int i = 0; i < n_layer; ++i) {
+    for (uint32_t i = stage_start; i < stage_end; ++i) {
         load_block_trunk(i, trunk_flags);
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
@@ -138,6 +146,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
+    const uint32_t stage_start = cparams.prima_layer_start;
+    const uint32_t stage_end = cparams.prima_layer_end == 0 ? n_layer : cparams.prima_layer_end;
+    GGML_ASSERT(stage_start <= stage_end && stage_end <= (uint32_t) n_layer);
+
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
 
     int sections[4];
@@ -146,17 +158,17 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = stage_start == 0 ? build_inp_embd(model.tok_embd) : build_inp_hidden();
 
     cb(inpL, "model.input_embed", -1);
 
     auto * inp = build_inp_mem_hybrid();
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = stage_end == (uint32_t) n_layer ? build_inp_out_ids() : nullptr;
 
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
-    for (int il = 0; il < n_layer; ++il) {
+    for (uint32_t il = stage_start; il < stage_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -206,6 +218,13 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         inpL = cur;
     }
     cur = inpL;
+
+    if (stage_end < (uint32_t) n_layer) {
+        res->t_embd = cur;
+        cb(cur, "stage_hidden", -1);
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
 

@@ -140,6 +140,8 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+    cparams.prima_layer_start = params.prima_layer_start;
+    cparams.prima_layer_end   = params.prima_layer_end;
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -3549,6 +3551,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.prima_layer_start          =*/ 0,
+        /*.prima_layer_end            =*/ 0,
     };
 
     return result;
