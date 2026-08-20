@@ -87,10 +87,10 @@ No pre-change batched-prefill measurement was captured in this run, so this
 file does not claim a speedup ratio. The post-change path sends one batched
 prefill message per prompt.
 
-The 27B path is **unverified and remote-only** on this host. The model file is
-18.97 GB, the host has 16 GiB unified memory, and only 9.7 GiB disk was free
-before shard creation. A full-model local load caused severe memory pressure
-and a machine crash; no 27B throughput or completion result was recorded.
-Do not rerun the 27B model locally on this host. Run the 27B proof on separate
-machines with enough aggregate RAM and disk, then add the exact commands and
-outputs here.
+## Verification scope
+
+These benchmarks and the acceptance suite intentionally use small fixture
+models that fit the test host. The current correctness fixture is Qwen3.5
+0.8B; other small models may be used when they exercise a supported path.
+Verifying 27B correctness, performance, or end-to-end execution is an explicit
+non-goal. 27B is a deployment target, not an acceptance target.

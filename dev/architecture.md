@@ -57,7 +57,7 @@ The server can spawn local workers for fixture tests. `--hosts a,b,c --launch ss
 
 A shard split changes where model memory lives. It does not reduce the aggregate number of model bytes. Multiple workers on one machine share physical RAM, page cache, and memory bandwidth; they are a topology emulator, not a way to fit a model that does not fit the machine.
 
-The intended deployment is one worker per physical machine, with each machine holding only its shard. The head stays metadata-only unless `--parity-check` is requested. `--parity-check` is a correctness harness for small fixtures, not a production 27B setting.
+The intended deployment is one worker per physical machine, with each machine holding only its shard. The head stays metadata-only unless `--parity-check` is requested. `--parity-check` is a correctness harness for small fixtures, not a requirement for target model sizes.
 
 ## Scheduling and optional paths
 

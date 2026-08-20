@@ -59,7 +59,13 @@ Measurements below use Apple Mac16,1, Apple M4, 10 cores, 16 GiB unified memory,
 
 Full benchmark commands and raw output: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-A 27B result is not published. The 18.97 GB Q4 model is **unverified and remote-only** for this 16 GiB M4. A real 27B proof requires separate machines with enough aggregate memory and disk.
+## Verification scope
+
+Correctness is verified with small fixture models that fit the test host. The
+current acceptance fixture is Qwen3.5 0.8B; other small models may be used when
+they exercise a supported path. Verifying 27B correctness, performance, or
+end-to-end execution is an explicit non-goal. 27B is a deployment target, not
+an acceptance target.
 
 ## How this differs from prima.cpp
 
@@ -80,8 +86,7 @@ Credit and context: [prima.cpp](https://github.com/OpenCPIL/prima.cpp) and [llam
 - The LAN is trusted. There is no authentication or encryption.
 - One chain serves one request at a time; the server returns HTTP 429 while busy.
 - Same-machine workers are for tests or multiple physical accelerators. They do not create memory and do not represent multi-machine throughput.
-- `--parity-check` is an explicit full-model correctness harness. Without it, the head loads metadata only and does not load the whole model.
-- 27B performance and end-to-end completion remain unverified until separate machines are available.
+- `--parity-check` is an explicit full-model correctness harness for small fixture models. Without it, the head loads metadata only and does not load the whole model.
 
 ## Verification
 

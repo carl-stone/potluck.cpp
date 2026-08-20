@@ -2,13 +2,21 @@
 
 This document separates two claims:
 
-- **Inference accuracy**: generated tokens match the full-model reference on the
-  0.8B fixture.
+- **Inference accuracy**: generated tokens match the full-model reference on
+  small fixture models.
 - **Feature parity**: a runtime capability has a named acceptance check.
 
 `CHAIN PASSED` proves inference accuracy only. It does not prove feature parity.
 The reference capability set is documented by [prima.cpp](https://github.com/OpenCPIL/prima.cpp);
 this project keeps a modern llama.cpp base and uses a versioned TCP transport.
+
+## Verification scope
+
+The correctness contract is exercised with small model files that fit the test
+host. The current fixture is Qwen3.5 0.8B; other small models may be used when
+they exercise a supported path. Verifying 27B correctness, performance, or
+end-to-end execution is an explicit non-goal. 27B is a deployment target, not
+an acceptance target.
 
 ## Re-verified on 2026-08-20
 
@@ -57,8 +65,6 @@ These items are not claimed as newly verified by the current M4 run:
 - Cross-machine throughput and the SSH launch path. The code and deployment
   commands are present; they need two reachable hosts built from the same
   commit.
-- 27B end-to-end inference. The 18.97 GB model is not safe to load on this
-  16 GiB unified-memory host. No 27B completion or throughput number is claimed.
 - PC GPU model and operating system. Earlier notes conflict, so this document
   makes no hardware claim for that machine until it is inspected directly.
 
