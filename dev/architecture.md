@@ -79,9 +79,10 @@ product behavior.
 
 The current server route implements two repeated disjoint windows per worker
 where the model layers permit. DNS-SD supplies candidate nodes and the server
-launches them through SSH, but the route still uses fixed scheduling and manual
-shard deployment rather than live heterogeneous profiling, admission,
-selection, and placement.
+launches them through SSH. Each worker reports its accelerator kind and free
+memory before the schedule is sent, and the head budgets that memory across the
+worker's windows to fill per-window layer offload on Metal or CUDA. Device
+admission, heterogeneous window sizing, and selection are still not live.
 
 Each selected device receives from its previous ring peer and sends directly to
 its next ring peer. Rank 0 is both a ring peer and the client-facing controller.
@@ -162,16 +163,16 @@ The direct adjacent-peer ZeroMQ path now runs in `potluck-server`:
 - The same M4 head automatically discovered the Linux node through DNS-SD,
   accepted its first SSH host key in a Potluck-specific trust file, launched
   the worker, and returned the same two-token result.
-- The remote smoke used the M4 as controller only. It did not demonstrate
-  heterogeneous placement or head computation.
+- The local two-worker smoke now reports each worker's accelerator through the
+  ring protocol and places window layers automatically: fully on M4 Metal and
+  on a GTX 1650 SUPER CUDA device, CPU-only when no device exists.
 
 The remaining product gaps are explicit:
 
-- DNS-SD candidate discovery and SSH launch are automatic, but live profiling,
-  device admission and selection, and heterogeneous placement are not.
+- DNS-SD candidate discovery and SSH launch are automatic, as is accelerator
+  profiling with per-window layer placement. Device admission, heterogeneous
+  selection, and heterogeneous window sizing are not.
 - Head resource reservation and adaptive head participation are not
-  implemented.
-- Per-window prefetch and independent CPU, CUDA, or Metal placement are not
   implemented.
 - Shard creation, transfer, validation, selection, and caching remain manual.
 - The server does not yet provide continuous HTTP batching or isolated

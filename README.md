@@ -31,15 +31,15 @@ connects each worker directly to its cyclic next peer with ZeroMQ, sends
 ingress only to rank 0, and receives final results back at the head. The
 current route assigns two repeated disjoint windows per worker where the model
 layers permit. It can launch local workers, discover advertised LAN nodes with
-mDNS/DNS-SD, and launch discovered workers through SSH.
+mDNS/DNS-SD, and launch discovered workers through SSH. Each worker reports its
+accelerator through the ring, and the head places window layers on Metal or
+CUDA automatically from that profile.
 
-Local two-worker CPU smoke passed, and an M4 head automatically discovered and
-launched one Linux CPU worker for the Qwen3.5 0.8B fixture. The remote smoke
-returned the same two-token result, ` located in`; the M4 head was only the
-controller and did not demonstrate heterogeneous placement or head computation.
-Live profiling and selection, resource-aware placement, shard automation,
-batching, slots, recovery, security, and full API parity remain unfinished, so
-Potluck is not complete.
+Local two-worker smoke passed with automatic placement: window layers fully on
+M4 Metal and on a GTX 1650 SUPER CUDA device. Live device selection and
+admission, heterogeneous window sizing, shard automation, batching, slots,
+recovery, security, and full API parity remain unfinished, so Potluck is not
+complete.
 
 Build and fixture commands in this repository are engineering checks only.
 They do not describe a supported deployment.

@@ -77,11 +77,11 @@ admission, lifecycle, and server coverage remain incomplete.
 | Area | Required product behavior | Current source | Status |
 |---|---|---|---:|
 | Distributed execution | Piped ring only; several disjoint windows per selected device | `potluck-server` direct adjacent-peer ZeroMQ ring; two repeated windows per worker where layers permit | PRESENT |
-| Window placement | Automatic heterogeneous placement from live capability and resource pressure | Fixed route from explicit worker/shard/bootstrap inputs; no live scheduler | PARTIAL |
-| Device profiling and selection | Automatic discovery, profiling, admission, and exclusion in the server lifecycle | DNS-SD candidate discovery and scoped SSH trust-on-first-use work; live profiling, admission, and selection do not | PARTIAL |
+| Window placement | Automatic heterogeneous placement from live capability and resource pressure | Fixed route from explicit worker/shard/bootstrap inputs; per-window layer offload is now planned from worker accelerator profiles; no heterogeneous window sizing or live scheduler | PARTIAL |
+| Device profiling and selection | Automatic discovery, profiling, admission, and exclusion in the server lifecycle | DNS-SD candidate discovery and scoped SSH trust-on-first-use work; workers profile their ggml accelerator devices at connect; admission and selection do not | PARTIAL |
 | Head participation | Optional worker after reserving for current user CPU, memory, and accelerator use | Remote smoke used the M4 as controller only; no live resource reserve | MISSING |
 | Prefetch | Next assigned window coordinated with ring execution | Per-window prefetch is not implemented | MISSING |
-| Accelerator placement | Independent CPU/CUDA/Metal decision per device and window | Static or explicit worker placement; no live per-device/window planner | PARTIAL |
+| Accelerator placement | Independent CPU/CUDA/Metal decision per device and window | Workers report kind plus free/total memory through the ring protocol; the head budgets usable memory per worker across its windows; verified on M4 Metal and GTX 1650 SUPER CUDA | PRESENT |
 | Model loading | Load only assigned GGUF window shards; full source file may remain on disk | Explicit shard inputs and window assignments work; creation and deployment automation are missing | PARTIAL |
 | Worker bootstrap | Automatic local and remote startup with readiness and topology lifecycle | DNS-SD discovery and SSH launch work; deployment, health, and topology lifecycle automation are missing | PARTIAL |
 | Continuous batching | Active HTTP requests scheduled together through the ring | HTTP path still serializes work; batch capacity is not continuous HTTP batching | PARTIAL |
