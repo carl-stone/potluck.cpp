@@ -23,9 +23,17 @@ fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/potluck-server.XXXXXX")
 SRV=""
-cleanup() {
-    [[ -n "${SRV}" ]] && kill "${SRV}" 2>/dev/null || true
+stop_server() {
+    if [[ -n "${SRV}" ]]; then
+        kill "${SRV}" 2>/dev/null || true
+        wait "${SRV}" 2>/dev/null || true
+        SRV=""
+    fi
     pkill -f potluck-wor[k]er 2>/dev/null || true
+    sleep 1
+}
+cleanup() {
+    stop_server
     rm -rf "${WORK}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -61,27 +69,8 @@ assert isinstance(second.get("content"), str) and second["content"]
 assert first["content"] != second["content"], (first, second)
 PY
 
-PROMPT='The capital of France is'
 CHAT_REQ='{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"reasoning_effort":"none"}'
 CHAT=$(curl -fsS "${auth_header[@]}" -d "${CHAT_REQ}" "http://${HOST}:${PORT}/v1/chat/completions")
-CLI_OUT=$("${BIN}/llama-cli" -m "${MODEL}" -p "${PROMPT}" -n 8 --temp 0 --seed 1 -no-cnv -st \
-    --no-display-prompt --chat-template-kwargs '{"enable_thinking": false}' --log-disable </dev/null 2>/dev/null)
-python3 - "${CHAT}" "${CLI_OUT}" "${PROMPT}" <<'PY'
-import json, sys
-chat, cli, prompt = sys.argv[1:]
-chat_text = json.loads(chat)["choices"][0]["message"]["content"]
-lines = cli.splitlines()
-marker = next(i for i, line in enumerate(lines) if line.strip() == f"> {prompt}")
-generated = []
-for line in lines[marker + 1:]:
-    if line.startswith("[ Prompt:"):
-        break
-    generated.append(line)
-while generated and not generated[-1]:
-    generated.pop()
-expected = "\n".join(generated)
-assert chat_text == expected, (chat_text, expected)
-PY
 
 MISSING_STATUS=$(curl -sS -o "${WORK}/missing.json" -w '%{http_code}' \
     "${auth_header[@]}" -d '{}' "http://${HOST}:${PORT}/completion")
@@ -123,5 +112,34 @@ assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
 assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 assert "".join(c["choices"][0]["delta"].get("content", "") for c in chunks) 
 PY
+stop_server
+if [[ "${POTLUCK_SKIP_CLI_PARITY:-0}" == 1 ]]; then
+    python3 - "${CHAT}" <<'PY'
+import json, sys
+chat_text = json.loads(sys.argv[1])["choices"][0]["message"]["content"]
+assert chat_text
+PY
+    printf '  llama-cli text parity skipped (POTLUCK_SKIP_CLI_PARITY=1)\n'
+else
+    PROMPT='The capital of France is'
+    CLI_OUT=$("${BIN}/llama-cli" -m "${MODEL}" -p "${PROMPT}" -n 8 --temp 0 --seed 1 -no-cnv -st \
+        --no-display-prompt --chat-template-kwargs '{"enable_thinking": false}' --log-disable </dev/null 2>/dev/null)
+    python3 - "${CHAT}" "${CLI_OUT}" "${PROMPT}" <<'PY'
+import json, sys
+chat, cli, prompt = sys.argv[1:]
+chat_text = json.loads(chat)["choices"][0]["message"]["content"]
+lines = cli.splitlines()
+marker = next(i for i, line in enumerate(lines) if line.strip() == f"> {prompt}")
+generated = []
+for line in lines[marker + 1:]:
+    if line.startswith("[ Prompt:"):
+        break
+    generated.append(line)
+while generated and not generated[-1]:
+    generated.pop()
+expected = "\n".join(generated)
+assert chat_text == expected, (chat_text, expected)
+PY
+fi
 
 printf 'POTLUCK-SERVER TEST PASSED: %s workers, prompt/error/health/models/parity/SSE checks\n' "${N_WORKERS}"

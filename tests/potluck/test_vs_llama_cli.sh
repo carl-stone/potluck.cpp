@@ -22,9 +22,17 @@ done
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/potluck-vs-cli.XXXXXX")
 SRV=""
-cleanup() {
-    [[ -n "${SRV}" ]] && kill "${SRV}" 2>/dev/null || true
+stop_server() {
+    if [[ -n "${SRV}" ]]; then
+        kill "${SRV}" 2>/dev/null || true
+        wait "${SRV}" 2>/dev/null || true
+        SRV=""
+    fi
     pkill -f potluck-wor[k]er 2>/dev/null || true
+    sleep 1
+}
+cleanup() {
+    stop_server
     rm -rf "${WORK}" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -39,10 +47,10 @@ for _ in $(seq 1 120); do
 done
 grep -q 'listening on http' "${WORK}/server.log"
 
-python3 - "${BIN}" "${MODEL}" "${HOST}" "${PORT}" "${N_PREDICT}" <<'PY'
-import json, subprocess, sys, urllib.request
-bin_dir, model, host, port, n_predict = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
-for prompt in ("The capital of France is", "The Eiffel Tower is in"):
+python3 - "${HOST}" "${PORT}" "${N_PREDICT}" "${WORK}" <<'PY'
+import json, sys, urllib.request
+host, port, n_predict, work = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+for index, prompt in enumerate(("The capital of France is", "The Eiffel Tower is in")):
     body = json.dumps({
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": n_predict,
@@ -54,7 +62,16 @@ for prompt in ("The capital of France is", "The Eiffel Tower is in"):
     )
     with urllib.request.urlopen(request) as response:
         result = json.load(response)
-    actual = result["choices"][0]["message"]["content"]
+    with open(f"{work}/server_{index}.json", "w", encoding="utf-8") as output:
+        json.dump({"prompt": prompt, "content": result["choices"][0]["message"]["content"]}, output)
+PY
+stop_server
+python3 - "${BIN}" "${MODEL}" "${N_PREDICT}" "${WORK}" <<'PY'
+import json, subprocess, sys
+bin_dir, model, n_predict, work = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+for index in (0, 1):
+    saved = json.load(open(f"{work}/server_{index}.json", encoding="utf-8"))
+    prompt = saved["prompt"]
     command = [
         f"{bin_dir}/llama-cli", "-m", model, "-p", prompt,
         "-n", str(n_predict), "--temp", "0", "--seed", "1",
@@ -74,6 +91,6 @@ for prompt in ("The capital of France is", "The Eiffel Tower is in"):
     while generated and not generated[-1]:
         generated.pop()
     expected = "\n".join(generated)
-    assert actual == expected, (prompt, actual, expected)
-print(f"llama-cli parity passed for {2} prompts")
+    assert saved["content"] == expected, (prompt, saved["content"], expected)
+print("llama-cli parity passed for 2 prompts")
 PY
