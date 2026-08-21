@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Pinned engineering fixture model for Potluck checks and smokes.
+# Source this file; do not execute it directly.
+#
+# Overrides:
+#   POTLUCK_MODEL_HF_REPO   Hugging Face repo id
+#   POTLUCK_MODEL_FILE      file name inside the repo
+#   POTLUCK_MODEL_SHA256    expected checksum of the file
+#   POTLUCK_MODEL_DIR       download/cache directory (default: <repo>/models)
+#   POTLUCK_TEST_MODEL      explicit full model path; wins over everything
+
+POTLUCK_MODEL_HF_REPO="${POTLUCK_MODEL_HF_REPO:-ggml-org/Qwen3.5-0.8B-GGUF}"
+POTLUCK_MODEL_FILE="${POTLUCK_MODEL_FILE:-Qwen3.5-0.8B-Q4_0.gguf}"
+POTLUCK_MODEL_SHA256="${POTLUCK_MODEL_SHA256:-57d1997790d1744fba5b40a7317df71ea5e2acee28c47e78f0cce39c0703f8cf}"
+
+potluck_model_repo_root() {
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    (cd "${script_dir}/.." && pwd)
+}
+
+potluck_model_url() {
+    printf 'https://huggingface.co/%s/resolve/main/%s\n' \
+        "${POTLUCK_MODEL_HF_REPO}" "${POTLUCK_MODEL_FILE}"
+}
+
+potluck_model_dir() {
+    printf '%s\n' "${POTLUCK_MODEL_DIR:-$(potluck_model_repo_root)/models}"
+}
+
+potluck_model_path() {
+    if [[ -n "${POTLUCK_TEST_MODEL:-}" ]]; then
+        printf '%s\n' "${POTLUCK_TEST_MODEL}"
+    else
+        printf '%s/%s\n' "$(potluck_model_dir)" "${POTLUCK_MODEL_FILE}"
+    fi
+}
