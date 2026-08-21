@@ -229,6 +229,60 @@ bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
     return offset == size;
 }
 
+bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & out) {
+    constexpr uint32_t profile_magic = 0x31504145; // "EAP1"
+    if (static_cast<uint32_t>(profile.kind) > static_cast<uint32_t>(accel_kind::other)) {
+        return false;
+    }
+    out.clear();
+    append_u32(out, profile_magic);
+    append_u32(out, profile.rank);
+    out.push_back(static_cast<uint8_t>(profile.kind));
+    append_u64(out, profile.free_bytes);
+    append_u64(out, profile.total_bytes);
+    return true;
+}
+
+bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & profile,
+                          std::string & error) {
+    constexpr uint32_t profile_magic = 0x31504145; // "EAP1"
+    constexpr size_t profile_bytes = 25;
+    profile = accel_profile{};
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint32_t rank = 0;
+    uint64_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+    if (size != profile_bytes) {
+        error = "accelerator profile size mismatch";
+        return false;
+    }
+    if (!read_u32(data, size, offset, magic, error)) {
+        return false;
+    }
+    if (magic != profile_magic) {
+        error = "invalid accelerator profile magic";
+        return false;
+    }
+    if (!read_u32(data, size, offset, rank, error)) {
+        return false;
+    }
+    const uint8_t kind = data[offset++];
+    if (kind > static_cast<uint8_t>(accel_kind::other)) {
+        error = "unknown accelerator kind";
+        return false;
+    }
+    if (!read_u64(data, size, offset, free_bytes, error) ||
+        !read_u64(data, size, offset, total_bytes, error)) {
+        return false;
+    }
+    profile.rank = rank;
+    profile.kind = static_cast<accel_kind>(kind);
+    profile.free_bytes = free_bytes;
+    profile.total_bytes = total_bytes;
+    return true;
+}
+
 
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,

@@ -115,5 +115,36 @@ int main() {
         CHECK(!potluck::decode_worker_bench_metrics(payload.data(), payload.size(), actual, error));
     }
 
+    // Accelerator profiles round-trip and reject damaged payloads.
+    {
+        const potluck::accel_profile expected = {3, potluck::accel_kind::cuda, 2147483648, 4294967296};
+        std::vector<uint8_t> payload;
+        CHECK(potluck::encode_accel_profile(expected, payload));
+        CHECK(payload.size() == 25);
+        potluck::accel_profile actual;
+        CHECK(potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(actual.rank == expected.rank);
+        CHECK(actual.kind == expected.kind);
+        CHECK(actual.free_bytes == expected.free_bytes);
+        CHECK(actual.total_bytes == expected.total_bytes);
+
+        const potluck::accel_profile metal = {0, potluck::accel_kind::metal, 1, 2};
+        CHECK(potluck::encode_accel_profile(metal, payload));
+        CHECK(potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(actual.kind == potluck::accel_kind::metal);
+
+        payload.push_back(0);
+        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "accelerator profile size mismatch");
+        payload.pop_back();
+        payload[0] = 0;
+        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "invalid accelerator profile magic");
+        payload[0] = 0x45; // restore magic byte
+        payload[8] = 9;    // kind byte out of range
+        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "unknown accelerator kind");
+    }
+
     return 0;
 }

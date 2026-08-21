@@ -81,6 +81,25 @@ bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
                                  std::vector<worker_bench_metrics> & metrics,
                                  std::string & error);
 
+// Accelerator capability a worker reports before ring configuration.
+enum class accel_kind : uint8_t {
+    none = 0,
+    metal = 1,
+    cuda = 2,
+    other = 3,
+};
+
+struct accel_profile {
+    uint32_t rank = 0;
+    accel_kind kind = accel_kind::none;
+    uint64_t free_bytes = 0;
+    uint64_t total_bytes = 0;
+};
+
+bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & out);
+bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & profile,
+                          std::string & error);
+
 
 // Serialize a node schedule into a message payload.
 bool encode_config(const node_config & config, std::vector<uint8_t> & out);
