@@ -1,22 +1,11 @@
-// Legacy PTLK frame codec for the raw-TCP component path. ADR 0007 requires
-// direct peer-ring communication through ZeroMQ. Retain this only until its
-// component callers and tests are rewritten during the clean cutover.
-
 #include "potluck-protocol.h"
 
 #include <cstring>
-#include <limits>
 
 namespace potluck {
 namespace {
 
-constexpr size_t frame_prefix_bytes = sizeof(uint64_t);
-constexpr size_t body_header_bytes = 4 + 2 + 2 + 4 + 4 + 8 + 2 + 2 + 8;
 
-void append_u16(std::vector<uint8_t> & out, uint16_t value) {
-    out.push_back(static_cast<uint8_t>(value));
-    out.push_back(static_cast<uint8_t>(value >> 8));
-}
 
 void append_u32(std::vector<uint8_t> & out, uint32_t value) {
     for (int i = 0; i < 4; ++i) {
@@ -30,16 +19,6 @@ void append_u64(std::vector<uint8_t> & out, uint64_t value) {
     }
 }
 
-bool read_u16(const uint8_t * data, size_t size, size_t & offset, uint16_t & value, std::string & error) {
-    if (offset > size || size - offset < 2) {
-        error = "truncated u16";
-        return false;
-    }
-    value = static_cast<uint16_t>(data[offset]) |
-            static_cast<uint16_t>(data[offset + 1]) << 8;
-    offset += 2;
-    return true;
-}
 
 bool read_u32(const uint8_t * data, size_t size, size_t & offset, uint32_t & value, std::string & error) {
     if (offset > size || size - offset < 4) {
@@ -67,174 +46,9 @@ bool read_u64(const uint8_t * data, size_t size, size_t & offset, uint64_t & val
     return true;
 }
 
-bool valid_message_type(uint16_t value) {
-    return value == static_cast<uint16_t>(message_type::hello) ||
-           value == static_cast<uint16_t>(message_type::batch_meta) ||
-           value == static_cast<uint16_t>(message_type::hidden_state) ||
-           value == static_cast<uint16_t>(message_type::token) ||
-           value == static_cast<uint16_t>(message_type::reset) ||
-           value == static_cast<uint16_t>(message_type::node_config) ||
-           value == static_cast<uint16_t>(message_type::ready) ||
-           value == static_cast<uint16_t>(message_type::profile_result) ||
-           value == static_cast<uint16_t>(message_type::batch_decode) ||
-           value == static_cast<uint16_t>(message_type::batch_result) ||
-           value == static_cast<uint16_t>(message_type::error);
-}
 
-bool valid_data_type(uint16_t value) {
-    return value <= static_cast<uint16_t>(data_type::i32);
-}
 
-} // namespace
 
-std::vector<uint8_t> encode_frame(const message & message) {
-    if (message.payload.size() > max_payload_bytes || message.shape.size() > std::numeric_limits<uint16_t>::max()) {
-        return {};
-    }
-
-    const uint64_t dims_bytes = static_cast<uint64_t>(message.shape.size()) * sizeof(uint64_t);
-    const uint64_t body_size = body_header_bytes + dims_bytes + message.payload.size();
-    if (body_size > static_cast<uint64_t>(frame_prefix_bytes) + max_payload_bytes ||
-        body_size > std::numeric_limits<size_t>::max() - frame_prefix_bytes) {
-        return {};
-    }
-
-    std::vector<uint8_t> frame;
-    frame.reserve(frame_prefix_bytes + static_cast<size_t>(body_size));
-    append_u64(frame, body_size);
-    append_u32(frame, protocol_magic);
-    append_u16(frame, protocol_version);
-    append_u16(frame, static_cast<uint16_t>(message.type));
-    append_u32(frame, message.flags);
-    append_u32(frame, message.rank);
-    append_u64(frame, message.sequence);
-    append_u16(frame, static_cast<uint16_t>(message.dtype));
-    append_u16(frame, static_cast<uint16_t>(message.shape.size()));
-    append_u64(frame, message.payload.size());
-    for (uint64_t dimension : message.shape) {
-        append_u64(frame, dimension);
-    }
-    frame.insert(frame.end(), message.payload.begin(), message.payload.end());
-    return frame;
-}
-
-bool decode_frame(const uint8_t * data, size_t size, message & output, std::string & error) {
-    error.clear();
-    if (data == nullptr || size < frame_prefix_bytes) {
-        error = "truncated frame prefix";
-        return false;
-    }
-
-    size_t offset = 0;
-    uint64_t body_size = 0;
-    if (!read_u64(data, size, offset, body_size, error)) {
-        return false;
-    }
-    if (body_size > frame_prefix_bytes + max_payload_bytes || body_size > size - frame_prefix_bytes) {
-        error = "truncated frame body";
-        return false;
-    }
-    if (body_size < body_header_bytes) {
-        error = "truncated frame header";
-        return false;
-    }
-
-    const size_t body_end = frame_prefix_bytes + static_cast<size_t>(body_size);
-    if (body_end > size) {
-        error = "truncated frame body";
-        return false;
-    }
-
-    uint32_t magic = 0;
-    uint16_t version = 0;
-    uint16_t type = 0;
-    uint16_t dtype = 0;
-    uint16_t dimensions = 0;
-    uint64_t payload_size = 0;
-    if (!read_u32(data, body_end, offset, magic, error) ||
-        !read_u16(data, body_end, offset, version, error) ||
-        !read_u16(data, body_end, offset, type, error) ||
-        !read_u32(data, body_end, offset, output.flags, error) ||
-        !read_u32(data, body_end, offset, output.rank, error) ||
-        !read_u64(data, body_end, offset, output.sequence, error) ||
-        !read_u16(data, body_end, offset, dtype, error) ||
-        !read_u16(data, body_end, offset, dimensions, error) ||
-        !read_u64(data, body_end, offset, payload_size, error)) {
-        return false;
-    }
-
-    if (magic != protocol_magic) {
-        error = "invalid protocol magic";
-        return false;
-    }
-    if (version != protocol_version) {
-        error = "protocol version mismatch: local " + std::to_string(protocol_version) +
-                ", peer " + std::to_string(version) +
-                "; rebuild both sides from the same commit";
-        return false;
-    }
-    if (!valid_message_type(type)) {
-        error = "invalid message type";
-        return false;
-    }
-    if (!valid_data_type(dtype)) {
-        error = "invalid data type";
-        return false;
-    }
-    if (payload_size > max_payload_bytes) {
-        error = "payload exceeds limit";
-        return false;
-    }
-
-    const uint64_t required = static_cast<uint64_t>(offset) +
-                              static_cast<uint64_t>(dimensions) * sizeof(uint64_t) +
-                              payload_size;
-    if (required > body_end) {
-        error = "truncated frame contents";
-        return false;
-    }
-
-    output.type = static_cast<message_type>(type);
-    output.dtype = static_cast<data_type>(dtype);
-    output.shape.clear();
-    output.shape.reserve(dimensions);
-    for (uint16_t i = 0; i < dimensions; ++i) {
-        uint64_t dimension = 0;
-        if (!read_u64(data, body_end, offset, dimension, error)) {
-            return false;
-        }
-        output.shape.push_back(dimension);
-    }
-
-    output.payload.assign(data + offset, data + offset + static_cast<size_t>(payload_size));
-    return true;
-}
-// ---------------------------------------------------------------------------
-// Node schedule (config) encoding. All integers are little-endian.
-//   u32 n_workers, u32 index, u32 n_ctx, u32 n_seq_max, u32 n_ubatch
-//   u8  tail
-//   u8  has_head_link; if set: u16 head_port + u16 host_len + host bytes
-//   u8  downstream;    if set: u16 port + u16 host_len + host bytes
-// ---------------------------------------------------------------------------
-
-static void append_str(std::vector<uint8_t> & out, const std::string & value) {
-    append_u16(out, static_cast<uint16_t>(value.size()));
-    out.insert(out.end(), value.begin(), value.end());
-}
-
-static bool read_str(const uint8_t * data, size_t size, size_t & offset, std::string & value, std::string & error) {
-    uint16_t length = 0;
-    if (!read_u16(data, size, offset, length, error)) {
-        return false;
-    }
-    if (offset > size || size - offset < length) {
-        error = "truncated config string";
-        return false;
-    }
-    value.assign(reinterpret_cast<const char *>(data + offset), length);
-    offset += length;
-    return true;
-}
 
 // Sampler params travel as IEEE-754 bit patterns, little-endian u32, so the
 // wire format stays fixed-width across architectures.
@@ -252,134 +66,109 @@ bool read_f32(const uint8_t * data, size_t size, size_t & offset, float & value,
     std::memcpy(&value, &bits, sizeof(value));
     return true;
 }
+} // namespace
 bool encode_config(const node_config & config, std::vector<uint8_t> & out) {
-    if (config.bounds.size() != config.n_workers + 1 ||
-        config.workers.size() != config.n_workers) {
+    constexpr uint32_t config_version = 1;
+    if (config.n_workers == 0 || config.index >= config.n_workers ||
+        config.n_layer == 0 || config.windows.empty() ||
+        config.windows.size() > config.n_layer) {
         return false;
     }
+    uint32_t next_layer = 0;
+    for (const ring_window & window : config.windows) {
+        if (window.owner >= config.n_workers || window.start != next_layer ||
+            window.start >= window.end || window.end > config.n_layer) {
+            return false;
+        }
+        next_layer = window.end;
+    }
+    if (next_layer != config.n_layer) {
+        return false;
+    }
+
     out.clear();
+    append_u32(out, config_version);
     append_u32(out, config.n_workers);
     append_u32(out, config.index);
+    append_u32(out, config.n_layer);
     append_u32(out, config.n_ctx);
     append_u32(out, config.n_seq_max);
     append_u32(out, config.n_ubatch);
-    out.push_back(config.tail ? 1 : 0);
-    append_u16(out, config.head_link.port);
-    append_str(out, config.head_link.host);
-    append_u32(out, static_cast<uint32_t>(config.bounds.size()));
-    for (uint32_t b : config.bounds) {
-        append_u32(out, b);
-    }
-    for (const node_addr & addr : config.workers) {
-        append_u16(out, addr.port);
-        append_str(out, addr.host);
-    }
     append_u32(out, config.seed);
     append_f32(out, config.temp);
     append_f32(out, config.top_p);
-    if (config.ngl.empty()) {
-        append_u32(out, 0);
-    } else {
-        if (config.ngl.size() != config.n_workers) {
-            return false;
-        }
-        append_u32(out, static_cast<uint32_t>(config.ngl.size()));
-        for (int32_t v : config.ngl) {
-            append_u32(out, static_cast<uint32_t>(v));
-        }
-    }
-    append_u32(out, static_cast<uint32_t>(config.ring.size()));
-    for (const auto & w : config.ring) {
-        append_u32(out, w.first);
-        append_u32(out, w.second);
+    append_u32(out, static_cast<uint32_t>(config.windows.size()));
+    for (const ring_window & window : config.windows) {
+        append_u32(out, window.owner);
+        append_u32(out, window.start);
+        append_u32(out, window.end);
+        append_u32(out, static_cast<uint32_t>(window.n_gpu_layers));
     }
     return true;
 }
 
 bool decode_config(const uint8_t * data, size_t size, node_config & config, std::string & error) {
+    constexpr uint32_t config_version = 1;
     error.clear();
     config = node_config{};
     size_t offset = 0;
-
+    uint32_t version = 0;
+    if (!read_u32(data, size, offset, version, error)) {
+        return false;
+    }
+    if (version != config_version) {
+        error = "unsupported ring config version";
+        return false;
+    }
     if (!read_u32(data, size, offset, config.n_workers, error) ||
         !read_u32(data, size, offset, config.index, error) ||
+        !read_u32(data, size, offset, config.n_layer, error) ||
         !read_u32(data, size, offset, config.n_ctx, error) ||
         !read_u32(data, size, offset, config.n_seq_max, error) ||
-        !read_u32(data, size, offset, config.n_ubatch, error)) {
-        return false;
-    }
-
-    uint8_t flag = 0;
-    if (offset >= size + 1) {
-        error = "truncated config tail flag";
-        return false;
-    }
-    flag = data[offset++];
-    if (flag > 1) {
-        error = "invalid config tail flag";
-        return false;
-    }
-    config.tail = flag == 1;
-    if (!read_u16(data, size, offset, config.head_link.port, error) ||
-        !read_str(data, size, offset, config.head_link.host, error)) {
-        return false;
-    }
-
-    uint32_t n_bounds = 0;
-    if (!read_u32(data, size, offset, n_bounds, error)) {
-        return false;
-    }
-    if (n_bounds != config.n_workers + 1) {
-        error = "config bounds size mismatch";
-        return false;
-    }
-    config.bounds.resize(n_bounds);
-    for (uint32_t & b : config.bounds) {
-        if (!read_u32(data, size, offset, b, error)) {
-            return false;
-        }
-    }
-
-    config.workers.resize(config.n_workers);
-    for (node_addr & addr : config.workers) {
-        if (!read_u16(data, size, offset, addr.port, error) ||
-            !read_str(data, size, offset, addr.host, error)) {
-            return false;
-        }
-    }
-    if (!read_u32(data, size, offset, config.seed, error) ||
+        !read_u32(data, size, offset, config.n_ubatch, error) ||
+        !read_u32(data, size, offset, config.seed, error) ||
         !read_f32(data, size, offset, config.temp, error) ||
         !read_f32(data, size, offset, config.top_p, error)) {
         return false;
     }
-    uint32_t n_ngl = 0;
-    if (!read_u32(data, size, offset, n_ngl, error)) {
+    if (config.n_workers == 0 || config.index >= config.n_workers || config.n_layer == 0) {
+        error = "invalid ring config dimensions";
         return false;
     }
-    if (n_ngl != 0) {
-        if (n_ngl != config.n_workers) {
-            error = "config ngl count mismatch";
-            return false;
-        }
-        config.ngl.resize(n_ngl);
-        for (int32_t & v : config.ngl) {
-            uint32_t raw = 0;
-            if (!read_u32(data, size, offset, raw, error)) {
-                return false;
-            }
-            v = static_cast<int32_t>(raw);
-        }
-    }
-    uint32_t n_ring = 0;
-    if (!read_u32(data, size, offset, n_ring, error)) {
+
+    uint32_t n_windows = 0;
+    if (!read_u32(data, size, offset, n_windows, error)) {
         return false;
     }
-    config.ring.resize(n_ring);
-    for (auto & w : config.ring) {
-        if (!read_u32(data, size, offset, w.first, error) ||
-            !read_u32(data, size, offset, w.second, error)) {
+    if (n_windows == 0 || n_windows > config.n_layer) {
+        error = "invalid ring window count";
+        return false;
+    }
+    config.windows.resize(n_windows);
+    uint32_t next_layer = 0;
+    for (ring_window & window : config.windows) {
+        uint32_t raw_gpu_layers = 0;
+        if (!read_u32(data, size, offset, window.owner, error) ||
+            !read_u32(data, size, offset, window.start, error) ||
+            !read_u32(data, size, offset, window.end, error) ||
+            !read_u32(data, size, offset, raw_gpu_layers, error)) {
             return false;
         }
+        window.n_gpu_layers = static_cast<int32_t>(raw_gpu_layers);
+        if (window.owner >= config.n_workers || window.start != next_layer ||
+            window.start >= window.end || window.end > config.n_layer) {
+            error = "invalid ring window";
+            return false;
+        }
+        next_layer = window.end;
+    }
+    if (next_layer != config.n_layer) {
+        error = "ring windows do not cover the model";
+        return false;
+    }
+    if (offset != size) {
+        error = "trailing ring config bytes";
+        return false;
     }
     return true;
 }
@@ -503,7 +292,8 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
         return false;
     }
     const size_t n_entries = n;
-    uint32_t raw_clear = 0, raw_trim = 0;
+    uint32_t raw_clear = 0;
+    uint32_t raw_trim = 0;
     if (!read_u32(data, size, offset, raw_clear, error) ||
         !read_u32(data, size, offset, raw_trim, error) ||
         !read_u32(data, size, offset, n_logits, error)) {

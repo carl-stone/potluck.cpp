@@ -10,6 +10,11 @@ Static contiguous execution, manual placement, and a single-request server are
 unfinished legacy implementation and must be removed, not retained as product
 modes or fallbacks.
 
+The direct ring is now implemented inside `potluck-server`. The controller
+launches local workers and can bootstrap explicitly named workers over SSH.
+This is a working transport and launch path, not the finished automatic
+cluster lifecycle.
+
 A finished Potluck deployment presents one OpenAI-compatible endpoint on the
 head machine. The controller automatically discovers and profiles the
 available devices, selects the useful devices, assigns repeated disjoint layer
@@ -54,34 +59,50 @@ head; distributed configuration is not part of the normal interface.
 9. The tail samples or selects the next token and the head returns the
    documented OpenAI-compatible JSON or streaming event.
 
-The data plane uses ZeroMQ message-oriented communication between adjacent ring
-peers. Hidden states do not return to the head between windows unless the head
-owns the next window. The custom PTLK/raw-TCP data plane and
-coordinator-relayed route are legacy removal targets.
+The implemented data plane in `potluck-server` uses ZeroMQ message-oriented
+communication between adjacent ring peers. Each worker binds its receive
+socket, connects directly to its cyclic next peer, and sends final results back
+to the head. Ingress goes to rank 0; the head does not relay intermediate
+windows it does not execute.
+
+DNS-SD candidate discovery and automatic SSH launch are implemented. Live
+profiling and admission, resource-aware selection and placement, shard
+automation, recovery, security, and full API parity remain unfinished.
 
 ## Piped-ring execution
 
 Every selected worker can own several disjoint layer windows. A request visits
 those windows in ring order and can visit the same device more than once during
-one model pass. Window sizes and ownership come from the automatic scheduler;
-equal splits and user-supplied static bounds are not product behavior.
+one model pass. Window sizes and ownership come from the automatic scheduler in
+the finished product; equal splits and user-supplied static bounds are not
+product behavior.
+
+The current server route implements two repeated disjoint windows per worker
+where the model layers permit. DNS-SD supplies candidate nodes and the server
+launches them through SSH, but the route still uses fixed scheduling and manual
+shard deployment rather than live heterogeneous profiling, admission,
+selection, and placement.
 
 Each selected device receives from its previous ring peer and sends directly to
 its next ring peer. Rank 0 is both a ring peer and the client-facing controller.
 Its control responsibility does not make it a relay for other peers' window
-transitions. Automatic setup must configure these connections without exposing
-ranks, addresses, ports, or launch order to the user.
+transitions. Automatic setup must eventually configure these connections
+without exposing ranks, addresses, ports, or launch order to the user.
 
 The ring must support prompt prefill, continuous decode, multiple active
 sequences, slot lifecycle, per-window prefetch, and per-window accelerator
-placement through the same server runtime. A standalone ring demonstration
-does not satisfy the architecture.
+placement through the same server runtime. A transport smoke does not satisfy
+the architecture.
 
 ## Shards and loading
 
 `potluck-shard` currently proves that independently loadable GGUF window files
 can preserve source metadata and global block indices. The product controller
 must integrate shard creation, selection, transfer, validation, and caching.
+
+The current server accepts explicit shard inputs and assigns workers only the
+windows described by that configuration. Shard creation, transfer, validation,
+selection, and caching are not yet automated.
 
 Shards are the unit of loading:
 
@@ -132,18 +153,37 @@ are unfinished implementation.
 
 ## Current implementation gap
 
-The present source does not implement this architecture end to end:
+The direct adjacent-peer ZeroMQ path now runs in `potluck-server`:
 
-- `potluck-server` uses a static equal or manually bounded chain;
-- `potluck-head --ring` is a separate opt-in path;
-- profiling produces manually consumed weights instead of live placement;
-- prefetch warms a model file rather than coordinating the next ring window;
-- accelerator planning uses static/global budgets;
-- shard generation and deployment are manual;
-- batch sequence primitives are not a continuous HTTP scheduler;
-- the server has no conversation slots and serializes requests with a mutex.
+- Local two-worker CPU smoke passed with repeated disjoint windows.
+- An M4 head bootstrapped one Linux CPU worker over SSH for the Qwen3.5 0.8B
+  fixture. The two-token result was ` located in`, and the server logged
+  windows `[0,12)` and `[12,24)`.
+- The same M4 head automatically discovered the Linux node through DNS-SD,
+  accepted its first SSH host key in a Potluck-specific trust file, launched
+  the worker, and returned the same two-token result.
+- The remote smoke used the M4 as controller only. It did not demonstrate
+  heterogeneous placement or head computation.
 
-These are gaps to remove through a clean cutover. They are not supported
+The remaining product gaps are explicit:
+
+- DNS-SD candidate discovery and SSH launch are automatic, but live profiling,
+  device admission and selection, and heterogeneous placement are not.
+- Head resource reservation and adaptive head participation are not
+  implemented.
+- Per-window prefetch and independent CPU, CUDA, or Metal placement are not
+  implemented.
+- Shard creation, transfer, validation, selection, and caching remain manual.
+- The server does not yet provide continuous HTTP batching or isolated
+  conversation slots.
+- Worker failure handling lacks reconnect, ring rebuild, slot migration, and
+  safe retry behavior.
+- The OpenAI-compatible HTTP surface is a subset; full request, response,
+  error, usage, streaming, and cancellation parity is unfinished.
+- Authentication, encryption, credential handling, and tenant or prompt
+  privacy controls are unfinished. The deployment boundary remains a trusted
+  LAN.
+
+These gaps must be removed through a clean cutover. They are not supported
 product configurations, provisional releases, or alternate architectures.
-Product tests must exercise the integrated piped-ring server. Static execution
-tests must be deleted or rewritten rather than used as product evidence.
+Product tests must exercise the integrated piped-ring server.

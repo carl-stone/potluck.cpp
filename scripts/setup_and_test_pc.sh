@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# One-shot build + full-suite run of the potluck tools on the Linux/CUDA PC.
+# One-shot build + integrated direct-ring suite on a Linux PC.
 #
 # Run this ON the PC (Linux), from inside a potluck.cpp checkout. It builds
-# potluck-head + potluck-worker + potluck-server + potluck-shard (CPU, plus
-# CUDA when nvidia-smi is present), downloads the Qwen3.5 fixture, and runs
-# the whole test suite.
+# the retained potluck worker, server, and shard tools, downloads the Qwen3.5
+# fixture, and runs the whole test suite.
 #
 # Env:
 #   REPO       checkout to build        (default: this repo)
@@ -18,9 +17,9 @@ set -euo pipefail
 N_PREDICT="${1:-32}"
 HOST="${2:-127.0.0.1}"
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-MODEL_DIR="${MODEL_DIR:-${REPO}/models}"
+POTLUCK_MODEL_DIR="${POTLUCK_MODEL_DIR:-${MODEL_DIR:-}}"
+export POTLUCK_MODEL_DIR
 NPROC="${NPROC:-$(nproc 2>/dev/null || echo 4)}"
-MODEL_URL="https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_0.gguf"
 
 for tool in git cmake g++ pkg-config curl; do
     command -v "${tool}" >/dev/null 2>&1 || { echo "missing build tool: ${tool}" >&2; exit 2; }
@@ -49,7 +48,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     cmake -S . -B build "${cmake_opts[@]}" >/tmp/potluck_pc_cmake.log 2>&1 || {
         tail -20 /tmp/potluck_pc_cmake.log >&2; exit 2; }
     echo "== building (${NPROC} jobs) =="
-    cmake --build build --target potluck-head potluck-worker potluck-server potluck-shard -j "${NPROC}" \
+    cmake --build build --target potluck-node potluck-worker potluck-server potluck-shard llama-cli test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run -j "${NPROC}" \
         >/tmp/potluck_pc_build.log 2>&1 || {
         tail -20 /tmp/potluck_pc_build.log >&2; exit 2; }
     echo "build ok"
@@ -59,14 +58,11 @@ else
 fi
 
 echo "== fetching fixture =="
-mkdir -p "${MODEL_DIR}"
-if [[ ! -f "${MODEL_DIR}/Qwen3.5-0.8B-Q4_0.gguf" ]]; then
-    curl -L --fail --progress-bar -o "${MODEL_DIR}/Qwen3.5-0.8B-Q4_0.gguf" "${MODEL_URL}"
-fi
-ls -l "${MODEL_DIR}/Qwen3.5-0.8B-Q4_0.gguf"
+MODEL_PATH="$(bash "${REPO}/scripts/fetch-model.sh")"
+ls -l "${MODEL_PATH}"
 
 echo "== running the suite (n_predict=${N_PREDICT}, host=${HOST}) =="
 export REPO="${REPO}"
 export BIN="${REPO}/build/bin"
-export MODEL="${MODEL_DIR}/Qwen3.5-0.8B-Q4_0.gguf"
+export MODEL="${MODEL_PATH}"
 bash "${REPO}/tests/potluck/run_all.sh" 2>&1 | tail -20

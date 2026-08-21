@@ -10,7 +10,9 @@ PORT="${4:-$((8100 + RANDOM % 400))}"
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 BIN="${BIN:-${REPO}/build/bin}"
-MODEL="${MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
+# shellcheck source=../../scripts/potluck-model.sh
+source "${REPO}/scripts/potluck-model.sh"
+MODEL="${MODEL:-$(potluck_model_path)}"
 
 source "${REPO}/tests/potluck/test_helpers.sh"
 if [[ ! -x "${BIN}/potluck-server" || ! -x "${BIN}/potluck-worker" || ! -x "${BIN}/llama-cli" ]]; then
@@ -198,69 +200,6 @@ chunks = [json.loads(line) for line in lines[:-1]]
 assert chunks and "".join(c.get("content", "") for c in chunks)
 PY
 
-python3 - "${HOST}" "${PORT}" <<'PY'
-import json, sys, threading, time, urllib.error, urllib.request
-
-host, port = sys.argv[1], int(sys.argv[2])
-base = f"http://{host}:{port}"
-
-def post(body):
-    request = urllib.request.Request(
-        base + "/completion",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            return response.status, response.read().decode()
-    except urllib.error.HTTPError as error:
-        return error.code, error.read().decode()
-
-stream_started = threading.Event()
-long_result = []
-
-def run_long_request():
-    request = urllib.request.Request(
-        base + "/completion",
-        data=json.dumps({
-            "prompt": "The capital of France is",
-            "n_predict": 256,
-            "stream": True,
-        }).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            first_line = response.readline().decode()
-            stream_started.set()
-            rest = response.read().decode()
-            long_result.append((response.status, first_line + rest))
-    except Exception as error:
-        long_result.append(error)
-        stream_started.set()
-
-thread = threading.Thread(target=run_long_request)
-thread.start()
-assert stream_started.wait(30), "stream request never started"
-assert not long_result or isinstance(long_result[0], Exception) is False, long_result
-
-busy_seen = False
-deadline = time.monotonic() + 10
-while thread.is_alive() and time.monotonic() < deadline:
-    status, body = post({"prompt": "The moon is made of", "n_predict": 1})
-    if status == 429:
-        error = json.loads(body)
-        assert error["error"] == "chain is busy; retry later"
-        busy_seen = True
-        break
-    assert status == 200, (status, body)
-assert busy_seen, "concurrent request never received HTTP 429"
-thread.join(timeout=180)
-assert not thread.is_alive(), "stream request did not finish"
-assert long_result and long_result[0][0] == 200, long_result
-status, body = post({"prompt": "The moon is made of", "n_predict": 1})
-assert status == 200, (status, body)
-PY
 
 stop_server
 if [[ "${POTLUCK_SKIP_CLI_PARITY:-0}" == 1 ]]; then

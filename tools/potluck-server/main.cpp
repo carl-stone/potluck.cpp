@@ -1,12 +1,11 @@
-// potluck-server: an OpenAI-compatible HTTP server around a distributed
-// potluck.cpp layer chain. Each request owns the chain for its full decode;
-// concurrent requests receive 429 instead of corrupting recurrent state.
+// potluck-server: an OpenAI-compatible HTTP server around a direct
+// ZeroMQ piped ring. Requests traverse the configured ring route.
 
 #include "llama.h"
 #include "common.h"
 #include "chat.h"
 #include "nlohmann/json.hpp"
-#include "potluck-protocol.h"
+#include "potluck-discovery.h"
 #include "potluck-transport.h"
 #include "potluck_runtime.h"
 #include <cpp-httplib/httplib.h>
@@ -17,18 +16,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <functional>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -103,23 +101,17 @@ std::vector<std::string> split_csv(const std::string & text) {
     }
 }
 
-std::vector<uint32_t> parse_bounds(const std::string & text) {
-    const std::vector<std::string> parts = split_csv(text);
-    std::vector<uint32_t> values;
-    values.reserve(parts.size());
-    for (const std::string & part : parts) {
-        size_t used = 0;
-        const unsigned long value = std::stoul(part, &used);
-        if (used != part.size() || value > UINT32_MAX) {
-            throw std::runtime_error("invalid --bounds value: " + part);
-        }
-        values.push_back(static_cast<uint32_t>(value));
-    }
-    return values;
-}
-
 std::vector<std::string> parse_hosts(const std::string & text) {
     return split_csv(text);
+}
+
+std::string ring_host(const std::string & bootstrap_host) {
+    const size_t user = bootstrap_host.rfind('@');
+    const std::string host = user == std::string::npos ? bootstrap_host : bootstrap_host.substr(user + 1);
+    if (host.empty()) {
+        throw std::runtime_error("bootstrap host has no ring address");
+    }
+    return host;
 }
 
 uint32_t json_u32(const json & object, const char * key, uint32_t fallback) {
@@ -167,6 +159,25 @@ std::string shell_quote(const std::string & value) {
     quoted += '\'';
     return quoted;
 }
+std::string discovery_known_hosts_file() {
+    const char * xdg = std::getenv("XDG_CONFIG_HOME");
+    const char * home = std::getenv("HOME");
+    std::filesystem::path directory;
+    if (xdg != nullptr && xdg[0] != '\0') {
+        directory = std::filesystem::path(xdg) / "potluck";
+    } else if (home != nullptr && home[0] != '\0') {
+        directory = std::filesystem::path(home) / ".config" / "potluck";
+    } else {
+        throw std::runtime_error("automatic SSH trust needs XDG_CONFIG_HOME or HOME");
+    }
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    if (error) {
+        throw std::runtime_error("cannot create Potluck config directory: " + error.message());
+    }
+    return (directory / "known_hosts").string();
+}
+
 
 uint16_t free_port() {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -190,6 +201,51 @@ uint16_t free_port() {
     close(fd);
     return port;
 }
+std::string local_address_for_peer(const std::string & host, uint16_t port) {
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    const std::string service = std::to_string(port);
+    addrinfo * addresses = nullptr;
+    const int resolve = getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+    if (resolve != 0) {
+        throw std::runtime_error("cannot resolve discovered node " + host + ": " + gai_strerror(resolve));
+    }
+    std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> guard(addresses, freeaddrinfo);
+    for (const addrinfo * address = addresses; address != nullptr; address = address->ai_next) {
+        const int fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        const int connected = connect(fd, address->ai_addr, address->ai_addrlen);
+        sockaddr_in local = {};
+        socklen_t local_length = sizeof(local);
+        const bool found = connected == 0 &&
+                           getsockname(fd, reinterpret_cast<sockaddr *>(&local), &local_length) == 0;
+        close(fd);
+        if (found) {
+            char text[INET_ADDRSTRLEN] = {};
+            if (inet_ntop(AF_INET, &local.sin_addr, text, sizeof(text)) != nullptr) {
+                return text;
+            }
+        }
+    }
+    throw std::runtime_error("cannot select a local address for discovered node " + host);
+}
+
+
+std::string tcp_endpoint(const std::string & host, uint16_t port) {
+    return "tcp://" + host + ":" + std::to_string(port);
+}
+
+std::string endpoint_host(const std::string & endpoint, const std::string & host) {
+    const size_t scheme = endpoint.find("://");
+    const size_t port = endpoint.rfind(':');
+    if (scheme == std::string::npos || port == std::string::npos || port <= scheme + 3) {
+        throw std::runtime_error("invalid ZeroMQ endpoint: " + endpoint);
+    }
+    return endpoint.substr(0, scheme + 3) + host + endpoint.substr(port);
+}
 
 std::string local_shard_path(const std::string & directory, const std::string & source,
                              uint32_t index, uint32_t count) {
@@ -197,55 +253,107 @@ std::string local_shard_path(const std::string & directory, const std::string & 
            "of" + std::to_string(count) + ".gguf";
 }
 
-bool launch_remote_worker(const std::string & host, const std::string & model,
-                          uint16_t port, uint32_t index) {
+struct ring_worker {
+    potluck::node_addr address;
+    std::string bind_endpoint;
+    std::string connect_endpoint;
+    std::string next_endpoint;
+};
+
+struct bootstrap_node {
+    std::string ssh_target;
+    uint16_t ssh_port = 22;
+    std::string ring_host;
+    uint16_t ring_port = 40001;
+    std::string known_hosts_file;
+};
+
+struct ServerRing {
+    std::vector<ring_worker> workers;
+    std::vector<potluck::ring_window> windows;
+    potluck::ring_receiver result;
+    std::string result_endpoint;
+    std::vector<potluck::ring_sender> controls;
+    potluck::ring_sender ingress;
+    std::string error;
+};
+
+struct serve_stats {
+    double prefill_seconds = 0.0;
+    double decode_seconds = 0.0;
+    uint64_t head_payload_bytes = 0;
+};
+
+std::vector<potluck::ring_window> build_ring_route(uint32_t n_workers, uint32_t n_layer) {
+    if (n_workers == 0) {
+        throw std::runtime_error("ring needs at least one worker");
+    }
+    if (n_layer < n_workers) {
+        throw std::runtime_error("ring needs at least one layer per worker");
+    }
+    constexpr uint32_t cycles = 2;
+    const uint32_t n_windows = std::min(n_layer, n_workers * cycles);
+    std::vector<potluck::ring_window> windows;
+    windows.reserve(n_windows);
+    for (uint32_t index = 0; index < n_windows; ++index) {
+        const uint32_t start = static_cast<uint32_t>(
+            (static_cast<uint64_t>(n_layer) * index) / n_windows);
+        const uint32_t end = static_cast<uint32_t>(
+            (static_cast<uint64_t>(n_layer) * (index + 1)) / n_windows);
+        windows.push_back({ index % n_workers, start, end, 0 });
+    }
+    return windows;
+}
+
+bool launch_remote_worker(const bootstrap_node & bootstrap, const std::string & model,
+                          const ring_worker & worker, const std::string & result_endpoint,
+                          uint32_t index) {
     const std::string log = "worker-" + std::to_string(index) + ".log";
-    const std::string remote = "cd ~/potluck && nohup ./potluck-worker " + shell_quote(model) +
-                               " 0.0.0.0 " + std::to_string(port) + " >" + shell_quote(log) +
-                               " 2>&1 < /dev/null &";
-    const std::string command = "ssh -o BatchMode=yes " + shell_quote(host) + " " + shell_quote(remote);
+    const std::string remote = "cd ~/potluck || exit 1; nohup ./potluck-worker " + shell_quote(model) +
+                               " --bind " + shell_quote(worker.bind_endpoint) +
+                               " --next " + shell_quote(worker.next_endpoint) +
+                               " --result " + shell_quote(result_endpoint) +
+                               " --rank " + std::to_string(index) +
+                               " >" + shell_quote(log) + " 2>&1 < /dev/null &";
+    const std::string ssh_port = bootstrap.ssh_port == 22
+        ? std::string() : " -p " + std::to_string(bootstrap.ssh_port);
+    const std::string ssh_trust = bootstrap.known_hosts_file.empty()
+        ? std::string()
+        : " -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=" +
+              shell_quote(bootstrap.known_hosts_file);
+    const std::string ssh = "ssh -o BatchMode=yes" + ssh_trust + ssh_port;
+    const std::string command = ssh + " " + shell_quote(bootstrap.ssh_target) + " " + shell_quote(remote);
     std::printf("potluck-server: launch[%u] %s\n", index, command.c_str());
     std::fflush(stdout);
     const int rc = std::system(command.c_str());
     if (rc == 0) {
         return true;
     }
-    const std::string tail_command = "ssh -o BatchMode=yes " + shell_quote(host) +
-                                     " " + shell_quote("tail -n 40 ~/potluck/" + log);
+    const std::string tail_command = ssh + " " + shell_quote(bootstrap.ssh_target) + " " +
+                                     shell_quote("tail -n 40 ~/potluck/" + log);
     std::fprintf(stderr, "potluck-server: SSH launch failed (exit %d): %s\n", rc, command.c_str());
     std::fprintf(stderr, "potluck-server: remote log tail command: %s\n", tail_command.c_str());
     std::system(tail_command.c_str());
     return false;
 }
 
-struct ServerChain {
-    std::vector<potluck::node_addr> workers;
-    std::vector<uint32_t> bounds;
-    potluck::tcp_channel stage0;
-    potluck::tcp_channel result;
-    std::string error;
-};
-struct serve_stats {
-    double prefill_seconds = 0.0;
-    double decode_seconds = 0.0;
-    uint64_t coordinator_payload_bytes = 0;
-};
-
-
-std::vector<potluck::node_addr> spawn_local(const std::string & worker_path,
-                                             const std::vector<std::string> & models,
-                                             const std::string & host) {
-    std::vector<potluck::node_addr> addresses;
-    addresses.reserve(models.size());
+void launch_local_workers(const std::string & worker_path,
+                          const std::vector<std::string> & models,
+                          const std::vector<ring_worker> & workers,
+                          const std::string & result_endpoint) {
     for (uint32_t index = 0; index < models.size(); ++index) {
-        const uint16_t port = free_port();
-        const std::string port_text = std::to_string(port);
         const pid_t pid = fork();
         if (pid < 0) {
             throw std::runtime_error("cannot fork potluck-worker");
         }
         if (pid == 0) {
-            std::vector<std::string> args = { worker_path, models[index], host, port_text };
+            std::vector<std::string> args = {
+                worker_path, models[index],
+                "--bind", workers[index].bind_endpoint,
+                "--next", workers[index].next_endpoint,
+                "--result", result_endpoint,
+                "--rank", std::to_string(index)
+            };
             std::vector<char *> argv;
             argv.reserve(args.size() + 1);
             for (std::string & arg : args) {
@@ -255,119 +363,91 @@ std::vector<potluck::node_addr> spawn_local(const std::string & worker_path,
             execv(worker_path.c_str(), argv.data());
             std::_Exit(127);
         }
-        (void) pid;
-        addresses.push_back({ host, port });
     }
-    return addresses;
 }
 
-std::vector<potluck::node_addr> read_workers_file(const std::string & path) {
-    std::ifstream input(path);
-    if (!input) {
-        throw std::runtime_error("cannot open workers file: " + path);
+void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
+                    uint32_t n_seq_max, uint32_t n_ubatch, uint32_t seed,
+                    float temp, float top_p) {
+    const uint32_t n_workers = static_cast<uint32_t>(ring.workers.size());
+    if (n_workers == 0 || ring.windows.empty()) {
+        throw std::runtime_error("cannot configure an empty ring");
     }
-    std::vector<potluck::node_addr> addresses;
-    std::string line;
-    while (std::getline(input, line)) {
-        const size_t comment = line.find('#');
-        if (comment != std::string::npos) {
-            line.resize(comment);
-        }
-        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
-            line.pop_back();
-        }
-        if (line.empty()) {
-            continue;
-        }
-        const size_t colon = line.rfind(':');
-        if (colon == std::string::npos || colon == 0 || colon + 1 == line.size()) {
-            throw std::runtime_error("invalid worker address: " + line);
-        }
-        addresses.push_back({ line.substr(0, colon), static_cast<uint16_t>(std::stoul(line.substr(colon + 1))) });
-    }
-    return addresses;
-}
+    constexpr int handshake_timeout_ms = 120000;
+    constexpr int decode_timeout_ms = 120000;
 
-ServerChain wire_chain(const std::vector<potluck::node_addr> & addresses,
-                       const std::string & head_host, uint32_t n_layer,
-                       uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch,
-                       uint32_t seed, float temp, float top_p,
-                       const std::vector<int32_t> & ngl,
-                       std::vector<uint32_t> bounds) {
-    if (addresses.empty()) {
-        throw std::runtime_error("no workers configured");
-    }
-    const uint32_t n_workers = static_cast<uint32_t>(addresses.size());
-    if (bounds.empty()) {
-        bounds.resize(n_workers + 1);
-        for (uint32_t i = 0; i <= n_workers; ++i) {
-            bounds[i] = static_cast<uint32_t>((static_cast<uint64_t>(n_layer) * i) / n_workers);
+    ring.controls.reserve(n_workers);
+    for (uint32_t index = 0; index < n_workers; ++index) {
+        potluck::ring_sender sender = potluck::ring_sender::connect(
+            ring.workers[index].connect_endpoint, ring.error);
+        if (!sender.valid()) {
+            throw std::runtime_error("cannot connect ring control sender for worker " +
+                                     std::to_string(index) + ": " + ring.error);
         }
-    }
-    if (bounds.size() != n_workers + 1 || bounds.front() != 0 || bounds.back() != n_layer) {
-        throw std::runtime_error("--bounds must contain n_workers+1 values from 0 to n_layer");
-    }
-    for (size_t i = 1; i < bounds.size(); ++i) {
-        if (bounds[i] <= bounds[i - 1]) {
-            throw std::runtime_error("worker bounds must be strictly increasing");
+        if (!sender.set_send_timeout(handshake_timeout_ms, ring.error)) {
+            throw std::runtime_error("cannot set ring control timeout: " + ring.error);
         }
+        ring.controls.push_back(std::move(sender));
+    }
+    ring.ingress = potluck::ring_sender::connect(ring.workers.front().connect_endpoint, ring.error);
+    if (!ring.ingress.valid()) {
+        throw std::runtime_error("cannot connect ring ingress sender: " + ring.error);
+    }
+    if (!ring.ingress.set_send_timeout(decode_timeout_ms, ring.error)) {
+        throw std::runtime_error("cannot set ring ingress timeout: " + ring.error);
     }
 
-    ServerChain chain;
-    chain.workers = addresses;
-    chain.bounds = bounds;
-    potluck::tcp_listener result_listener = potluck::tcp_listener::bind_host(head_host, 0);
-    if (!result_listener.valid()) {
-        throw std::runtime_error("cannot bind chain result listener");
+    for (uint32_t index = 0; index < n_workers; ++index) {
+        potluck::node_config config;
+        config.n_workers = n_workers;
+        config.index = index;
+        config.n_layer = n_layer;
+        config.n_ctx = n_ctx;
+        config.n_seq_max = n_seq_max;
+        config.n_ubatch = n_ubatch;
+        config.seed = seed;
+        config.temp = temp;
+        config.top_p = top_p;
+        config.windows = ring.windows;
+        std::vector<uint8_t> payload;
+        if (!potluck::encode_config(config, payload)) {
+            throw std::runtime_error("cannot encode ring worker configuration");
+        }
+        potluck::message message;
+        message.type = potluck::message_type::node_config;
+        message.rank = index;
+        message.payload = std::move(payload);
+        if (!ring.controls[index].send(message, ring.error)) {
+            throw std::runtime_error("cannot send ring worker configuration: " + ring.error);
+        }
     }
 
-    potluck::node_config config;
-    config.n_workers = n_workers;
-    config.n_ctx = n_ctx;
-    config.n_seq_max = n_seq_max;
-    config.n_ubatch = n_ubatch;
-    config.seed = seed;
-    config.temp = temp;
-    config.top_p = top_p;
-    config.bounds = bounds;
-    config.workers = addresses;
-    config.ngl = ngl;
-    config.head_link = { head_host, result_listener.port() };
-
-    chain.stage0 = potluck::connect_retry(addresses[0].host, addresses[0].port, 9000, 200, chain.error);
-    if (!chain.stage0.valid()) {
-        throw std::runtime_error("cannot connect to worker 0: " + chain.error);
+    if (!ring.result.set_receive_timeout(handshake_timeout_ms, ring.error)) {
+        throw std::runtime_error("cannot set ring ready timeout: " + ring.error);
     }
-    chain.stage0.set_timeouts(potluck::handshake_timeout_s(), potluck::handshake_timeout_s());
-    std::vector<uint8_t> payload;
-    if (!potluck::encode_config(config, payload)) {
-        throw std::runtime_error("cannot encode worker configuration");
+    for (uint32_t ready_count = 0; ready_count < n_workers; ++ready_count) {
+        potluck::message ready;
+        if (!ring.result.receive(ready, ring.error)) {
+            throw std::runtime_error("ring worker readiness failed: " + ring.error);
+        }
+        if (ready.type != potluck::message_type::ready) {
+            throw std::runtime_error("ring worker sent unexpected readiness message");
+        }
     }
-    potluck::message config_message;
-    config_message.type = potluck::message_type::node_config;
-    config_message.payload = std::move(payload);
-    if (!chain.stage0.send(config_message, chain.error)) {
-        throw std::runtime_error("cannot send worker configuration: " + chain.error);
+    if (!ring.result.set_receive_timeout(decode_timeout_ms, ring.error)) {
+        throw std::runtime_error("cannot set ring result timeout: " + ring.error);
     }
-    // Stage 0 reports ready only after every downstream worker has wired its
-    // link. Receive first so a rejected shard closes the timed handshake
-    // instead of leaving this result-listener accept blocked forever.
-    potluck::message ready;
-    if (!chain.stage0.receive(ready, chain.error) || ready.type != potluck::message_type::ready) {
-        throw std::runtime_error("chain never became ready: " + chain.error);
+    std::printf("potluck-server: ring ready (%u workers, %zu windows)\n",
+                n_workers, ring.windows.size());
+    for (size_t i = 0; i < ring.windows.size(); ++i) {
+        const potluck::ring_window & window = ring.windows[i];
+        std::printf("potluck-server: ring window %zu owner=%u layers=[%u,%u) n_gpu_layers=%d\n",
+                    i, window.owner, window.start, window.end, window.n_gpu_layers);
     }
-    chain.result = result_listener.accept(chain.error);
-    if (!chain.result.valid()) {
-        throw std::runtime_error("tail never connected back: " + chain.error);
-    }
-    chain.stage0.set_timeouts(potluck::decode_timeout_s(), potluck::decode_timeout_s());
-    chain.result.set_timeouts(potluck::decode_timeout_s(), potluck::decode_timeout_s());
-    std::printf("potluck-server: chain ready (%u workers)\n", n_workers);
     std::fflush(stdout);
-    return chain;
 }
 
-std::vector<int32_t> drive_batch(ServerChain & chain,
+std::vector<int32_t> drive_batch(ServerRing & ring,
                                  const std::vector<int32_t> & positions,
                                  const std::vector<int32_t> & sequences,
                                  const std::vector<int32_t> & tokens,
@@ -378,26 +458,31 @@ std::vector<int32_t> drive_batch(ServerChain & chain,
     }
     potluck::message input;
     input.type = potluck::message_type::batch_decode;
+    input.flags = 0;
+    input.rank = 0;
     input.sequence = static_cast<uint64_t>(positions.back());
     if (!potluck::encode_batch_payload(positions, sequences, tokens, nullptr, 0,
                                        clear, trim_to, n_logits, input.payload)) {
-        throw std::runtime_error("cannot encode chain batch");
+        throw std::runtime_error("cannot encode ring batch");
     }
     if (stats != nullptr) {
-        stats->coordinator_payload_bytes += input.payload.size();
+        stats->head_payload_bytes += input.payload.size();
     }
-    if (!chain.stage0.send(input, chain.error)) {
-        throw std::runtime_error("cannot send chain batch: " + chain.error);
+    if (!ring.ingress.send(input, ring.error)) {
+        throw std::runtime_error("cannot inject ring batch: " + ring.error);
     }
     potluck::message output;
-    if (!chain.result.receive(output, chain.error)) {
-        throw std::runtime_error("chain result channel closed: " + chain.error);
+    if (!ring.result.receive(output, ring.error)) {
+        throw std::runtime_error("ring result receiver closed: " + ring.error);
     }
     if (stats != nullptr) {
-        stats->coordinator_payload_bytes += output.payload.size();
+        stats->head_payload_bytes += output.payload.size();
     }
     if (output.type != potluck::message_type::batch_result) {
-        throw std::runtime_error("unexpected chain result message");
+        throw std::runtime_error("unexpected ring result message");
+    }
+    if (output.flags != ring.windows.size()) {
+        throw std::runtime_error("ring result stopped before completing its route");
     }
     std::vector<int32_t> result_positions, result_sequences, result_tokens;
     std::vector<float> result_hidden;
@@ -406,11 +491,11 @@ std::vector<int32_t> drive_batch(ServerChain & chain,
     if (!potluck::decode_batch_payload(output.payload.data(), output.payload.size(), 0,
                                        ignored_clear, ignored_trim, ignored_logits,
                                        result_positions, result_sequences, result_tokens,
-                                       result_hidden, chain.error)) {
-        throw std::runtime_error("cannot decode chain result: " + chain.error);
+                                       result_hidden, ring.error)) {
+        throw std::runtime_error("cannot decode ring result: " + ring.error);
     }
     if (result_positions != positions || result_sequences != sequences || result_tokens.size() != positions.size()) {
-        throw std::runtime_error("chain result entries do not match the request");
+        throw std::runtime_error("ring result entries do not match the request");
     }
     return result_tokens;
 }
@@ -445,28 +530,7 @@ double peak_rss_mb() {
 #endif
 }
 
-std::vector<potluck::worker_bench_metrics> request_worker_metrics(
-        ServerChain & chain) {
-    potluck::message request;
-    request.type = potluck::message_type::profile_result;
-    if (!chain.stage0.send(request, chain.error)) {
-        throw std::runtime_error("cannot request worker benchmark metrics: " + chain.error);
-    }
-    potluck::message response;
-    if (!chain.stage0.receive(response, chain.error) ||
-        response.type != potluck::message_type::profile_result) {
-        throw std::runtime_error("worker benchmark metrics response missing: " + chain.error);
-    }
-    std::vector<potluck::worker_bench_metrics> metrics;
-    if (!potluck::decode_worker_bench_metrics(response.payload.data(), response.payload.size(),
-                                               metrics, chain.error)) {
-        throw std::runtime_error("cannot decode worker benchmark metrics: " + chain.error);
-    }
-    return metrics;
-}
-
-
-std::vector<llama_token> serve(ServerChain & chain, const llama_vocab * vocab,
+std::vector<llama_token> serve(ServerRing & ring, const llama_vocab * vocab,
                                const std::vector<llama_token> & prompt,
                                uint32_t n_predict,
                                const std::function<void(const std::string &)> & emit,
@@ -482,7 +546,7 @@ std::vector<llama_token> serve(ServerChain & chain, const llama_vocab * vocab,
         tokens[i] = static_cast<int32_t>(prompt[i]);
     }
     const auto prefill_start = std::chrono::steady_clock::now();
-    (void) drive_batch(chain, positions, sequences, tokens, 1, -1, 1, stats);
+    (void) drive_batch(ring, positions, sequences, tokens, 1, -1, 1, stats);
     if (stats != nullptr) {
         stats->prefill_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prefill_start).count();
@@ -494,14 +558,13 @@ std::vector<llama_token> serve(ServerChain & chain, const llama_vocab * vocab,
     uint32_t position = static_cast<uint32_t>(prompt.size());
     for (uint32_t i = 0; i < n_predict; ++i) {
         const auto decode_start = std::chrono::steady_clock::now();
-        const std::vector<int32_t> result = drive_batch(chain,
+        const std::vector<int32_t> result = drive_batch(ring,
             { static_cast<int32_t>(position) }, { 0 }, { static_cast<int32_t>(previous) }, 0, -1, 1, stats);
         if (stats != nullptr) {
             stats->decode_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - decode_start).count();
         }
         if (result.empty()) {
-
             break;
         }
         const llama_token next = static_cast<llama_token>(result.front());
@@ -534,15 +597,10 @@ int main(int argc, char ** argv) {
         std::string model_path;
         std::string shard_dir;
         std::string host = "127.0.0.1";
-        std::string workers_file;
         std::string hosts_spec;
         std::string launch;
-        std::string bounds_spec;
         uint16_t http_port = 8080;
-        uint16_t worker_port_base = 39271;
-        uint32_t worker_local = 2;
-        uint32_t gpu_layers = 0;
-        uint32_t gpu_mem_mb = 0;
+        uint32_t worker_local = 0;
         uint32_t n_predict_default = 24;
         uint32_t n_ctx = 4096;
         uint32_t n_seq_max = 1;
@@ -551,6 +609,7 @@ int main(int argc, char ** argv) {
         float temp = 0.0f;
         float top_p = 0.0f;
         bool bench = false;
+        bool workers_option = false;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -564,14 +623,12 @@ int main(int argc, char ** argv) {
             else if (arg == "--shard-dir" || arg == "--shards") shard_dir = take("--shard-dir");
             else if (arg == "--host") host = take("--host");
             else if (arg == "--port") http_port = static_cast<uint16_t>(std::stoul(take("--port")));
-            else if (arg == "--workers") worker_local = static_cast<uint32_t>(std::stoul(take("--workers")));
-            else if (arg == "--workers-file") workers_file = take("--workers-file");
+            else if (arg == "--workers") {
+                worker_local = static_cast<uint32_t>(std::stoul(take("--workers")));
+                workers_option = true;
+            }
             else if (arg == "--hosts") hosts_spec = take("--hosts");
             else if (arg == "--launch") launch = take("--launch");
-            else if (arg == "--worker-port-base") worker_port_base = static_cast<uint16_t>(std::stoul(take("--worker-port-base")));
-            else if (arg == "--bounds") bounds_spec = take("--bounds");
-            else if (arg == "--gpu-layers" || arg == "--ngl") gpu_layers = static_cast<uint32_t>(std::stoul(take("--gpu-layers")));
-            else if (arg == "--gpu-mem") gpu_mem_mb = static_cast<uint32_t>(std::stoul(take("--gpu-mem")));
             else if (arg == "--ctx") n_ctx = static_cast<uint32_t>(std::stoul(take("--ctx")));
             else if (arg == "--batch") n_seq_max = std::max<uint32_t>(1, static_cast<uint32_t>(std::stoul(take("--batch"))));
             else if (arg == "--temp") temp = std::stof(take("--temp"));
@@ -579,16 +636,24 @@ int main(int argc, char ** argv) {
             else if (arg == "--seed") seed = static_cast<uint32_t>(std::stoul(take("--seed")));
             else if (arg == "--n-predict") n_predict_default = static_cast<uint32_t>(std::stoul(take("--n-predict")));
             else if (arg == "--bench") bench = true;
-            else throw std::runtime_error("usage: potluck-server -m model.gguf [--workers N | --hosts a,b,c] [--launch ssh] [--shard-dir DIR] [--bounds A,B,...]");
+            else throw std::runtime_error(
+                "usage: potluck-server -m model.gguf [--workers N] [--shard-dir DIR] "
+                "[--hosts a,b,c (internal discovery bootstrap)] [--launch ssh]");
         }
         if (model_path.empty()) {
             throw std::runtime_error("need -m model.gguf");
         }
         if (!launch.empty() && launch != "ssh") {
-            throw std::runtime_error("--launch supports only ssh");
+            throw std::runtime_error("--launch supports only ssh for internal discovery bootstrap");
         }
-        if (!hosts_spec.empty() && (!workers_file.empty() || worker_local != 2)) {
-            throw std::runtime_error("--hosts cannot be combined with --workers or --workers-file");
+        if (!hosts_spec.empty() && workers_option) {
+            throw std::runtime_error("--hosts is internal discovery-bootstrap input and cannot be combined with --workers");
+        }
+        if (hosts_spec.empty() && !launch.empty()) {
+            throw std::runtime_error("--launch ssh requires internal discovery-bootstrap --hosts input");
+        }
+        if (!hosts_spec.empty() && launch != "ssh") {
+            throw std::runtime_error("--hosts is internal discovery-bootstrap input and requires --launch ssh");
         }
 
         llama_backend_init();
@@ -608,88 +673,139 @@ int main(int argc, char ** argv) {
         const std::string model_name = basename_of(model_path);
         common_chat_templates_ptr chat_templates = common_chat_templates_init(meta, "");
 
-        std::vector<potluck::node_addr> addresses;
-        std::vector<std::string> worker_models;
+        std::vector<bootstrap_node> bootstrap_nodes;
         if (!hosts_spec.empty()) {
-            const std::vector<std::string> hosts = parse_hosts(hosts_spec);
-            worker_local = 0;
-            addresses.reserve(hosts.size());
-            for (uint32_t i = 0; i < hosts.size(); ++i) {
-                addresses.push_back({ hosts[i], static_cast<uint16_t>(worker_port_base + i) });
+            for (const std::string & value : parse_hosts(hosts_spec)) {
+                bootstrap_node bootstrap;
+                bootstrap.ssh_target = value;
+                bootstrap.ring_host = ring_host(value);
+                bootstrap_nodes.push_back(std::move(bootstrap));
             }
-            if (shard_dir.empty()) {
-                for (size_t i = 0; i < hosts.size(); ++i) {
-                    // launch_remote_worker() changes to ~/potluck first, so a
-                    // basename avoids quoting a literal "~" as a path.
+        } else if (!workers_option) {
+            std::string discovery_error;
+            const std::vector<potluck::discovered_node> discovered =
+                potluck::discover_nodes(3000, discovery_error);
+            if (!discovery_error.empty()) {
+                throw std::runtime_error("mDNS discovery failed: " + discovery_error);
+            }
+            const std::string known_hosts_file = discovery_known_hosts_file();
+            for (const potluck::discovered_node & node : discovered) {
+                const std::string label = !node.id.empty()
+                    ? node.id : (node.instance.empty() ? std::string("<unnamed>") : node.instance);
+                const auto skip = [&](const char * reason) {
+                    std::fprintf(stderr,
+                                 "potluck-server: skipping incompatible discovered node '%s': %s\n",
+                                 label.c_str(), reason);
+                };
+                if (node.protocol_version != potluck::discovery_protocol_version) {
+                    skip("unsupported protocol version");
+                    continue;
+                }
+                if (!node.available) {
+                    skip("node is not available");
+                    continue;
+                }
+                if (node.id.empty()) {
+                    skip("missing id");
+                    continue;
+                }
+                if (node.host.empty()) {
+                    skip("missing host");
+                    continue;
+                }
+                if (node.ssh_user.empty()) {
+                    skip("missing SSH user");
+                    continue;
+                }
+                if (node.ssh_port == 0 || node.ring_port == 0) {
+                    skip("missing SSH or ring port");
+                    continue;
+                }
+                bootstrap_node bootstrap;
+                bootstrap.ssh_target = node.ssh_user + "@" + node.host;
+                bootstrap.ssh_port = node.ssh_port;
+                bootstrap.ring_host = node.host;
+                bootstrap.ring_port = node.ring_port;
+                bootstrap.known_hosts_file = known_hosts_file;
+                bootstrap_nodes.push_back(std::move(bootstrap));
+            }
+            if (bootstrap_nodes.empty()) {
+                throw std::runtime_error("mDNS discovery returned no eligible nodes");
+            }
+        }
+
+        const bool remote = !bootstrap_nodes.empty();
+        if (!remote && worker_local == 0) {
+            throw std::runtime_error("need at least one ring worker");
+        }
+        const uint32_t n_workers = remote
+            ? static_cast<uint32_t>(bootstrap_nodes.size()) : worker_local;
+        if (n_workers == 0) {
+            throw std::runtime_error("need at least one ring worker");
+        }
+
+        // These addresses are controller-private. Local ports are reserved before worker launch.
+        std::vector<ring_worker> workers;
+        workers.reserve(n_workers);
+        std::vector<std::string> worker_models;
+        worker_models.reserve(n_workers);
+        for (uint32_t index = 0; index < n_workers; ++index) {
+            const std::string address_host = remote ? bootstrap_nodes[index].ring_host : "127.0.0.1";
+            const uint16_t port = remote ? bootstrap_nodes[index].ring_port : free_port();
+            ring_worker worker;
+            worker.address = { address_host, port };
+            worker.connect_endpoint = tcp_endpoint(address_host, port);
+            worker.bind_endpoint = tcp_endpoint(remote ? "0.0.0.0" : address_host, port);
+            workers.push_back(std::move(worker));
+
+            if (remote) {
+                if (shard_dir.empty()) {
+                    // SSH workers run from ~/potluck, so pass only the model name.
                     worker_models.push_back(model_name);
+                } else {
+                    worker_models.push_back(basename_of(
+                        local_shard_path(shard_dir, model_path, index, n_workers)));
                 }
             } else {
-                for (size_t i = 0; i < hosts.size(); ++i) {
-                    worker_models.push_back(basename_of(local_shard_path(shard_dir, model_path, i, hosts.size())));
+                worker_models.push_back(shard_dir.empty()
+                    ? model_path : local_shard_path(shard_dir, model_path, index, n_workers));
+            }
+        }
+        for (uint32_t index = 0; index < n_workers; ++index) {
+            workers[index].next_endpoint = workers[(index + 1) % n_workers].connect_endpoint;
+        }
+
+        ServerRing ring;
+        ring.workers = std::move(workers);
+        ring.windows = build_ring_route(n_workers, n_layer);
+        std::string result_error;
+        ring.result = potluck::ring_receiver::bind("tcp://0.0.0.0:*", result_error);
+        if (!ring.result.valid()) {
+            throw std::runtime_error("cannot bind ring result receiver: " + result_error);
+        }
+        const std::string result_host = remote
+            ? local_address_for_peer(bootstrap_nodes.front().ring_host, bootstrap_nodes.front().ring_port)
+            : (host == "0.0.0.0" ? "127.0.0.1" : host);
+        ring.result_endpoint = endpoint_host(ring.result.endpoint(), result_host);
+
+        if (remote) {
+            for (uint32_t index = 0; index < n_workers; ++index) {
+                if (!launch_remote_worker(bootstrap_nodes[index], worker_models[index],
+                                          ring.workers[index], ring.result_endpoint, index)) {
+                    throw std::runtime_error("remote ring worker launch failed");
                 }
             }
-            if (launch == "ssh") {
-                for (uint32_t i = 0; i < hosts.size(); ++i) {
-                    if (!launch_remote_worker(hosts[i], worker_models[i], addresses[i].port, i)) {
-                        throw std::runtime_error("remote worker launch failed");
-                    }
-                }
-            }
-        } else if (!workers_file.empty()) {
-            addresses = read_workers_file(workers_file);
         } else {
             const std::string worker_path = exe_dir(argv[0]) + "/potluck-worker";
             if (worker_path == "/potluck-worker") {
                 throw std::runtime_error("cannot locate potluck-worker beside potluck-server");
             }
-            worker_models.assign(worker_local, model_path);
-            if (!shard_dir.empty()) {
-                for (uint32_t i = 0; i < worker_local; ++i) {
-                    worker_models[i] = local_shard_path(shard_dir, model_path, i, worker_local);
-                }
-            }
-            addresses = spawn_local(worker_path, worker_models, host == "0.0.0.0" ? "127.0.0.1" : host);
+            launch_local_workers(worker_path, worker_models, ring.workers, ring.result_endpoint);
         }
-        if (addresses.empty()) {
-            throw std::runtime_error("need at least one worker");
-        }
-        if (worker_models.empty()) {
-            worker_models.assign(addresses.size(), model_path);
-        }
-
-        std::vector<uint32_t> bounds;
-        if (!bounds_spec.empty()) {
-            bounds = parse_bounds(bounds_spec);
-        }
-        if (!bounds.empty() && bounds.size() != addresses.size() + 1) {
-            throw std::runtime_error("--bounds must have one more value than workers");
-        }
-
-        std::vector<int32_t> ngl(addresses.size(), 0);
-        if (gpu_layers > 0 || gpu_mem_mb > 0) {
-            uint32_t total = std::min(gpu_layers, n_layer);
-            if (gpu_mem_mb > 0) {
-                const uint64_t layer_bytes = std::max<uint64_t>(1, potluck::model_file_bytes(model_path) / n_layer);
-                total = std::min<uint32_t>(n_layer, static_cast<uint32_t>((static_cast<uint64_t>(gpu_mem_mb) * 1024 * 1024) / layer_bytes));
-            }
-            const std::vector<uint32_t> effective = bounds.empty() ? [&] {
-                std::vector<uint32_t> v(addresses.size() + 1);
-                for (uint32_t i = 0; i <= addresses.size(); ++i) v[i] = static_cast<uint32_t>((static_cast<uint64_t>(n_layer) * i) / addresses.size());
-                return v;
-            }() : bounds;
-            for (uint32_t i = 0; i < addresses.size(); ++i) {
-                const int64_t remaining = static_cast<int64_t>(total) - effective[i];
-                const int64_t width = effective[i + 1] - effective[i];
-                ngl[i] = static_cast<int32_t>(std::max<int64_t>(0, std::min(remaining, width)));
-            }
-        }
-
-        ServerChain chain = wire_chain(addresses, host == "0.0.0.0" ? "127.0.0.1" : host,
-                                        n_layer, n_ctx, n_seq_max, n_ubatch,
-                                        seed, temp, top_p, ngl, bounds);
+        configure_ring(ring, n_layer, n_ctx, n_seq_max, n_ubatch, seed, temp, top_p);
 
         httplib::Server server;
-        std::mutex chain_mutex;
+        std::mutex ring_mutex;
         const auto set_common_headers = [](httplib::Response & response) {
             response.set_header("Access-Control-Allow-Origin", "*");
             response.set_header("Cache-Control", "no-cache");
@@ -701,11 +817,15 @@ int main(int argc, char ** argv) {
             response.status = 204;
         });
         server.Get("/health", [&](const httplib::Request &, httplib::Response & response) {
-            json health = { { "status", "ok" }, { "workers", chain.workers.size() }, { "windows", json::array() } };
-            for (size_t i = 0; i < chain.workers.size(); ++i) {
+            json health = { { "status", "ok" }, { "workers", ring.workers.size() }, { "windows", json::array() } };
+            for (size_t i = 0; i < ring.windows.size(); ++i) {
+                const potluck::ring_window & window = ring.windows[i];
+                const ring_worker & worker = ring.workers[window.owner];
                 health["windows"].push_back(json{
-                    { "index", i }, { "host", chain.workers[i].host }, { "port", chain.workers[i].port },
-                    { "start", chain.bounds[i] }, { "end", chain.bounds[i + 1] }
+                    { "index", i }, { "owner", window.owner },
+                    { "host", worker.address.host }, { "port", worker.address.port },
+                    { "start", window.start }, { "end", window.end },
+                    { "n_gpu_layers", window.n_gpu_layers }
                 });
             }
             set_common_headers(response);
@@ -721,11 +841,11 @@ int main(int argc, char ** argv) {
 
         auto handle = [&](const httplib::Request & request, httplib::Response & response, bool chat) {
             std::shared_ptr<std::unique_lock<std::mutex>> busy =
-                std::make_shared<std::unique_lock<std::mutex>>(chain_mutex, std::defer_lock);
+                std::make_shared<std::unique_lock<std::mutex>>(ring_mutex, std::defer_lock);
             if (!busy->try_lock()) {
                 response.status = 429;
                 set_common_headers(response);
-                response.set_content(error_json("chain is busy; retry later").dump(), "application/json");
+                response.set_content(error_json("ring is busy; retry later").dump(), "application/json");
                 return;
             }
             json req;
@@ -791,7 +911,7 @@ int main(int argc, char ** argv) {
                                     const std::string event = "data: " + common_chunk(role) + "\n\n";
                                     sink.write(event.data(), event.size());
                                 }
-                                (void) serve(chain, vocab, prompt, n_predict, [&](const std::string & piece) {
+                                (void) serve(ring, vocab, prompt, n_predict, [&](const std::string & piece) {
                                     json delta = chat ? json{ { "index", 0 }, { "delta", { { "content", piece } } }, { "finish_reason", nullptr } }
                                                        : json{ { "content", piece } };
                                     const std::string event = chat ? "data: " + common_chunk(delta) + "\n\n"
@@ -818,7 +938,7 @@ int main(int argc, char ** argv) {
                     return;
                 }
 
-                const std::vector<llama_token> generated = serve(chain, vocab, prompt, n_predict, {});
+                const std::vector<llama_token> generated = serve(ring, vocab, prompt, n_predict, {});
                 const std::string text = render_tokens(vocab, generated);
                 json result;
                 if (chat) {
@@ -860,14 +980,14 @@ int main(int argc, char ** argv) {
             }
         });
 
-        std::printf("potluck-server: listening on http://%s:%u (%zu workers, model %s)\n",
-                    host.c_str(), http_port, addresses.size(), model_path.c_str());
+        std::printf("potluck-server: listening on http://%s:%u (%zu workers, %zu ring windows, model %s)\n",
+                    host.c_str(), http_port, ring.workers.size(), ring.windows.size(), model_path.c_str());
         std::fflush(stdout);
         if (bench) {
             const std::vector<llama_token> bench_prompt = tokenize_prompt(vocab, "The capital of France is");
             serve_stats stats;
             const auto start = std::chrono::steady_clock::now();
-            const std::vector<llama_token> bench_tokens = serve(chain, vocab, bench_prompt, 8, {}, &stats);
+            const std::vector<llama_token> bench_tokens = serve(ring, vocab, bench_prompt, 8, {}, &stats);
             const double wall = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start).count();
             const double prefill = stats.prefill_seconds > 0.0
@@ -876,37 +996,21 @@ int main(int argc, char ** argv) {
                 ? bench_tokens.size() / stats.decode_seconds : 0.0;
             const double aggregate = wall > 0.0 ? bench_tokens.size() / wall : 0.0;
             const double bytes_per_token = bench_tokens.empty()
-                ? 0.0 : static_cast<double>(stats.coordinator_payload_bytes) / bench_tokens.size();
-            const std::vector<potluck::worker_bench_metrics> metrics =
-                request_worker_metrics(chain);
-            if (metrics.size() != chain.workers.size()) {
-                throw std::runtime_error("worker benchmark metrics count mismatch");
+                ? 0.0 : static_cast<double>(stats.head_payload_bytes) / bench_tokens.size();
+            const uint64_t model_bytes = potluck::model_file_bytes(model_path);
+            std::printf("bench ring route windows=%zu\n", ring.windows.size());
+            for (size_t i = 0; i < ring.windows.size(); ++i) {
+                const potluck::ring_window & window = ring.windows[i];
+                const uint64_t bytes = model_bytes * (window.end - window.start) /
+                    std::max<uint32_t>(1, n_layer);
+                std::printf("bench ring window %zu owner=%u [%u,%u) weight-bytes=%llu n_gpu_layers=%d\n",
+                            i, window.owner, window.start, window.end,
+                            static_cast<unsigned long long>(bytes), window.n_gpu_layers);
             }
-            std::vector<float> worker_speed(chain.workers.size(), 0.0f);
-            std::vector<float> worker_rss(chain.workers.size(), 0.0f);
-            for (const auto & metric : metrics) {
-                if (metric.index >= chain.workers.size()) {
-                    throw std::runtime_error("worker benchmark metrics index out of range");
-                }
-                worker_speed[metric.index] = metric.decode_tok_s;
-                worker_rss[metric.index] = metric.peak_rss_mb;
-            }
-            const float max_worker_rss = worker_rss.empty()
-                ? 0.0f : *std::max_element(worker_rss.begin(), worker_rss.end());
-            std::printf("bench worker host window       weight-bytes gpu-layers decode-tok/s peak-rss-mb\n");
-            for (size_t i = 0; i < chain.workers.size(); ++i) {
-                const uint64_t bytes = potluck::model_file_bytes(model_path) *
-                    (chain.bounds[i + 1] - chain.bounds[i]) / std::max<uint32_t>(1, n_layer);
-                std::printf("bench %6zu %-15s [%u,%u) %12llu %10d %12.2f %11.1f\n", i,
-                            chain.workers[i].host.c_str(), chain.bounds[i], chain.bounds[i + 1],
-                            static_cast<unsigned long long>(bytes), ngl[i],
-                            worker_speed[i], worker_rss[i]);
-            }
-            std::printf("bench cluster prefill-tok/s %.2f decode-tok/s %.2f aggregate-tok/s %.2f "
-                        "ms/token %.2f wire-bytes/token %.1f coordinator-peak-rss-mb %.1f "
-                        "worker-peak-rss-mb-max %.1f\n",
+            std::printf("bench ring prefill-tok/s %.2f decode-tok/s %.2f aggregate-tok/s %.2f "
+                        "ms/token %.2f wire-bytes/token %.1f head-peak-rss-mb %.1f\n",
                         prefill, decode, aggregate, aggregate > 0.0 ? 1000.0 / aggregate : 0.0,
-                        bytes_per_token, peak_rss_mb(), max_worker_rss);
+                        bytes_per_token, peak_rss_mb());
             std::fflush(stdout);
         }
         if (!server.listen(host.c_str(), http_port)) {

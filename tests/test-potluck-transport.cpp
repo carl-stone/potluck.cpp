@@ -1,17 +1,13 @@
-// Historical check for the legacy raw-TCP component transport. ADR 0007
-// requires replacement coverage for the direct-peer ZeroMQ ring.
-
 #include "../src/potluck-protocol.h"
 #include "../src/potluck-transport.h"
 
 #include <cstdint>
+
 #include <cstdio>
-#include <cstring>
+#include <cstdlib>
 #include <string>
-#include <thread>
 #include <vector>
 
-// Runtime check that survives both Debug and Release (-DNDEBUG) builds.
 #define CHECK(cond)                                                                       \
     do {                                                                                  \
         if (!(cond)) {                                                                    \
@@ -20,87 +16,91 @@
         }                                                                                 \
     } while (0)
 
+namespace {
+
+potluck::message make_message(uint64_t sequence, uint8_t value) {
+    potluck::message result;
+    result.type = potluck::message_type::hidden_state;
+    result.flags = 0x12345678;
+    result.rank = 3;
+    result.sequence = sequence;
+    result.dtype = potluck::data_type::f32;
+    result.shape = {2, 4, 8};
+    result.payload.assign(64, value);
+    return result;
+}
+
+void check_equal(const potluck::message & actual, const potluck::message & expected) {
+    CHECK(actual.type == expected.type);
+    CHECK(actual.flags == expected.flags);
+    CHECK(actual.rank == expected.rank);
+    CHECK(actual.sequence == expected.sequence);
+    CHECK(actual.dtype == expected.dtype);
+    CHECK(actual.shape == expected.shape);
+    CHECK(actual.payload == expected.payload);
+}
+
+} // namespace
+
 int main() {
-    // bind_loopback(0) picks an ephemeral port; valid() + non-zero port.
-    potluck::tcp_listener listener = potluck::tcp_listener::bind_loopback(0);
-    CHECK(listener.valid());
-    const uint16_t port = listener.port();
-    CHECK(port != 0);
-
-    // A listener is move-constructible and the moved-from handle is invalid.
-    potluck::tcp_listener moved_listener = std::move(listener);
-    CHECK(moved_listener.valid());
-    CHECK(!listener.valid());
-
-    potluck::message sent;
-    sent.type = potluck::message_type::hidden_state;
-    sent.rank = 0;
-    sent.sequence = 42;
-    sent.dtype = potluck::data_type::f32;
-    sent.shape = {1, 1, 16};
-    sent.payload.assign(64, 0xab);
-
-    std::thread server([&] {
-        std::string error;
-        potluck::tcp_channel peer = moved_listener.accept(error);
-        CHECK(peer.valid());
-
-        // A channel is move-assignable and the moved-from channel is invalid.
-        potluck::tcp_channel owned_peer = std::move(peer);
-        CHECK(owned_peer.valid());
-        CHECK(!peer.valid());
-
-        potluck::message received;
-        CHECK(owned_peer.receive(received, error));
-        CHECK(received.type == sent.type);
-        CHECK(received.sequence == sent.sequence);
-        CHECK(received.shape == sent.shape);
-        CHECK(received.payload == sent.payload);
-        CHECK(owned_peer.send(sent, error));
-    });
-
     std::string error;
-    potluck::tcp_channel client = potluck::tcp_channel::connect_loopback(port, error);
-    CHECK(client.valid());
-    CHECK(client.send(sent, error));
+    potluck::ring_peer left = potluck::ring_peer::bind("tcp://127.0.0.1:*", error);
+    CHECK(left.receive_valid());
+    CHECK(!left.endpoint().empty());
+    CHECK(left.endpoint().find("tcp://127.0.0.1:") == 0);
 
+    potluck::ring_peer right = potluck::ring_peer::bind("tcp://127.0.0.1:*", error);
+    CHECK(right.receive_valid());
+    CHECK(!right.endpoint().empty());
+
+    CHECK(left.connect_next(right.endpoint(), error));
+    CHECK(right.connect_next(left.endpoint(), error));
+    CHECK(left.valid());
+    CHECK(right.valid());
+    CHECK(left.next_endpoint() == right.endpoint());
+    CHECK(right.next_endpoint() == left.endpoint());
+    CHECK(left.set_timeouts(500, 500, error));
+    CHECK(right.set_timeouts(500, 500, error));
+
+    potluck::ring_peer moved = std::move(left);
+    CHECK(moved.valid());
+    CHECK(!left.valid());
+
+    potluck::message sent = make_message(42, 0xab);
+    CHECK(moved.send(sent, error));
+    potluck::message received;
+    CHECK(right.receive(received, error));
+    check_equal(received, sent);
+
+    potluck::message reply = make_message(43, 0xcd);
+    CHECK(right.send(reply, error));
     potluck::message echoed;
-    CHECK(client.receive(echoed, error));
-    CHECK(echoed.sequence == sent.sequence);
-    CHECK(echoed.payload == sent.payload);
+    CHECK(moved.receive(echoed, error));
+    check_equal(echoed, reply);
 
-    server.join();
+    potluck::message oversized_metadata = sent;
+    oversized_metadata.shape.assign(potluck::ring_max_shape_dims + 1, 1);
+    CHECK(!moved.send(oversized_metadata, error));
+    CHECK(error.find("shape") != std::string::npos);
 
-    // connect_host resolves a hostname as well as a numeric IPv4 address.
-    {
-        std::string err;
-        potluck::tcp_channel named = potluck::tcp_channel::connect_host("localhost", port, err);
-        CHECK(named.valid());
-    }
+    potluck::ring_receiver timeout_receiver =
+        potluck::ring_receiver::bind("tcp://127.0.0.1:*", error);
+    CHECK(timeout_receiver.valid());
+    CHECK(timeout_receiver.set_receive_timeout(20, error));
+    potluck::message absent;
+    CHECK(!timeout_receiver.receive(absent, error));
+    CHECK(error.find("timeout") != std::string::npos);
 
-    // connect_loopback to a closed port fails (connection refused).
-    {
-        std::string err;
-        potluck::tcp_channel refused = potluck::tcp_channel::connect_loopback(1, err);
-        CHECK(!refused.valid());
-        CHECK(!err.empty());
-    }
+    potluck::ring_sender bad_sender = potluck::ring_sender::connect("not-a-zmq-endpoint", error);
+    CHECK(!bad_sender.valid());
+    CHECK(!error.empty());
 
-    // bind_host rejects a non-IPv4 host string.
-    {
-        potluck::tcp_listener bad = potluck::tcp_listener::bind_host("not-an-ip", 0);
-        CHECK(!bad.valid());
-    }
-
-    // A closed/invalid channel cannot send or receive.
-    {
-        std::string err;
-        potluck::tcp_channel closed;
-        CHECK(!closed.valid());
-        CHECK(!closed.send(sent, err));
-        potluck::message m;
-        CHECK(!closed.receive(m, err));
-    }
+    potluck::ring_sender closed_sender;
+    CHECK(!closed_sender.send(sent, error));
+    CHECK(error.find("PUSH") != std::string::npos);
+    potluck::ring_receiver closed_receiver;
+    CHECK(!closed_receiver.receive(absent, error));
+    CHECK(error.find("PULL") != std::string::npos);
 
     return 0;
 }

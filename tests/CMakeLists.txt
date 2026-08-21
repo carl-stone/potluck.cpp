@@ -351,19 +351,43 @@ if (TARGET gguf-model-data)
 endif()
 
 # ---------------------------------------------------------------------------
-# Legacy potluck.cpp PTLK/raw-TCP component tests
-# ADR 0007 requires direct-peer ZeroMQ product communication. These targets
-# remain only as pre-cutover evidence and must be removed or rewritten.
+# Shared Potluck direct-peer transport.
 # ---------------------------------------------------------------------------
+find_package(PkgConfig REQUIRED)
+if (NOT TARGET PkgConfig::ZMQ)
+    pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+endif()
 
-# Shared implementation of the legacy protocol and transport.
-add_library(potluck-distributed STATIC
-    ${PROJECT_SOURCE_DIR}/src/potluck-protocol.cpp
-    ${PROJECT_SOURCE_DIR}/src/potluck-transport.cpp)
-target_include_directories(potluck-distributed PUBLIC ${PROJECT_SOURCE_DIR}/src)
-target_link_libraries(potluck-distributed PUBLIC llama)
+if (NOT TARGET potluck-distributed)
+    add_library(potluck-distributed STATIC
+        ${PROJECT_SOURCE_DIR}/src/potluck-protocol.cpp
+        ${PROJECT_SOURCE_DIR}/src/potluck-transport.cpp)
+    target_include_directories(potluck-distributed PUBLIC ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(potluck-distributed PUBLIC PkgConfig::ZMQ)
+endif()
 
-# Legacy protocol and transport unit tests (no model required).
+if (NOT TARGET potluck-discovery)
+    add_library(potluck-discovery STATIC
+        ${PROJECT_SOURCE_DIR}/src/potluck-discovery.cpp
+        ${PROJECT_SOURCE_DIR}/src/potluck-discovery.h)
+    target_include_directories(potluck-discovery PUBLIC ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(potluck-discovery PUBLIC cxx_std_17)
+    if (APPLE)
+        # Bonjour is part of libSystem on macOS.
+    elseif (UNIX)
+        if (NOT TARGET PkgConfig::AVAHI_COMPAT_LIBDNSSD)
+            pkg_check_modules(AVAHI_COMPAT_LIBDNSSD REQUIRED IMPORTED_TARGET avahi-compat-libdns_sd)
+        endif()
+        target_link_libraries(potluck-discovery PUBLIC PkgConfig::AVAHI_COMPAT_LIBDNSSD)
+    else()
+        message(FATAL_ERROR "Potluck DNS-SD discovery requires macOS or Linux")
+    endif()
+endif()
+
+llama_build_and_test(test-potluck-discovery.cpp LABEL discovery)
+target_include_directories(test-potluck-discovery PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-potluck-discovery PRIVATE potluck-discovery)
+
 llama_build_and_test(test-potluck-protocol.cpp)
 target_link_libraries(test-potluck-protocol PRIVATE potluck-distributed)
 llama_build_and_test(test-potluck-transport.cpp)
@@ -377,22 +401,6 @@ target_link_libraries(test-potluck-transport PRIVATE potluck-distributed)
 # under -O3 -DNDEBUG).
 llama_build_and_test(test-potluck-qwen35-stages.cpp ARGS ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
 
-# Legacy separate-process correctness over a raw-TCP loopback channel. This
-# requires two processes, so CTest drives both roles through a shell script.
-# It is not evidence for the required direct-peer ZeroMQ ring.
-add_executable(test-potluck-qwen35-process-stage test-potluck-qwen35-process-stage.cpp)
-target_link_libraries(test-potluck-qwen35-process-stage PRIVATE potluck-distributed)
-add_test(NAME test-potluck-qwen35-process-stage
-         COMMAND ${PROJECT_SOURCE_DIR}/tests/test-potluck-qwen35-process-stage.sh
-                 $<TARGET_FILE:test-potluck-qwen35-process-stage>
-                 ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
-set_property(TEST test-potluck-qwen35-process-stage PROPERTY LABELS main)
-set_property(TEST test-potluck-qwen35-process-stage PROPERTY TIMEOUT 1800)
-
-# Separate-process two-stage test that forwards hidden states for two decode
-# steps and compares both returned tokens with a full-model reference.
-llama_build_and_test(test-potluck-qwen35-network-stage.cpp ARGS ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
-target_link_libraries(test-potluck-qwen35-network-stage PRIVATE potluck-distributed)
 
 # Full pipeline: prompt prefill + multi-token greedy generation across a split,
 # compared token-for-token against the unsplit full model.

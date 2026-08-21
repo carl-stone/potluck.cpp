@@ -1,48 +1,38 @@
 #!/usr/bin/env bash
-# Runs checks for components in the unfinished pre-ADR-0006/0007 implementation.
-# This is not the Potluck product or architecture acceptance gate.
-set -uo pipefail
+# Run the retained direct-ring checks and integrated local server gate.
+set -euo pipefail
 
-cd "$(dirname "$0")"
+REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
+BIN="${BIN:-${REPO}/build/bin}"
+if [[ -z "${MODEL:-}" ]]; then
+    MODEL="$(bash "${REPO}/scripts/fetch-model.sh")"
+fi
+export REPO BIN MODEL
 
-TESTS=(
-    "test_chain.sh 1 24 127.0.0.1"
-    "test_chain.sh 2 48 127.0.0.1"
-    "test_chain.sh 4 32 127.0.0.1"
-    "test_chain.sh 6 32 127.0.0.1"
-    "test_no_attn.sh 8 127.0.0.1"
-    "test_sampler.sh 2 32 127.0.0.1"
-    "test_gpu.sh 3 24 127.0.0.1"
-    "test_sched.sh 2 32 127.0.0.1"
-    "test_lp.sh 32 127.0.0.1"
-    "test_remove.sh 24 127.0.0.1"
-    "test_prefetch.sh 2 32 127.0.0.1"
-    "test_ring.sh 16 127.0.0.1"
-    "test_spec.sh 3 24 127.0.0.1"
-    "test_batch.sh 3 24 127.0.0.1"
-    "test_chat.sh 3 24 127.0.0.1"
-    "test_server.sh 2 8 127.0.0.1"
-    "test_vs_llama_cli.sh 2 16 127.0.0.1"
-    "test_shard.sh 127.0.0.1"
-)
+if [[ ! -f "${MODEL}" ]]; then
+    printf 'missing model: %s\n' "${MODEL}" >&2
+    exit 2
+fi
 
-failed=0
-for t in "${TESTS[@]}"; do
-    name="${t%% *}"
-    printf '== %s ==\n' "${name}"
-    if bash ${t} >/tmp/potluck_suite_${name}.log 2>&1; then
-        tail -1 /tmp/potluck_suite_${name}.log
-    else
-        printf 'FAILED: %s\n' "${name}"
-        tail -5 /tmp/potluck_suite_${name}.log >&2
-        failed=1
+for test_bin in test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run; do
+    if [[ ! -x "${BIN}/${test_bin}" ]]; then
+        printf 'missing test binary: %s\n' "${BIN}/${test_bin}" >&2
+        exit 2
     fi
-    pkill -f potluck-wor[k]er 2>/dev/null || true
-    sleep 1
 done
 
-if (( failed )); then
-    printf 'SUITE FAILED\n' >&2
-    exit 1
-fi
-printf 'COMPONENT SUITE PASSED (%s tests; PRODUCT GATE NOT SATISFIED)\n' "${#TESTS[@]}"
+for test_bin in test-potluck-discovery test-potluck-protocol test-potluck-transport; do
+    printf '== %s ==\n' "${test_bin}"
+    "${BIN}/${test_bin}"
+done
+
+printf '== test-potluck-qwen35-stages ==\n'
+"${BIN}/test-potluck-qwen35-stages" "${MODEL}"
+
+printf '== test-potluck-run ==\n'
+"${BIN}/test-potluck-run" "${MODEL}"
+
+printf '== integrated potluck-server ==\n'
+bash "${REPO}/tests/potluck/test_server.sh"
+
+printf 'DIRECT-RING SUITE PASSED\n'

@@ -4,15 +4,8 @@ set -euo pipefail
 
 REPO="${REPO:-$(git rev-parse --show-toplevel)}"
 BUILD_DIR="${POTLUCK_BUILD_DIR:-${REPO}/build}"
-MODEL="${POTLUCK_TEST_MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
+MODEL="$(bash "${REPO}/scripts/fetch-model.sh")"
 JOBS="${POTLUCK_BUILD_JOBS:-2}"
-
-if [[ ! -f "${MODEL}" ]]; then
-    printf 'pre-push: missing test fixture: %s\n' "${MODEL}" >&2
-    printf 'pre-push: set POTLUCK_TEST_MODEL or place the Qwen3.5 0.8B fixture there\n' >&2
-    exit 2
-fi
-
 case "$(uname -s)" in
     Darwin)
         : "${POTLUCK_SKIP_GPU_TESTS:=0}"
@@ -43,7 +36,7 @@ cmake -S "${REPO}" -B "${BUILD_DIR}" \
 
 printf 'pre-push: building required binaries with %s jobs\n' "${JOBS}"
 cmake --build "${BUILD_DIR}" --config Release --parallel "${JOBS}" \
-    --target potluck-head potluck-worker potluck-server potluck-shard llama-cli
+    --target potluck-node potluck-worker potluck-server potluck-shard llama-cli test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run
 
 printf 'pre-push: running local component suite\n'
 bash "${REPO}/tests/potluck/run_all.sh"

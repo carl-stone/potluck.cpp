@@ -69,53 +69,57 @@ Status labels:
 
 ## Executive boundary
 
-The current source is unfinished and cannot be shipped as Potluck. Its required
-pieces exist in separate static, ring, profiling, batch, shard, and HTTP paths;
-they do not form the decided product.
+The current source is unfinished and cannot be shipped as Potluck. The
+implemented `potluck-server` path now owns a direct adjacent-peer ZeroMQ ring
+with repeated disjoint windows and DNS-SD candidate discovery, but scheduling,
+admission, lifecycle, and server coverage remain incomplete.
 
 | Area | Required product behavior | Current source | Status |
 |---|---|---|---:|
-| Distributed execution | Piped ring only; several disjoint windows per selected device | Static server/head default; opt-in ring in `potluck-head` | CONFLICTING |
-| Window placement | Automatic heterogeneous placement from live capability and resource pressure | Equal/manual bounds, weights, optional offline LP | CONFLICTING |
-| Device profiling and selection | Automatic discovery, profiling, admission, and exclusion in the server lifecycle | Standalone profile output and schedule-time removal | PARTIAL |
-| Head participation | Optional worker after reserving for current user CPU, memory, and accelerator use | No live user-load-aware placement | MISSING |
-| Prefetch | Next assigned window coordinated with ring execution | Whole-model-file page-cache warm path | CONFLICTING |
-| Accelerator placement | Independent CPU/CUDA/Metal decision per device and window | Static/global GPU-layer budgets | PARTIAL |
-| Model loading | Load only assigned GGUF window shards; full source file may remain on disk | Explicit shards exist, but server can launch workers on the full model path | PARTIAL |
-| Continuous batching | Active HTTP requests scheduled together through the ring | Batch protocol/CLI exists separately | PARTIAL |
-| Conversation slots | Isolated state, identity, cache affinity, cancellation, and lifecycle | Every request resets one chain; busy requests receive 429 | MISSING |
-| Client server | OpenAI-compatible contract on the ring head | Small HTTP subset on the static server path | PARTIAL |
+| Distributed execution | Piped ring only; several disjoint windows per selected device | `potluck-server` direct adjacent-peer ZeroMQ ring; two repeated windows per worker where layers permit | PRESENT |
+| Window placement | Automatic heterogeneous placement from live capability and resource pressure | Fixed route from explicit worker/shard/bootstrap inputs; no live scheduler | PARTIAL |
+| Device profiling and selection | Automatic discovery, profiling, admission, and exclusion in the server lifecycle | DNS-SD candidate discovery and scoped SSH trust-on-first-use work; live profiling, admission, and selection do not | PARTIAL |
+| Head participation | Optional worker after reserving for current user CPU, memory, and accelerator use | Remote smoke used the M4 as controller only; no live resource reserve | MISSING |
+| Prefetch | Next assigned window coordinated with ring execution | Per-window prefetch is not implemented | MISSING |
+| Accelerator placement | Independent CPU/CUDA/Metal decision per device and window | Static or explicit worker placement; no live per-device/window planner | PARTIAL |
+| Model loading | Load only assigned GGUF window shards; full source file may remain on disk | Explicit shard inputs and window assignments work; creation and deployment automation are missing | PARTIAL |
+| Worker bootstrap | Automatic local and remote startup with readiness and topology lifecycle | DNS-SD discovery and SSH launch work; deployment, health, and topology lifecycle automation are missing | PARTIAL |
+| Continuous batching | Active HTTP requests scheduled together through the ring | HTTP path still serializes work; batch capacity is not continuous HTTP batching | PARTIAL |
+| Conversation slots | Isolated state, identity, cache affinity, cancellation, and lifecycle | No conversation slots or cache affinity | MISSING |
+| Client server | OpenAI-compatible contract on the ring head | A small HTTP subset runs through the direct ring | PARTIAL |
+| Resilience | Reconnect, ring rebuild, migration, and safe retry | No worker reconnect, topology rebuild, or slot migration | MISSING |
+| Security | Authenticated and encrypted deployment with privacy controls | Discovered SSH hosts use Potluck-scoped trust-on-first-use; ring authentication, encryption, and privacy controls are unfinished | MISSING |
 
-The 0.8B component suite proves only its named low-level behaviors. It does not
-prove this product contract. Static-chain checks must be deleted or rewritten
-as ring-product checks during the clean cutover.
+The local two-worker CPU smoke passed. An M4 head also automatically discovered
+one Linux CPU worker through DNS-SD, accepted its key in the Potluck-specific
+SSH trust file, launched it, and returned the two-token completion ` located in`.
+The server logged windows `[0,12)` and `[12,24)`. The remote smoke did not
+demonstrate heterogeneous placement or head computation. These checks prove
+candidate discovery and the direct server path only, not the release gate.
 
 ## 1. Current potluck server contract
 
 ### Startup options currently implemented
 
-`potluck-server` currently accepts only this small set:
+`potluck-server` currently accepts this small set of explicit bootstrap and
+inference options:
 
 | Option family | Current behavior | Status |
 |---|---|---:|
-| `-m`, `--model` | Metadata source; also defaults workers to full-model path | PARTIAL; full-file worker loading must be removed |
-| `--shard-dir`, `--shards` | Explicit generated per-window files | PARTIAL; product must select and transfer shards automatically |
-| `--workers N` | Manually choose local worker count | CONFLICTING |
-| `--workers-file` | Connect to manually listed workers | CONFLICTING |
-| `--hosts`, `--launch ssh` | Manually address and launch remote workers | CONFLICTING |
+| `-m`, `--model` | Model metadata source for the direct server route | PRESENT component |
+| `--shard-dir`, `--shards` | Explicit per-window GGUF shard inputs | PARTIAL; product must create, select, transfer, validate, and cache shards automatically |
+| `--workers N` | Internal local-worker engineering input | PARTIAL; normal startup discovers nodes, but automatic live selection remains missing |
+| `--hosts`, `--launch ssh` | Internal explicit SSH bootstrap for engineering checks | PARTIAL; normal startup uses DNS-SD, but this does not provide placement |
 | `--host`, `--port` | Bind the client-facing HTTP server | PRESENT component |
-| `--worker-port-base` | Manually select worker ports | CONFLICTING |
-| `--bounds` | Set one static contiguous window per worker | CONFLICTING |
-| `--gpu-layers`, `--ngl` | Set one global offload boundary | CONFLICTING |
-| `--gpu-mem` | Estimate one global layer budget | CONFLICTING |
-| `--ctx` | Set one cluster context size | PRESENT component |
+| `--ctx` | Set the cluster context size | PRESENT component |
 | `--batch` | Set protocol sequence capacity without HTTP continuous batching | PARTIAL |
 | `--temp`, `--top-p`, `--seed` | Set process-wide sampler defaults | PARTIAL |
-| `--n-predict` | Set one process-wide generation limit | PARTIAL |
-| `--bench` | Run a manual startup benchmark | CONFLICTING as a product control |
+| `--n-predict` | Set a process-wide generation limit | PARTIAL |
+| `--bench` | Run a startup benchmark | PRESENT component; not a release gate |
 
-These entries describe the source that must be replaced. Product startup must
-not expose topology, placement, profiling, or execution-mode controls.
+Local ports and the cyclic peer endpoints are allocated by the controller.
+Product startup must eventually hide topology, placement, profiling, and
+execution controls while retaining the direct server ring.
 
 ### Request fields currently implemented
 
@@ -143,7 +147,7 @@ cancellation.
 
 ## 2. HTTP endpoint matrix
 
-The following is the endpoint-level compatibility inventory. “Missing” means
+The following is the endpoint-level compatibility inventory. "Missing" means
 the route is not registered by `potluck-server`, not that the upstream route is
 always useful for every model.
 
@@ -221,7 +225,7 @@ the worker configuration. It does not expose these controls per request.
 | `n`, `n_predict`, `max_tokens` | Completion count and token limit | PARTIAL; one count, route-specific limit |
 | Time limits and indentation | FIM/time-bounded generation controls | MISSING |
 | Request LoRA scales | Per-request adapter selection | MISSING |
-| Speculative decoding | Draft model, draft count, acceptance settings | PARTIAL; `potluck-head --draft` only, not server/API |
+| Speculative decoding | Draft model, draft count, acceptance settings | MISSING; no product-server integration |
 | Lookup decoding | Static/dynamic lookup caches | MISSING |
 
 ### Structured output, tools, and modalities
@@ -246,8 +250,8 @@ the worker configuration. It does not expose these controls per request.
 - A second request receives HTTP 429 immediately; it is not queued.
 - `serve()` sends a reset/prefill sequence starting at position zero.
 - The client must resend the complete chat history.
-- Worker batch messages and sequence IDs exist for `potluck-head --batch`,
-  but the HTTP server does not map requests to those sequences.
+- Worker batch messages and sequence IDs exist as protocol components, but the
+  HTTP server does not map requests to those sequences.
 - A transport or worker error returns HTTP 503. There is no worker reconnect,
   chain rebuild, slot migration, or retry policy.
 - `--bench` prints one startup result. It is not a live metrics API.
@@ -303,70 +307,68 @@ the worker configuration:
 | Model router | Models directory/presets, load/unload, multi-model dispatch | MISSING |
 
 Some of these controls are low-value for a first distributed release. They
-remain gaps whenever the product claim is “use potluck like llama-server”.
+remain gaps whenever the product claim is "use potluck like llama-server".
 
 ## 6. Prima.cpp distributed-runtime comparison
 
 Prima's distributed runtime is a separate baseline from its HTTP API. Potluck
-already has several equivalent or stronger design choices, but the controls
-are not all available through `potluck-server`.
+now has a direct server ring for the core data path, but the automatic
+controller behavior and full lifecycle are not complete.
 
 | Prima capability or option family | Potluck implementation | Status | Notes |
 |---|---|---:|---|
-| Multi-device layer pipeline | Contiguous static windows with hidden-state transport | CONFLICTING | Must be removed; static tests must be rewritten |
-| Full-model greedy reference | Optional `--parity-check` harness | TEST ONLY | Small-fixture correctness process; never product loading |
-| Piped-ring execution | `potluck-head --ring` with coordinator-routed multi-window workers | CONFLICTING | Replace with the only `potluck-server` runtime: adjacent peers communicate directly over ZeroMQ |
-| Worker discovery/peer topology | Workers file, local spawn, SSH host list; head opens one channel to each worker | CONFLICTING | Replace with automatic discovery and direct peer-ring lifecycle |
-| `--world`, `--rank`, `--master`, `--next`, `--data-port` | Not accepted by potluck server/head | INTENTIONAL | Do not add manual aliases; configure equivalent direct-ring topology automatically |
-| Layer-window scheduling | Explicit bounds, integer weights, profile output, optional LP | CONFLICTING | Replace with live automatic ring placement |
-| Prima `--lw` layer-window weights | No equivalent user-facing option | INTENTIONAL | Manual window weights are not a product control |
-| GPU offload | Static/global `--gpu-layers` or `--gpu-mem` derivation | PARTIAL | Replace with per-device, per-window live placement |
-| Device profiling | Worker benchmark metrics and profile weights | PARTIAL | Integrate profiling and selection into server lifecycle |
-| LP placement | HiGHS RAM/VRAM placement when enabled | PARTIAL | Solver may be internal; manual invocation must be removed |
-| Prefetch | Worker `--prefetch` warms a model file | CONFLICTING | Replace with coordinated per-window ring prefetch |
-| Scheduler cycles | Ring cycles exist as route traversal | PARTIAL | Integrate with server scheduling |
-| Force-prefetch policy | No equivalent `--force` option | INTENTIONAL | Prefetch is automatic, not a user mode |
-| Master priority | No equivalent `--master-priority` option | PARTIAL | Head user reserve and live load replace a manual priority |
-| Runtime device removal | `--drop-slowest` profiles and excludes once | PARTIAL | Automatic capacity-aware selection and live rebuild required |
-| Speculative decoding | `potluck-head --draft --draft-n` | PARTIAL | Separate CLI path is not product integration |
-| Dynamic batching | `potluck-head --batch` mixes sequence IDs | PARTIAL | Continuous HTTP ring scheduler and slots required |
+| Multi-device layer pipeline | Direct adjacent-peer ring with repeated disjoint windows; current route uses two cycles per worker | PARTIAL | The transport is implemented; live heterogeneous scheduling is missing |
+| Full-model greedy reference | Optional test-only fixture comparison | TEST ONLY | Correctness evidence; never product loading |
+| Piped-ring execution | `potluck-server` workers connect directly to cyclic next peers over ZeroMQ | PRESENT | Head ingress goes to rank 0 and final results return to the head |
+| Worker discovery/peer topology | DNS-SD candidates, scoped SSH trust-on-first-use, SSH launch, and cyclic endpoints | PARTIAL | Live admission, health, removal, and topology rebuild remain missing |
+| `--world`, `--rank`, `--master`, `--next`, `--data-port` | Not user-facing server options | INTENTIONAL | Configure equivalent direct-ring topology internally |
+| Layer-window scheduling | Fixed repeated route from explicit worker/shard/bootstrap inputs | PARTIAL | Replace with live automatic ring placement |
+| Prima `--lw` layer-window weights | No user-facing option | INTENTIONAL | Manual window weights are not a product control |
+| GPU offload | No live per-device/window planner | MISSING | Implement independent CPU/CUDA/Metal placement |
+| Device profiling | No automatic live profiling or selection | MISSING | Integrate profiling into server lifecycle |
+| LP placement | No integrated automatic placement path | MISSING | A solver may be internal only after lifecycle integration |
+| Prefetch | No coordinated per-window prefetch | MISSING | Implement prefetch in ring scheduling |
+| Scheduler cycles | Current route repeats disjoint windows for a second cycle | PARTIAL | Integrate cycles with batching and live scheduling |
+| Force-prefetch policy | No user mode | INTENTIONAL | Prefetch must be automatic |
+| Master priority | No live head reserve or load adaptation | MISSING | Protect the user's current resources |
+| Runtime device removal | No live failure removal or ring rebuild | MISSING | Add health, selection, and recovery lifecycle |
+| Speculative decoding | No integrated product-server path | MISSING | Separate experiments do not satisfy the contract |
+| Dynamic batching | Protocol capacity exists, but HTTP work remains serialized | PARTIAL | Continuous HTTP batching and slots are required |
 | Sampler breadth | Tail supports the narrow configured sampler path | PARTIAL | Not prima/llama full sampler chain |
-| Model copy behavior | Workers load per-window GGUF shards; a full source GGUF may also exist on disk | PARTIAL | Loading, not download or storage, is the product invariant |
-| Transport and data topology | Versioned PTLK over raw TCP; coordinator relays ring hops | CONFLICTING | Remove it; ADR 0007 requires prima.cpp's direct peer-to-peer ZeroMQ communication model |
+| Model copy behavior | Explicit per-window GGUF shards can be assigned to workers | PARTIAL | Creation, transfer, validation, and caching automation remain missing |
+| Transport and data topology | Direct adjacent-peer ZeroMQ ring with a separate final-result path | PRESENT | No head relay for windows the head does not execute |
 
 Prima-specific flag aliases are not required. Their behavioral goals are
 binding: automatic topology setup, heterogeneous ring-window placement,
 per-window prefetch, per-device accelerator placement, device selection,
 continuous batching, conversation slots, and recovery must operate through
-`potluck-server`. Workers files, explicit bounds, and manually applied profile
-output are not the replacement product contract.
+`potluck-server`. Explicit worker, host, shard, and placement inputs are not
+the replacement product contract.
 
 ## 7. Security (deferred) and deployment gaps
 
-The initial product assumes a trusted home LAN. Authentication, encryption,
-and tenant isolation are not release blockers for that deployment model.
-Deployment reliability is a separate release requirement: discovery,
+Security remains unfinished. The initial product assumes a trusted home LAN,
+but that assumption does not provide authentication, encryption, or tenant
+isolation. Deployment reliability is a separate release requirement: discovery,
 capability reporting, model transfer, process startup, health, and recovery
 must work without manual network administration.
-
 
 | Boundary | Current behavior | Status |
 |---|---|---:|
 | HTTP authentication | None | MISSING |
 | HTTP encryption | No TLS options | MISSING |
-| Worker authentication | Current PTLK handshake has no identity or credential; required ZeroMQ model is not implemented | MISSING |
-| Worker encryption | Current raw-TCP payloads are clear text; ZeroMQ does not provide security unless configured | MISSING |
+| Worker authentication | ZeroMQ sockets have no identity or credential authentication configured | MISSING |
+| Worker encryption | ZeroMQ payloads are unencrypted; no security configuration is enabled | MISSING |
 | Shard authorization | A worker validates window metadata but not caller identity | PARTIAL |
 | CORS | `Access-Control-Allow-Origin: *` and fixed methods/headers | PARTIAL; not safe for credentialed clients |
-| Remote launch | Shell command over batch-mode SSH, trusted host and remote directory assumed | PARTIAL |
+| Remote launch | Explicit batch-mode SSH bootstrap assumes trusted hosts and remote directories | PARTIAL |
 | Firewall guidance | Manual tunnel/workaround is documented | PARTIAL |
 | Secrets and API keys | No storage, rotation, or redaction policy | MISSING |
 | Prompt/privacy controls | No request logging policy or tenant isolation | MISSING |
 
-Security work remains deferred under the trusted-LAN assumption. Keep the
-current “never expose the service to the public Internet” warning, but do not
-block the first household release on API keys, TLS, or worker encryption.
-Revisit these items only if the supported deployment boundary changes.
+Keep the current "never expose the service to the public Internet" warning.
+Do not call the trusted-LAN assumption a security implementation; API keys,
+TLS, worker authentication, encryption, and privacy controls remain unfinished.
 
 
 ## 8. Model and backend scope
@@ -388,19 +390,19 @@ by a layer-window graph.
 | Multi-model router | MISSING |
 | 27B correctness/performance/end-to-end acceptance | INTENTIONAL non-goal |
 
-“Works in llama.cpp” and “works in a potluck distributed window” are separate
+"Works in llama.cpp" and "works in a potluck distributed window" are separate
 claims. A new architecture requires a graph/window implementation and a
 named acceptance check before it can be listed as supported.
 
 ## 9. Required implementation cutover
 
-The following work can be sequenced internally, but no intermediate step is a
-Potluck product, supported configuration, or release:
+The direct ring core is implemented, but no intermediate state is a Potluck
+product, supported configuration, or release. The remaining work is:
 
-1. Make the piped-ring runtime the only distributed execution path and remove
-   static routing, static bounds, and static product tests.
-2. Move discovery, live profiling, device admission, and heterogeneous window
-   assignment into the server lifecycle. Include current head CPU, memory,
+1. Keep the direct piped-ring runtime as the only distributed execution path
+   and remove any remaining static routing, static bounds, and static tests.
+2. Extend discovery with live profiling, device admission, and heterogeneous
+   window assignment in the server lifecycle. Include current head CPU, memory,
    accelerator pressure, and a user resource reserve.
 3. Integrate shard creation, selection, transfer, checksums, and caching.
    Workers must load only assigned window shards even when a full GGUF exists
@@ -411,8 +413,9 @@ Potluck product, supported configuration, or release:
    scheduler that drives the same ring.
 6. Make the head's OpenAI-compatible request, response, error, cancellation,
    usage, and streaming behavior operate through that scheduler.
-7. Automate worker startup, readiness, resource changes, topology rebuild, and
-   clear recovery without exposing ranks, hosts, ports, bounds, or weights.
+7. Extend local and SSH bootstrap with automatic readiness, resource changes,
+   topology rebuild, and clear recovery without exposing ranks, hosts, ports,
+   bounds, or weights.
 8. Ship controller and worker artifacts and a simple local interface that
    forms the complete server without a source build.
 
@@ -449,8 +452,7 @@ through one server process:
 Component checks, a standalone ring CLI, a static server, or a manual cluster
 cannot satisfy this gate.
 
-
-## 11. Definition of “regular local inference server”
+## 11. Definition of "regular local inference server"
 
 Potluck is a regular local inference server only when the complete release gate
 above passes. In particular, named checks must cover:

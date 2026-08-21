@@ -5,8 +5,6 @@ endif()
 
 add_executable(potluck-server
     main.cpp
-    ../../src/potluck-protocol.cpp
-    ../../src/potluck-transport.cpp
 )
 
 target_include_directories(potluck-server PRIVATE
@@ -16,4 +14,4 @@ target_include_directories(potluck-server PRIVATE
 )
 target_compile_features(potluck-server PRIVATE cxx_std_17)
 
-target_link_libraries(potluck-server PRIVATE llama llama-common cpp-httplib)
+target_link_libraries(potluck-server PRIVATE potluck-discovery potluck-distributed llama llama-common cpp-httplib)

@@ -4,7 +4,9 @@ set -euo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 LLAMA_CLI="${LLAMA_CLI:-${REPO}/build/bin/llama-cli}"
-MODEL="${MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
+# shellcheck source=../../scripts/potluck-model.sh
+source "${REPO}/scripts/potluck-model.sh"
+MODEL="${MODEL:-$(potluck_model_path)}"
 
 if [[ ! -x "${LLAMA_CLI}" ]]; then
     printf 'missing llama-cli (build it first): %s\n' "${LLAMA_CLI}" >&2

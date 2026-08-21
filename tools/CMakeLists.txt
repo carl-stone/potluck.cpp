@@ -1,6 +1,36 @@
 # dependencies
 
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+if (NOT TARGET PkgConfig::ZMQ)
+    pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+endif()
+
+if (NOT TARGET potluck-distributed)
+    add_library(potluck-distributed STATIC
+        ${PROJECT_SOURCE_DIR}/src/potluck-protocol.cpp
+        ${PROJECT_SOURCE_DIR}/src/potluck-transport.cpp)
+    target_include_directories(potluck-distributed PUBLIC ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(potluck-distributed PUBLIC PkgConfig::ZMQ)
+endif()
+
+if (NOT TARGET potluck-discovery)
+    add_library(potluck-discovery STATIC
+        ${PROJECT_SOURCE_DIR}/src/potluck-discovery.cpp
+        ${PROJECT_SOURCE_DIR}/src/potluck-discovery.h)
+    target_include_directories(potluck-discovery PUBLIC ${PROJECT_SOURCE_DIR}/src)
+    target_compile_features(potluck-discovery PUBLIC cxx_std_17)
+    if (APPLE)
+        # Bonjour is part of libSystem on macOS.
+    elseif (UNIX)
+        if (NOT TARGET PkgConfig::AVAHI_COMPAT_LIBDNSSD)
+            pkg_check_modules(AVAHI_COMPAT_LIBDNSSD REQUIRED IMPORTED_TARGET avahi-compat-libdns_sd)
+        endif()
+        target_link_libraries(potluck-discovery PUBLIC PkgConfig::AVAHI_COMPAT_LIBDNSSD)
+    else()
+        message(FATAL_ERROR "Potluck DNS-SD discovery requires macOS or Linux")
+    endif()
+endif()
 
 # third-party
 
@@ -41,7 +71,7 @@ else()
     endif()
     add_subdirectory(fit-params)
     add_subdirectory(results)
-        add_subdirectory(potluck-worker)
-    add_subdirectory(potluck-head)
+    add_subdirectory(potluck-node)
+    add_subdirectory(potluck-worker)
     add_subdirectory(potluck-server)
 endif()

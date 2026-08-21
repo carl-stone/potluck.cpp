@@ -1,7 +1,5 @@
 add_executable(potluck-worker
     main.cpp
-    ../../src/potluck-protocol.cpp
-    ../../src/potluck-transport.cpp
 )
 
 target_include_directories(potluck-worker PRIVATE
@@ -10,4 +8,4 @@ target_include_directories(potluck-worker PRIVATE
 )
 target_compile_features(potluck-worker PRIVATE cxx_std_17)
 
-target_link_libraries(potluck-worker PRIVATE llama)
+target_link_libraries(potluck-worker PRIVATE potluck-distributed llama)

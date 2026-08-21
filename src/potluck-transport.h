@@ -1,78 +1,108 @@
 #pragma once
 
-// Legacy raw-TCP transport. ADR 0007 requires its removal and replacement with
-// direct ZeroMQ communication between adjacent ring peers.
-
 #include "potluck-protocol.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
 namespace potluck {
 
-class tcp_channel {
+// The metadata frame is intentionally small and independent of the payload
+// helpers used by the model protocol.
+constexpr uint8_t ring_message_version = 1;
+constexpr size_t ring_max_shape_dims = 64;
+constexpr size_t ring_max_metadata_bytes = 4096;
+
+class ring_receiver {
 public:
-    tcp_channel() = default;
-    explicit tcp_channel(int fd);
-    ~tcp_channel();
+    ring_receiver() = default;
+    ~ring_receiver();
 
-    tcp_channel(const tcp_channel &) = delete;
-    tcp_channel & operator=(const tcp_channel &) = delete;
-    tcp_channel(tcp_channel && other) noexcept;
-    tcp_channel & operator=(tcp_channel && other) noexcept;
+    ring_receiver(const ring_receiver &) = delete;
+    ring_receiver & operator=(const ring_receiver &) = delete;
+    ring_receiver(ring_receiver && other) noexcept;
+    ring_receiver & operator=(ring_receiver && other) noexcept;
 
-    bool valid() const;
-    bool send(const message & message, std::string & error);
-    bool receive(message & message, std::string & error);
+    static ring_receiver bind(const std::string & endpoint, std::string & error);
 
-    // SO_RCVTIMEO / SO_SNDTIMEO in seconds. A stalled peer then surfaces as a
-    // read/write error instead of a forever-blocking recv()/send().
-    void set_timeouts(int rcv_seconds, int snd_seconds);
-
-    static tcp_channel connect_host(const std::string & host, uint16_t port, std::string & error);
-    static tcp_channel connect_loopback(uint16_t port, std::string & error);
+    bool valid() const noexcept;
+    const std::string & endpoint() const noexcept;
+    bool set_receive_timeout(int timeout_ms, std::string & error);
+    bool receive(message & output, std::string & error);
 
 private:
-    int fd_ = -1;
+    ring_receiver(void * context, void * socket, std::string endpoint);
 
-    bool write_all(const uint8_t * data, size_t size, std::string & error);
-    bool read_all(uint8_t * data, size_t size, std::string & error);
+    void * context_ = nullptr;
+    void * socket_ = nullptr;
+    std::string endpoint_;
 };
 
-class tcp_listener {
+class ring_sender {
 public:
-    tcp_listener() = default;
-    ~tcp_listener();
+    ring_sender() = default;
+    ~ring_sender();
 
-    tcp_listener(const tcp_listener &) = delete;
-    tcp_listener & operator=(const tcp_listener &) = delete;
-    tcp_listener(tcp_listener && other) noexcept;
-    tcp_listener & operator=(tcp_listener && other) noexcept;
+    ring_sender(const ring_sender &) = delete;
+    ring_sender & operator=(const ring_sender &) = delete;
+    ring_sender(ring_sender && other) noexcept;
+    ring_sender & operator=(ring_sender && other) noexcept;
 
-    static tcp_listener bind_host(const std::string & host, uint16_t port);
-    static tcp_listener bind_loopback(uint16_t port);
-    bool valid() const;
-    uint16_t port() const;
-    tcp_channel accept(std::string & error);
+    static ring_sender connect(const std::string & endpoint, std::string & error);
+
+    bool valid() const noexcept;
+    const std::string & endpoint() const noexcept;
+    bool set_send_timeout(int timeout_ms, std::string & error);
+    bool send(const message & input, std::string & error);
 
 private:
-    int fd_ = -1;
-    uint16_t port_ = 0;
+    ring_sender(void * context, void * socket, std::string endpoint);
 
-    tcp_listener(int fd, uint16_t port);
+    void * context_ = nullptr;
+    void * socket_ = nullptr;
+    std::string endpoint_;
 };
 
+// A direct adjacent-peer ring endpoint: PULL is bound locally and PUSH is
+// connected to the next peer. The sender and receiver primitives above are
+// available when a controller needs a short-lived one-way connection.
+class ring_peer {
+public:
+    ring_peer() = default;
+    ~ring_peer() = default;
 
-// Socket timeouts in seconds. Handshake covers config exchange (workers may
-// still be loading weights); decode covers per-token round trips on slow
-// hardware. Overridable: POTLUCK_TIMEOUT_HANDSHAKE_S / POTLUCK_TIMEOUT_DECODE_S.
-int handshake_timeout_s();
-int decode_timeout_s();
+    ring_peer(const ring_peer &) = delete;
+    ring_peer & operator=(const ring_peer &) = delete;
+    ring_peer(ring_peer && other) noexcept = default;
+    ring_peer & operator=(ring_peer && other) noexcept = default;
 
-// connect_host that retries for up to `attempts` times, sleeping `delay_ms`
-// between failures. Neighbor stages in a chain start asynchronously (each does
-// its own Metal/backend init), so peers may not be listening yet when we try.
-tcp_channel connect_retry(const std::string & host, uint16_t port, int attempts,
-                          int delay_ms, std::string & error);
+    static ring_peer bind(const std::string & local_endpoint, std::string & error);
+    static ring_peer bind(const std::string & local_endpoint,
+                          const std::string & next_endpoint,
+                          std::string & error);
+
+    bool connect_next(const std::string & next_endpoint, std::string & error);
+
+    bool valid() const noexcept;
+    bool receive_valid() const noexcept;
+    bool send_valid() const noexcept;
+    const std::string & endpoint() const noexcept;
+    const std::string & next_endpoint() const noexcept;
+
+    bool set_timeouts(int receive_timeout_ms, int send_timeout_ms, std::string & error);
+    bool receive(message & output, std::string & error);
+    bool send(const message & input, std::string & error);
+
+    ring_receiver & receiver() noexcept;
+    const ring_receiver & receiver() const noexcept;
+    ring_sender & sender() noexcept;
+    const ring_sender & sender() const noexcept;
+
+private:
+    ring_receiver receiver_;
+    ring_sender sender_;
+    std::string next_endpoint_;
+};
 
 } // namespace potluck

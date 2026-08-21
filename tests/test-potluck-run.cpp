@@ -8,8 +8,7 @@
 //      token sequence.
 //   3. Assert the two sequences are identical, and print the generated text.
 //
-// Supports an in-process remote stage (no sockets) for speed and a separate
-// process / loopback variant is covered by test-potluck-qwen35-network-stage.
+// Uses an in-process remote stage for speed.
 //
 // Usage: test-potluck-run <model.gguf> [split] [n_predict]
 

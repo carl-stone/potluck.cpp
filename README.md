@@ -26,11 +26,20 @@ product requires one integrated path with:
 - an OpenAI-compatible server on the head;
 - head placement that reserves resources for the person using that machine.
 
-The current source does not yet provide this product. Its server still uses a
-static, manually placed, single-request chain; its ring, profiling, batching,
-and HTTP capabilities are separate paths. Those paths must be replaced by the
-integrated ring server. There is no provisional product quickstart until that
-cutover is complete.
+The direct server path now owns the implemented ring data plane. `potluck-server`
+connects each worker directly to its cyclic next peer with ZeroMQ, sends
+ingress only to rank 0, and receives final results back at the head. The
+current route assigns two repeated disjoint windows per worker where the model
+layers permit. It can launch local workers, discover advertised LAN nodes with
+mDNS/DNS-SD, and launch discovered workers through SSH.
+
+Local two-worker CPU smoke passed, and an M4 head automatically discovered and
+launched one Linux CPU worker for the Qwen3.5 0.8B fixture. The remote smoke
+returned the same two-token result, ` located in`; the M4 head was only the
+controller and did not demonstrate heterogeneous placement or head computation.
+Live profiling and selection, resource-aware placement, shard automation,
+batching, slots, recovery, security, and full API parity remain unfinished, so
+Potluck is not complete.
 
 Build and fixture commands in this repository are engineering checks only.
 They do not describe a supported deployment.
@@ -56,32 +65,70 @@ The piped ring is the only Potluck execution architecture. Each selected
 device can own several disjoint windows. Adjacent devices exchange hidden
 states directly through ZeroMQ in ring order. The head participates as a ring
 peer when assigned work, but it does not relay intermediate data for other
-workers. The scheduler chooses devices, windows, prefetch, and accelerator
+workers.
+The finished scheduler must choose devices, windows, prefetch, and accelerator
 placement from measured live capacity. It must account for current CPU and
 memory pressure on the head before assigning work there.
 
-Workers load only their assigned GGUF window shards. A full model may be
-downloaded or retained on a device, but no production worker loads the complete
-model.
+Product workers must load only their assigned GGUF window shards. A full model
+may be downloaded or retained on a device, but no production worker may load
+the complete model.
 
-Static contiguous execution, equal or manual bounds, manual worker topology,
-and a ring CLI disconnected from the server are unfinished legacy code. They
-must be removed rather than retained as modes or fallbacks.
+Manual topology, bounds, and worker or shard selection are not supported
+product behavior. The direct server path is the only current ring path; any
+remaining static or disconnected implementation is a removal target, not a
+mode or fallback.
+
+## Quick start
+
+One command prepares any macOS or Linux device. It checks build tools, builds
+the runtime, fetches the pinned fixture model, and installs everything flat
+into `~/potluck`:
+
+```sh
+bash scripts/install.sh
+```
+
+Then:
+
+- Worker device: run `~/potluck/potluck-node`. It advertises the node over
+  DNS-SD until stopped. Keep the default prefix on workers; the head launches
+  workers there.
+- Head device: run
+  `~/potluck/potluck-server -m ~/potluck/Qwen3.5-0.8B-Q4_0.gguf`. The head
+  discovers advertised nodes, launches their workers over SSH, and serves the
+  OpenAI-like HTTP surface.
+
+First contact accepts a new SSH host key into
+`$XDG_CONFIG_HOME/potluck/known_hosts` or `~/.config/potluck/known_hosts`.
+Later key changes fail closed.
+
+The model is not stored in this repository. The engineering fixture is pinned
+to `ggml-org/Qwen3.5-0.8B-GGUF` (`Qwen3.5-0.8B-Q4_0.gguf`, SHA256 checked), and
+`scripts/fetch-model.sh` downloads and verifies it on demand. Override the pin
+with `POTLUCK_MODEL_HF_REPO`, `POTLUCK_MODEL_FILE`, or point at a local file
+with `POTLUCK_TEST_MODEL`. This remains an engineering smoke path, not a
+supported deployment.
 
 ## Measured results
-These measurements cover component and regression paths in the unfinished
-implementation. They are not product benchmarks and do not satisfy the
-piped-ring server release gate.
+These observations are functional smoke evidence for the unfinished direct
+server implementation. They are not product benchmarks and do not satisfy the
+resource-aware piped-ring server release gate.
 
+The fixture was `Qwen3.5-0.8B-Q4_0.gguf`. The local smoke ran on an Apple M4
+with two local CPU workers. The remote smoke used an M4 head as controller and
+one Linux CPU worker advertised with `potluck-node`; it did not exercise
+heterogeneous head computation or automatic placement.
 
-Measurements below use Apple Mac16,1, Apple M4, 10 cores, 16 GiB unified memory, Darwin 25.5.0, and the 526.50 MiB `Qwen3.5-0.8B-Q4_0.gguf` fixture. The two workers run on the same host and are a test harness, not a scale-out result.
-
-| Command | Hardware | Result |
+| Path | Hardware | Result |
 |---|---|---|
-| `potluck-server -m models/Qwen3.5-0.8B-Q4_0.gguf --workers 2 --bench` | M4, 2 local CPU workers | Prefill 129.01 tok/s; decode 81.11 tok/s; 17.17 ms/token; 75.0 wire B/token; worker peak RSS 1109.5 MiB |
-| `potluck-head models/Qwen3.5-0.8B-Q4_0.gguf workers.txt 8 --bench` | M4, 2 local CPU workers | Prefill 170.90 tok/s; decode 80.03 tok/s; 16.88 ms/token; 30.0 wire B/token; worker peak RSS 1112.5 MiB |
-| `bash tests/potluck/test_server.sh 2 4` | M4, 0.8B fixture | Prompt, error, health, models, llama-cli parity, and SSE checks passed |
-| `bash tests/potluck/run_all.sh` | M4, 0.8B fixture | Historical 18-check component suite; not the product release gate |
+| `potluck-server` local ring | M4, 2 local CPU workers | Direct adjacent-peer ZeroMQ ring; two repeated windows per worker; a two-token completion returned ` located in` |
+| `potluck-server` automatic discovery | M4 head, 1 Linux CPU worker | DNS-SD discovery, scoped SSH trust-on-first-use, SSH launch, and direct ring inference succeeded; the same two-token completion returned ` located in` |
+
+These smokes establish candidate discovery and the direct server transport and
+launch boundaries only. They do not establish live profiling or admission,
+heterogeneity-aware selection and placement, shard automation, continuous
+batching, slots, resilience, public-network security, or full API parity.
 
 Full benchmark commands and raw output: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
@@ -117,26 +164,28 @@ modern inference engine and backend base.
 
 ## Current implementation gaps
 
-- `potluck-server` still executes a static contiguous chain. This path is
-  against the product architecture and must be removed.
-- `potluck-head --ring` proves coordinator-relayed routing over custom
-  PTLK/raw TCP. It is disconnected from the client-facing server and conflicts
-  with the required direct peer-to-peer ZeroMQ ring.
-- Device profiling, selection, placement, prefetch, and offload are optional or
-  manually connected instead of one automatic runtime.
-- The current prefetch path warms a model file, not the next assigned ring
-  window.
-- Accelerator planning does not independently adapt every device and window.
-- Shard creation, transfer, and selection are manual.
-- One chain serves one request at a time and returns HTTP 429 while busy.
-- The server has no conversation slots, cache affinity, or continuous HTTP
-  batching.
-- The HTTP surface is only an OpenAI-like subset and silently ignores some
-  unsupported fields.
+The direct adjacent-peer ZeroMQ ring now runs inside `potluck-server`, but its
+bootstrap and scheduling are still explicit and incomplete:
+
+- The current route uses two repeated disjoint windows per worker where layers
+  permit; it does not yet select windows from live heterogeneous capability or
+  current resource pressure.
+- DNS-SD candidate discovery and automatic SSH launch work, but live profiling,
+  admission, selection, placement, and topology lifecycle do not.
+- Per-window prefetch and independent CPU, CUDA, or Metal placement are not
+  implemented.
+- Shard creation, transfer, validation, selection, and caching are not
+  automated.
+- The server still serializes HTTP work instead of providing continuous
+  batching and isolated conversation slots.
+- The HTTP surface is only an OpenAI-like subset; full request, response,
+  error, usage, streaming, and cancellation parity is unfinished.
+- Worker failure handling lacks reconnect, ring rebuild, slot migration, and
+  safe retry behavior.
+- Authentication, encryption, credential handling, and tenant or prompt
+  privacy controls are unfinished. The deployment boundary remains a trusted
+  LAN.
 - The distributed graph currently targets Qwen3.5 dense (`qwen35`).
-- The current raw-TCP transport has no authentication or encryption and must be
-  replaced by the required ZeroMQ communication model. ZeroMQ authentication
-  and encryption remain separate security work.
 
 These are not acceptable product limitations or staged release modes. The
 product is unfinished until the complete
