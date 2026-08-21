@@ -75,7 +75,7 @@ stop_all() {
     done
     pids=()
     wait 2>/dev/null || true
-    sleep 1
+    sleep 3
 }
 
 weights="${work}/weights.txt"
@@ -138,6 +138,12 @@ if (( ! head_ok )) && grep -qE 'ggml_cuda_(init|graph)' "${head_log}" 2>/dev/nul
     printf '  (CUDA backend: near-tie flip after device drop; exact parity not asserted)\n'
 else
     if (( ! head_ok )); then
+        for log in "${work}"/worker_*.log "${work}"/bench_*.log; do
+            if [[ -f "${log}" ]]; then
+                printf '%s\n' "--- ${log} ---" >&2
+                cat "${log}" >&2
+            fi
+        done
         cat "${head_log}" >&2
         printf 'test_remove failed: chain head rc nonzero\n' >&2
         exit 1

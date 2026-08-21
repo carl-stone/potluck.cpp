@@ -33,8 +33,14 @@ stop_server() {
     sleep 1
 }
 cleanup() {
+    local rc=$?
+    if (( rc != 0 )) && [[ -f "${WORK}/server.log" ]]; then
+        printf '%s\n' '--- server.log ---' >&2
+        cat "${WORK}/server.log" >&2
+    fi
     stop_server
     rm -rf "${WORK}" 2>/dev/null || true
+    return "${rc}"
 }
 trap cleanup EXIT
 

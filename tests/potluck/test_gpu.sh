@@ -78,12 +78,18 @@ stop_workers() {
     done
     pids=()
     wait 2>/dev/null || true
-    sleep 1
+    sleep 3
 }
 
 fail_run() {
     local head_log="$1" label="$2"
     cat "${head_log}" >&2
+    for log in "${work}"/worker_*.log; do
+        if [[ -f "${log}" ]]; then
+            printf '%s\n' "--- ${log} ---" >&2
+            cat "${log}" >&2
+        fi
+    done
     printf 'test_gpu failed: %s\n' "${label}" >&2
     exit 1
 }

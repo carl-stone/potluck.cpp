@@ -87,7 +87,7 @@ stop_all() {
     done
     pids=()
     wait 2>/dev/null || true
-    sleep 1
+    sleep 3
 }
 
 weights="${work}/weights.txt"
@@ -127,6 +127,12 @@ printf '  ok (profile): measured weights %s\n' "${weights_line}"
 spawn_chain
 head_log="${work}/head.log"
 if ! "${BIN}/potluck-head" "${MODEL}" "${weights}" "${N_PREDICT}" "${HOST}" --parity-check >"${head_log}" 2>&1; then
+    for log in "${work}"/worker_*.log "${work}"/bench_*.log; do
+        if [[ -f "${log}" ]]; then
+            printf '%s\n' "--- ${log} ---" >&2
+            cat "${log}" >&2
+        fi
+    done
     cat "${head_log}" >&2
     printf 'test_sched failed: chain head rc nonzero\n' >&2
     exit 1
