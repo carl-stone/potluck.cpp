@@ -1,6 +1,8 @@
 *
 !*.*
 !snapshots/
+!potluck/
+!potluck/*.sh
 *.o
 ggml-common.h
 **/*.swp
