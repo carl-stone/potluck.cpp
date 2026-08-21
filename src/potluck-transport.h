@@ -1,5 +1,8 @@
 #pragma once
 
+// Legacy raw-TCP transport. ADR 0007 requires its removal and replacement with
+// direct ZeroMQ communication between adjacent ring peers.
+
 #include "potluck-protocol.h"
 
 #include <cstdint>

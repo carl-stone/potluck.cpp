@@ -1,23 +1,30 @@
 # ADR 0005: Raw TCP, not ZeroMQ
 
 - Date: 2026-08-20
-- Status: Accepted
+- Status: Superseded by ADR 0007
+- Approval note: This decision was marked accepted without the decision owner's
+  approval and was never a binding Potluck product decision.
 
-## Context
+## Historical context
 
-The cluster protocol needs ordered point-to-point delivery of frames between
-neighboring workers in a ring, on a trusted LAN. Options were raw POSIX TCP or
-a messaging library such as ZeroMQ.
+The unfinished component implementation needed ordered message delivery on a
+trusted LAN. An agent selected raw POSIX TCP instead of prima.cpp's ZeroMQ
+communication model.
 
-## Decision
+## Superseded decision
 
-Raw TCP with a length-prefixed frame protocol (`potluck-protocol.h`). No
-middleware dependency; every worker connects to exactly one next hop.
+The implementation used a custom length-prefixed PTLK frame protocol over raw
+TCP. The ADR also claimed that each worker connected to one next hop, but the
+implemented `potluck-head --ring` path instead connected the coordinator to
+every worker and relayed every hop.
 
-## Consequences
+ADR 0007 requires prima.cpp's direct peer-to-peer ring behavior and ZeroMQ
+communication model. The custom raw-TCP transport and coordinator-relayed route
+are removal targets, not supported alternatives.
 
-- Zero third-party runtime dependencies in the data path; builds on macOS and
-  Linux with only libc.
-- The protocol must handle partial reads/writes itself, which it does
-  (`recv_full`/`send_all`).
-- No auth or encryption: LAN-trusted deployment only, stated as a limitation.
+## Historical consequences
+
+- The component path avoided a ZeroMQ dependency.
+- It had to implement framing, partial reads and writes, timeouts, and retries.
+- It did not provide authentication or encryption.
+- Its transport and topology checks are historical evidence only.

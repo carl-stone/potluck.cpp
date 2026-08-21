@@ -1,7 +1,7 @@
 # ADR 0004: Context and sequence sizing come from need
 
 - Date: 2026-08-20
-- Status: Accepted
+- Status: Superseded by ADR 0006
 
 ## Context
 
@@ -12,15 +12,17 @@ plus 63.5 MB of reserved logits.
 
 ## Decision
 
-The head decides `n_ctx`, `n_seq_max`, and `n_ubatch` once for the cluster and
-carries them in the protocol `node_config`. Defaults: `n_ctx` 4096,
-`n_seq_max` 1, `n_ubatch` 512. `--ctx N` sets the context on head and server;
-`--batch N` sets `n_seq_max` (the multi-sequence path).
+ADR 0006 requires bounded conversation slots and continuous batching in the
+integrated ring server. Context, slot count, and batch sizes must be selected
+from the model's state cost and the live per-device resource plan. A
+single-sequence default is not a product configuration, and users must not
+manually assemble a separate batch execution mode.
 
 ## Consequences
 
-- Default 27B recurrent-state reservation drops from ~9.6 GiB to ~150 MiB per
-  worker.
-- Batched prefill sends the whole prompt in one message with one graph launch
-  per token per stage, not one round trip per token.
+- Sequence-state allocation remains bounded by the selected slot count.
+- Product placement accounts for context and per-slot state on every selected
+  worker before admitting the topology.
+- The protocol carries the selected context and batching limits as part of the
+  integrated server lifecycle.
 - The protocol version bump to 5 absorbs the config change.

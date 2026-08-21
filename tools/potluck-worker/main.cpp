@@ -1,16 +1,11 @@
-// potluck-worker: a generic stage in a potluck-style layer pipeline.
+// potluck-worker: legacy PTLK/raw-TCP stage used by component checks.
 //
-// A worker consumes either tokens (stage index 0) or a hidden state (any other
-// stage) from its upstream peer, runs its own layer window [start, end), and
-// forwards the resulting hidden state to the next stage -- or, when it is the
-// tail, reports the predicted token back to the coordinator. Each stage keeps
-// its own persistent context so recurrent/attention state survives across
-// positions, and it decodes every position (prefill and generation) so its
-// local recurrent state stays in sync with the rest of the model.
-//
-// The whole chain is described by one node_config handed to stage 0 by the
-// coordinator and forwarded unchanged down the chain; each worker reads its
-// own sliver from `bounds[index]`.
+// It can consume tokens or hidden state, execute assigned windows, and preserve
+// recurrent and attention state across positions. Its current chain and ring
+// connections do not implement ADR 0007: the finished product must use direct
+// ZeroMQ communication between adjacent ring peers, configured automatically
+// by the integrated server. Keep useful stage execution behavior during the
+// cutover, but do not preserve this transport or coordinator topology.
 //
 // Usage: potluck-worker <model.gguf> <host> <port> [-ngl N]
 
@@ -122,7 +117,7 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
-    // 1. Listen; the coordinator (stage 0) or the previous stage connects here.
+    // Legacy listener: accepts a coordinator or previous static-chain stage.
     potluck::tcp_listener listener = potluck::tcp_listener::bind_host(host, port);
     if (!listener.valid()) {
         fail("cannot bind listener");
@@ -131,10 +126,9 @@ int main(int argc, char ** argv) {
     std::fflush(stdout);
 
     std::string error;
-    // 2. Receive the chain schedule. A coordinator may open (and reset) a
-    //    probing connection before sending the real node_config; keep accepting
-    //    until a valid one arrives instead of aborting on a spurious first
-    //    connection.
+    // Legacy PTLK schedule path. It accepts probe connections before the real
+    // node_config. ADR 0007 requires this lifecycle to be replaced by the
+    // direct-peer ZeroMQ ring.
     potluck::tcp_channel upstream;
     potluck::message msg;
     for (;;) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Runs the whole potluck feature-parity + correctness suite.
-# Each test cleans up its own workers. Exit code is nonzero if any fails.
+# Runs checks for components in the unfinished pre-ADR-0006/0007 implementation.
+# This is not the Potluck product or architecture acceptance gate.
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -10,6 +10,7 @@ TESTS=(
     "test_chain.sh 2 48 127.0.0.1"
     "test_chain.sh 4 32 127.0.0.1"
     "test_chain.sh 6 32 127.0.0.1"
+    "test_no_attn.sh 8 127.0.0.1"
     "test_sampler.sh 2 32 127.0.0.1"
     "test_gpu.sh 3 24 127.0.0.1"
     "test_sched.sh 2 32 127.0.0.1"
@@ -44,4 +45,4 @@ if (( failed )); then
     printf 'SUITE FAILED\n' >&2
     exit 1
 fi
-printf 'SUITE PASSED (%s tests)\n' "${#TESTS[@]}"
+printf 'COMPONENT SUITE PASSED (%s tests; PRODUCT GATE NOT SATISFIED)\n' "${#TESTS[@]}"

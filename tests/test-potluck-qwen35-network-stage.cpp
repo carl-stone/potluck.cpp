@@ -1,3 +1,6 @@
+// Historical correctness check for the legacy raw-TCP stage path. It does not
+// cover the direct-peer ZeroMQ ring required by ADR 0007.
+
 #include "llama.h"
 #include "potluck-transport.h"
 

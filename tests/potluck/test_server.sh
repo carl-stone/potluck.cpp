@@ -12,6 +12,7 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 BIN="${BIN:-${REPO}/build/bin}"
 MODEL="${MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
 
+source "${REPO}/tests/potluck/test_helpers.sh"
 if [[ ! -x "${BIN}/potluck-server" || ! -x "${BIN}/potluck-worker" || ! -x "${BIN}/llama-cli" ]]; then
     printf 'missing binaries (build potluck-server, potluck-worker, llama-cli first): %s\n' "${BIN}" >&2
     exit 2
@@ -70,13 +71,25 @@ EIFFEL=$(curl -fsS "${auth_header[@]}" -d '{"prompt":"The Eiffel Tower is in","n
 python3 - "${FRANCE}" "${EIFFEL}" <<'PY'
 import json, sys
 first, second = map(json.loads, sys.argv[1:])
-assert isinstance(first.get("content"), str) and first["content"]
-assert isinstance(second.get("content"), str) and second["content"]
+for result in (first, second):
+    assert isinstance(result.get("content"), str) and result["content"]
+    assert result["finish_reason"] == "stop"
+    assert isinstance(result["n_predict"], int) and result["n_predict"] > 0
 assert first["content"] != second["content"], (first, second)
 PY
 
 CHAT_REQ='{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":8,"reasoning_effort":"none"}'
 CHAT=$(curl -fsS "${auth_header[@]}" -d "${CHAT_REQ}" "http://${HOST}:${PORT}/v1/chat/completions")
+python3 - "${CHAT}" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["object"] == "chat.completion"
+assert result["choices"][0]["message"]["role"] == "assistant"
+assert result["choices"][0]["message"]["content"]
+assert result["choices"][0]["finish_reason"] == "stop"
+usage = result["usage"]
+assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+PY
 
 MISSING_STATUS=$(curl -sS -o "${WORK}/missing.json" -w '%{http_code}' \
     "${auth_header[@]}" -d '{}' "http://${HOST}:${PORT}/completion")
@@ -85,6 +98,62 @@ python3 - "${WORK}/missing.json" <<'PY'
 import json, sys
 assert json.load(open(sys.argv[1]))["error"] == "missing prompt"
 PY
+
+BAD_JSON_STATUS=$(curl -sS -o "${WORK}/bad-json.json" -w '%{http_code}' \
+    "${auth_header[@]}" --data-binary '{' "http://${HOST}:${PORT}/completion")
+[[ "${BAD_JSON_STATUS}" == 400 ]]
+python3 - "${WORK}/bad-json.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["error"].startswith("invalid JSON:")
+PY
+
+INVALID_NUMBER_STATUS=$(curl -sS -o "${WORK}/invalid-number.json" -w '%{http_code}' \
+    "${auth_header[@]}" -d '{"prompt":"hello","n_predict":"eight"}' \
+    "http://${HOST}:${PORT}/completion")
+[[ "${INVALID_NUMBER_STATUS}" == 400 ]]
+python3 - "${WORK}/invalid-number.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["error"].startswith("invalid n_predict:")
+PY
+
+INVALID_NEGATIVE_STATUS=$(curl -sS -o "${WORK}/negative-number.json" -w '%{http_code}' \
+    "${auth_header[@]}" -d '{"prompt":"hello","n_predict":-1}' \
+    "http://${HOST}:${PORT}/completion")
+[[ "${INVALID_NEGATIVE_STATUS}" == 400 ]]
+python3 - "${WORK}/negative-number.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["error"].startswith("invalid n_predict:")
+PY
+
+INVALID_LARGE_STATUS=$(curl -sS -o "${WORK}/large-number.json" -w '%{http_code}' \
+    "${auth_header[@]}" -d '{"prompt":"hello","n_predict":4294967296}' \
+    "http://${HOST}:${PORT}/completion")
+[[ "${INVALID_LARGE_STATUS}" == 400 ]]
+python3 - "${WORK}/large-number.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["error"].startswith("invalid n_predict:")
+PY
+
+INVALID_STREAM_STATUS=$(curl -sS -o "${WORK}/invalid-stream.json" -w '%{http_code}' \
+    "${auth_header[@]}" -d '{"prompt":"hello","stream":"yes"}' \
+    "http://${HOST}:${PORT}/completion")
+[[ "${INVALID_STREAM_STATUS}" == 400 ]]
+python3 - "${WORK}/invalid-stream.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["error"].startswith("invalid stream:")
+PY
+
+NOT_FOUND_STATUS=$(curl -sS -o "${WORK}/not-found.json" -w '%{http_code}' \
+    "http://${HOST}:${PORT}/not-found")
+[[ "${NOT_FOUND_STATUS}" == 404 ]]
+python3 - "${WORK}/not-found.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["error"] == "not found"
+PY
+
+OPTIONS_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS \
+    "${auth_header[@]}" "http://${HOST}:${PORT}/completion")
+[[ "${OPTIONS_STATUS}" == 204 ]]
 
 HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
 python3 - "${HEALTH}" "${N_WORKERS}" <<'PY'
@@ -118,6 +187,81 @@ assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
 assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
 assert "".join(c["choices"][0]["delta"].get("content", "") for c in chunks) 
 PY
+RAW_SSE=$(curl -fsS -N "${auth_header[@]}" -d \
+    '{"prompt":"Say hi","n_predict":3,"stream":true}' \
+    "http://${HOST}:${PORT}/completion")
+python3 - "${RAW_SSE}" <<'PY'
+import json, sys
+lines = [line[6:] for line in sys.argv[1].splitlines() if line.startswith("data: ")]
+assert lines and lines[-1] == "[DONE]"
+chunks = [json.loads(line) for line in lines[:-1]]
+assert chunks and "".join(c.get("content", "") for c in chunks)
+PY
+
+python3 - "${HOST}" "${PORT}" <<'PY'
+import json, sys, threading, time, urllib.error, urllib.request
+
+host, port = sys.argv[1], int(sys.argv[2])
+base = f"http://{host}:{port}"
+
+def post(body):
+    request = urllib.request.Request(
+        base + "/completion",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
+
+stream_started = threading.Event()
+long_result = []
+
+def run_long_request():
+    request = urllib.request.Request(
+        base + "/completion",
+        data=json.dumps({
+            "prompt": "The capital of France is",
+            "n_predict": 256,
+            "stream": True,
+        }).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response:
+            first_line = response.readline().decode()
+            stream_started.set()
+            rest = response.read().decode()
+            long_result.append((response.status, first_line + rest))
+    except Exception as error:
+        long_result.append(error)
+        stream_started.set()
+
+thread = threading.Thread(target=run_long_request)
+thread.start()
+assert stream_started.wait(30), "stream request never started"
+assert not long_result or isinstance(long_result[0], Exception) is False, long_result
+
+busy_seen = False
+deadline = time.monotonic() + 10
+while thread.is_alive() and time.monotonic() < deadline:
+    status, body = post({"prompt": "The moon is made of", "n_predict": 1})
+    if status == 429:
+        error = json.loads(body)
+        assert error["error"] == "chain is busy; retry later"
+        busy_seen = True
+        break
+    assert status == 200, (status, body)
+assert busy_seen, "concurrent request never received HTTP 429"
+thread.join(timeout=180)
+assert not thread.is_alive(), "stream request did not finish"
+assert long_result and long_result[0][0] == 200, long_result
+status, body = post({"prompt": "The moon is made of", "n_predict": 1})
+assert status == 200, (status, body)
+PY
+
 stop_server
 if [[ "${POTLUCK_SKIP_CLI_PARITY:-0}" == 1 ]]; then
     python3 - "${CHAT}" <<'PY'

@@ -1,12 +1,11 @@
-// potluck-head: coordinator for a potluck-style layer pipeline.
+// potluck-head: legacy coordinator for component verification.
 //
-// Reads a chain of worker nodes from a config file (host:port one per line),
-// automatically tessellates the full model's layers into one contiguous window
-// per worker, wires the neighbor-to-neighbor chain, drives prompt prefill plus
-// n_predict greedy decode steps, and asserts the pipeline output matches a
-// local full-model reference run. The full-model reference is a correctness
-// harness (the 0.8B fixture fits on one machine); it is not used in the
-// pipeline's data path.
+// This executable uses manual worker configuration, static-chain behavior, and
+// a coordinator-relayed PTLK/raw-TCP ring. ADR 0007 requires direct ZeroMQ
+// communication between adjacent ring peers through the integrated server.
+// This implementation is a removal target and must not be extended into a
+// product path. Its optional full-model reference remains useful only for
+// small-fixture correctness checks during the clean cutover.
 //
 // Usage: potluck-head <model.gguf> <workers_file> [n_predict] [host] [-ngl N]
 
@@ -113,7 +112,7 @@ std::vector<llama_token> run_full(const std::string & model_path,
                 tok[i] = static_cast<int32_t>(prompt[i]);
             }
             if (potluck::stage_decode_tokens_batch(sm, tok.data(), pos.data(), seq.data(),
-                                                   static_cast<uint32_t>(prompt.size()), /*n_logits=*/static_cast<uint32_t>(prompt.size())) != 0) {
+                                                   static_cast<uint32_t>(prompt.size()), /*n_logits=*/1) != 0) {
                 fail("full batched prefill decode failed");
             }
         }
@@ -807,13 +806,11 @@ int main(int argc, char ** argv) {
         fail("--lp and --ring are mutually exclusive (the ring takes explicit window sizes)");
     }
 
-    // §3 piped ring. The model's layers are covered by a set of windows, one
-    // per rank per cycle; within a cycle the windows are owned in ring order
-    // (rank 1, 2, .., n-1, 0, mirroring potluck's this_layer_is_mine). Each rank
-    // therefore owns several disjoint windows, and a single token's forward
-    // pass hops between ranks' windows multiple times. The coordinator routes
-    // every hop (request/response over one channel per worker); the worker
-    // hosts all of its windows and decodes the requested one.
+    // Legacy piped-ring component check. The model's layers are covered by
+    // several windows per rank, but the coordinator relays every hop over one
+    // PTLK/raw-TCP channel per worker. ADR 0007 requires adjacent ring peers to
+    // exchange this data directly over ZeroMQ. This route is a removal target,
+    // not the basis of the integrated server.
     if (!ring_sizes.empty()) {
         if (ring_sizes.size() != n_workers) {
             fail("--ring needs one window size per worker");
@@ -856,7 +853,7 @@ int main(int argc, char ** argv) {
         }
         std::printf("\n");
 
-        // Connect one channel per worker and hand each its window list.
+        // Legacy coordinator fan-out; ADR 0007 requires direct peer-ring links.
         std::vector<potluck::tcp_channel> channels;
         channels.reserve(n_workers);
         std::string error;

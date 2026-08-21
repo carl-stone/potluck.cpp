@@ -1,15 +1,12 @@
 #pragma once
 
-// Shared stage-runtime helpers for the potluck-style static pipeline.
+// Shared stage-runtime helpers for legacy static and coordinator-routed
+// component checks.
 //
-// A "stage" owns a contiguous half-open range of model layers [start, end).
-//   - A head stage starts at layer 0 and emits the hidden state after its last
-//     layer (no LM head) when end < n_layer.
-//   - A tail stage ends at layer n_layer and runs the LM head producing logits.
-//   - A middle stage (future work) would consume a hidden state and emit one.
-//
-// This header is intentionally small and dependency-light so it can be shared
-// between the potluck-stage coordinator tool and the test suite.
+// A stage owns one or more model-layer windows. The execution helpers can be
+// retained during the ADR 0007 cutover, but their current PTLK/raw-TCP
+// coordinator topology cannot. Product communication must use direct ZeroMQ
+// links between adjacent ring peers.
 
 #include "llama.h"
 
@@ -84,20 +81,16 @@ inline llama_context_params stage_context_params(uint32_t start, uint32_t end, b
         params.n_threads_batch = 1;
     }
     params.n_ctx = n_ctx;
-    // n_batch must accept one whole batched window (§11/§12); n_ubatch is the
-    // size llama.cpp splits it into internally. The coordinator decides both
-    // once for the cluster and carries them in node_config.
+    // Legacy node_config carries these cluster-wide values. The integrated
+    // direct-peer ZeroMQ server must select and distribute equivalent bounded
+    // values automatically.
     params.n_batch = 256;
     params.n_ubatch = 1;
-    // Concurrent requests are distinct sequences in one llama_decode per
-    // round, so the context must accept at least n_seq_max sequences
-    // (llama.cpp asserts n_outputs_max >= n_seq_max when it reserves the
-    // output buffer). The coordinator sizes this from actual need: 1 by
-    // default, N with --batch N.
-    params.n_seq_max = 64;
-    // A non-tail stage emits every hidden row from a batched window. A tail
-    // stage only needs logits for the requested sequence outputs.
-    params.n_outputs_max = 64;
+    // Keep the configured number of sequences. llama.cpp treats n_ctx as the
+    // total context across those sequences; forcing 64 slots silently reduced
+    // the default server's per-request context to 1/64 (256 tokens at 4096).
+    params.n_seq_max = std::max<uint32_t>(1, n_seq_max);
+    params.n_outputs_max = embeddings ? params.n_batch : std::max<uint32_t>(1, n_seq_max);
     params.embeddings = embeddings;
     params.potluck_layer_start = start;
     params.potluck_layer_end = end;

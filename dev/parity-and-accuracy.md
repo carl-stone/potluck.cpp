@@ -1,46 +1,66 @@
-# Feature parity and inference accuracy
+# Component verification and inference accuracy
 
-This document separates two claims:
+This document records evidence from the current unfinished implementation. It
+does not define the product architecture or a release gate. The binding
+decision is [ADR 0006](decisions/0006-piped-ring-server-product.md), amended by
+[ADR 0007](decisions/0007-prima-direct-ring-zeromq.md): Potluck is a
+resource-aware, direct-peer ZeroMQ piped-ring-only OpenAI-compatible server with
+automatic profiling and selection, heterogeneous window placement, per-window
+prefetch, per-device accelerator placement, shard-only loading, continuous
+batching, and conversation slots.
+
+Static execution and other alternative architecture paths must be removed from
+the source and tests. Passing a static, standalone ring, batch-protocol, shard,
+or HTTP component check does not make Potluck a finished product.
+
+This document separates two component claims:
 
 - **Inference accuracy**: generated tokens match the full-model reference on
-  small fixture models.
-- **Feature parity**: a runtime capability has a named acceptance check.
+  small test fixtures.
+- **Component feature evidence**: a current mechanism has a named check.
 
-`CHAIN PASSED` proves inference accuracy only. It does not prove feature parity.
-The reference capability set is documented by [prima.cpp](https://github.com/OpenCPIL/prima.cpp);
-this project keeps a modern llama.cpp base and uses a versioned TCP transport.
+`CHAIN PASSED` proves fixture inference accuracy only. It does not prove the
+product contract. The reference capability set is documented by
+[prima.cpp](https://github.com/OpenCPIL/prima.cpp). Potluck keeps a modern
+llama.cpp base. The present versioned raw-TCP transport is conflicting legacy
+implementation; ADR 0007 requires prima.cpp's direct-ring ZeroMQ model.
 
 ## Verification scope
 
-The correctness contract is exercised with small model files that fit the test
-host. The current fixture is Qwen3.5 0.8B; other small models may be used when
-they exercise a supported path. Verifying 27B correctness, performance, or
-end-to-end execution is an explicit non-goal. 27B is a deployment target, not
-an acceptance target.
+Fixture accuracy is exercised with small model files that fit the test host.
+The current fixture is Qwen3.5 0.8B; other small models may exercise a
+component primitive. Verifying 27B correctness, performance, or end-to-end
+execution remains outside the fixture test scope. It does not change the
+ADR 0006 product architecture or release gate.
 
-## Re-verified on 2026-08-20
+## Re-verified on 2026-08-21
 
-The checks below ran from this checkout on an Apple M4 with the Qwen3.5 0.8B
-fixture. The full command is `bash tests/potluck/run_all.sh`.
+The component checks below ran from this checkout on an Apple M4 with the
+Qwen3.5 0.8B fixture. The command is `bash tests/potluck/run_all.sh`. The same
+source and fixture also passed the 18-check component suite on the Arch PC
+(`x86_64`) with `POTLUCK_HIGHS=OFF`; the PC run skips CLI comparison because
+CUDA/x86 numerical variance is covered by the fixture policy.
 
-| Capability | Definition of done | Check |
+
+| Component | Checked behavior | Check and product boundary |
 |---|---|---|
-| Hidden-state static pipeline and tail LM head | Multiple worker outputs match the full-model reference | `test_chain.sh` |
-| Contiguous N-worker tessellation | 1, 2, 4, and 6 worker splits pass | `test_chain.sh` entries in `run_all.sh` |
-| Piped-ring routing | Every worker owns at least two windows and all four scenarios pass | `test_ring.sh` (including 2x[4,4] three-cycle case) |
-| Throughput-aware scheduling | Profiled weights and scheduler produce a passing chain | `test_sched.sh` |
-| HiGHS LP placement | LP path honors the configured placement constraints | `test_lp.sh` |
-| Worker profiling and removal | Profile results drive the drop-slowest path | `test_remove.sh` |
-| Prefetch | Page-cache warm path completes and keeps output identical | `test_prefetch.sh` |
-| GPU layer planning | CPU/Metal offload budgets preserve the checked output; CUDA still checks the plan and permits only an evidenced near-tie mismatch | `test_gpu.sh` |
-| Sampling | Temperature, top-p, and seed behavior meet the script contract | `test_sampler.sh` |
-| Speculative decoding | Speculative output matches the target greedy stream | `test_spec.sh` |
-| Dynamic batch sequences | Multiple sequence IDs match isolated requests | `test_batch.sh` |
-| Prompt, chat, and streaming output | Chat template, text output, and stream checks pass | `test_chat.sh` |
-| HTTP server behavior | Prompt changes output, missing prompt is 400, health/models work, SSE parses, and chat output matches `llama-cli` | `test_server.sh` and `test_vs_llama_cli.sh` |
-| Per-window GGUF shards | Generated shards load, a sharded chain matches the unsplit chain, and a wrong assignment names both windows | `potluck-shard` plus `test_shard.sh` |
-| Versioned transport | Protocol mismatch reports local and peer versions | protocol tests and worker handshake path |
-| Metadata-only coordinator | Head runs without `--parity-check` and loads no model weights | `test_chain.sh` default path and server startup |
+| Legacy static hidden-state path | Multiple worker outputs match the full-model reference | `test_chain.sh`; removal target, not product execution |
+| Legacy static worker tessellation | 1, 2, 4, and 6 worker splits pass | `test_chain.sh`; must be rewritten or deleted during cutover |
+| Mixed recurrent/attention window primitive | A worker window with no attention layers preserves fixture accuracy | `test_no_attn.sh`; component evidence only |
+| Standalone piped-ring routing | Every worker owns at least two windows and all four scenarios pass | `test_ring.sh`; must move into the server |
+| Throughput measurement primitive | Profiled weights can drive a passing legacy schedule | `test_sched.sh`; manual application is not product behavior |
+| HiGHS placement primitive | LP path honors configured constraints | `test_lp.sh`; automatic integration remains missing |
+| Schedule-time worker removal primitive | Profile results drive one drop-slowest operation | `test_remove.sh`; live selection remains missing |
+| Whole-file prefetch primitive | Page-cache warm path completes and keeps output identical | `test_prefetch.sh`; conflicts with required per-window prefetch |
+| Static GPU planning primitive | CPU/Metal budgets preserve checked output; CUDA permits only an evidenced near-tie mismatch | `test_gpu.sh`; per-device/window placement remains missing |
+| Sampling primitive | Temperature, top-p, and seed meet the script contract | `test_sampler.sh` |
+| Standalone speculative decoding | Output matches the target greedy stream | `test_spec.sh`; not integrated with the product server |
+| Batch sequence protocol | Multiple sequence IDs match isolated requests | `test_batch.sh`; not continuous HTTP batching or slots |
+| Prompt, chat, and streaming component | Template, text, and stream checks pass | `test_chat.sh`; not the complete OpenAI contract |
+| Legacy static HTTP server | Prompt/error/health/models/SSE checks and CLI comparison pass | `test_server.sh`, `test_vs_llama_cli.sh`; server architecture must be replaced |
+| Per-window GGUF shard primitive | Generated shards load and reject wrong assignments | `potluck-shard`, `test_shard.sh`; automatic ring integration remains missing |
+| Legacy versioned raw-TCP transport | Protocol mismatch reports local and peer versions | protocol tests and worker handshake path; removal target, not product communication |
+| Metadata-only coordinator primitive | Head can omit the full fixture reference | `test_chain.sh`; production must also use shard-only worker loading |
 
 The GPU check asserts exact greedy parity on CPU and Metal. CUDA backend
 numerics can vary at a near tie; the script accepts that case only when the
@@ -87,17 +107,22 @@ These items are not claimed as newly verified by the current M4 run:
 - Quantization breadth has no passing Q8_0 window test in this checkout. It is
   explicitly inherited and unverified, not feature parity.
 
-## Architecture scope
+## Architecture status
 
-The distributed window loader currently targets the `qwen35` dense path. The
-static route assigns one contiguous window to each worker. Ring mode is a
-separate route and loads several disjoint windows per worker. Raw TCP is
-intentional; ZeroMQ transport compatibility is not a project requirement.
+The current distributed window loader targets the `qwen35` dense path. The
+source still contains a static route, a separate opt-in ring route, manually
+applied scheduling, whole-file prefetch, static accelerator budgets, a
+standalone batch path, and a one-chain HTTP server that returns 429 while busy.
 
-The full-model reference remains an explicit correctness harness. Production
-runs should omit `--parity-check`; the coordinator then loads GGUF metadata and
-vocabulary only. One chain serves one request at a time, and the HTTP server
-returns 429 while it is busy.
+Every item in that list is an unfinished gap against ADR 0006. The clean
+cutover must remove static execution and connect automatic live placement,
+per-window prefetch, per-device accelerator placement, shard-only loading,
+continuous batching, and conversation slots to the OpenAI-compatible ring
+server. Component checks in this document must be rewritten around that
+integrated product path.
+
+The full-model reference remains test-only and explicit. Product binaries must
+not load the full model as a correctness reference.
 
 CI configures `POTLUCK_HIGHS=OFF` to avoid the network-only HiGHS
 `FetchContent` dependency. In that build, `test_lp.sh` reports an explicit

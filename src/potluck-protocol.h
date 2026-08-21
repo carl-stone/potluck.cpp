@@ -52,8 +52,8 @@ struct node_addr {
     uint16_t port = 0;
 };
 
-// Node schedule handed to worker 0 by the coordinator and forwarded unchanged
-// down the chain; each worker reads its own sliver from `bounds` by `index`.
+// Legacy static-chain schedule. ADR 0007 requires its PTLK/raw-TCP transport
+// and coordinator-forwarded topology to be removed, not extended.
 struct node_config {
     uint32_t n_workers = 0;
     uint32_t index = 0;            // this worker's stage index in [0, n_workers)
@@ -68,10 +68,9 @@ struct node_config {
     float temp  = 0.0f;            // >0 enables temperature sampling; <=0 means greedy
     float top_p = 0.0f;            // >0 && <1 narrows the distribution (with temp); otherwise disabled
     std::vector<int32_t> ngl;      // per-stage GPU offload (window-relative) layers, size n_workers; empty = use worker default
-    // Piped-ring mode: when non-empty, this worker owns these windows (each a
-    // half-open [start,end) layer range) instead of one contiguous slice, and
-    // serves window-decode requests from the coordinator over a single channel.
-    // Empty means the default static contiguous-window pipeline.
+    // Legacy coordinator-routed ring mode. ADR 0007 requires direct ZeroMQ
+    // communication between adjacent ring peers and prohibits retaining this
+    // PTLK/raw-TCP route or the static fallback as a product mode.
     std::vector<std::pair<uint32_t, uint32_t>> ring;
 };
 // Per-stage metrics returned by a live benchmark request. The coordinator

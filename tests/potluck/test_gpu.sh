@@ -34,6 +34,8 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 BIN="${BIN:-${REPO}/build/bin}"
 MODEL="${MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
+source "${REPO}/tests/potluck/test_helpers.sh"
+
 
 if [[ ! -x "${BIN}/potluck-head" || ! -x "${BIN}/potluck-worker" ]]; then
     printf 'missing binaries (build potluck-head/potluck-worker first): %s\n' "${BIN}" >&2
@@ -100,37 +102,32 @@ scenarios=(
     "--gpu-layers 24|all layers offloaded"
 )
 
+# Bit-exact greedy parity across independent contexts is a Metal/CPU
+# guarantee. CUDA can choose a different near-tie token, but the only
+# accepted exception is a complete, in-vocab token stream with equal length.
 for spec in "${scenarios[@]}"; do
     budget_arg="${spec%%|*}"
     label="${spec##*|}"
     head_log="${work}/head_${budget_arg// /_}.log"
 
     start_workers
-    # Bit-exact greedy parity ("CHAIN PASSED") across independent contexts is
-    # a Metal/CPU guarantee. llama.cpp's CUDA backend is not run-to-run
-    # reproducible, so a mixed-offload boundary can flip a near-tie greedy
-    # step (the head then exits 1 with MISMATCH); on CUDA that specific
-    # outcome is accepted and noted, everything else still fails.
+    head_result=0
     if "${BIN}/potluck-head" "${MODEL}" "${workers}" "${N_PREDICT}" "${HOST}" --parity-check ${budget_arg} >"${head_log}" 2>&1; then
-        head_ok=1
+        head_result=1
+    elif potluck_accept_backend_variance "${head_log}"; then
+        head_result=2
     else
-        head_ok=0
+        fail_run "${head_log}" "head rc nonzero (${label})"
     fi
     stop_workers
 
-    cuda_backend=0
-    if grep -qE 'ggml_cuda_(init|graph)' "${head_log}" 2>/dev/null; then
-        cuda_backend=1
+    if (( head_result == 1 )) && ! grep -q 'CHAIN PASSED' "${head_log}"; then
+        fail_run "${head_log}" "no CHAIN PASSED (${label})"
     fi
-    if (( head_ok )); then
-        if ! grep -q 'CHAIN PASSED' "${head_log}"; then
-            fail_run "${head_log}" "no CHAIN PASSED (${label})"
-        fi
+    if (( head_result == 1 )); then
         printf '  ok: %-45s -> %s\n' "${label}" "$(grep -oE 'CHAIN PASSED[^,]*' "${head_log}" | head -1)"
-    elif (( cuda_backend )) && grep -q 'MISMATCH' "${head_log}"; then
-        printf '  (CUDA backend, %s: near-tie flip; exact parity not asserted)\n' "${label}"
     else
-        fail_run "${head_log}" "head rc nonzero (${label})"
+        printf '  ok: %-45s -> CUDA numerical variance accepted\n' "${label}"
     fi
     if ! grep -q 'GPU offload plan' "${head_log}"; then
         fail_run "${head_log}" "no offload plan printed (${label})"

@@ -1,3 +1,6 @@
+// Historical check for the legacy raw-TCP component transport. ADR 0007
+// requires replacement coverage for the direct-peer ZeroMQ ring.
+
 #include "../src/potluck-protocol.h"
 #include "../src/potluck-transport.h"
 

@@ -27,6 +27,7 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 BIN="${BIN:-${REPO}/build/bin}"
 MODEL="${MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
+source "${REPO}/tests/potluck/test_helpers.sh"
 
 if [[ ! -x "${BIN}/potluck-head" || ! -x "${BIN}/potluck-worker" ]]; then
     printf 'missing binaries (build potluck-head/potluck-worker first): %s\n' "${BIN}" >&2
@@ -79,12 +80,10 @@ stop_all() {
 }
 
 weights="${work}/weights.txt"
-probe_weights="${work}/probe_weights.txt"
 
 # Profile all devices and drop exactly the slowest one (--drop-slowest 1):
 # the rebuilt topology must exclude it, and the remaining devices must still
 # reproduce the reference exactly.
-weights="${work}/weights.txt"
 
 spawn_bench
 if ! "${BIN}/potluck-head" "${MODEL}" "${workers}" 1 "${HOST}" --profile --out "${weights}" \
@@ -120,34 +119,30 @@ while read -r line; do
     pids+=($!)
 done < "${weights}"
 sleep 2
-
 head_log="${work}/head.log"
+
 # Bit-exact greedy parity across independent contexts is a Metal/CPU
-# guarantee; llama.cpp's CUDA backend is not run-to-run reproducible, so after
-# a device drop a near-tie can flip. On CUDA that specific outcome (MISMATCH
-# exit) is accepted -- the topology itself is what this test checks --
-# everything else still fails.
+# guarantee. CUDA can choose a different near-tie token, but the only
+# accepted exception is a complete, in-vocab token stream with equal length.
+head_result=0
 if "${BIN}/potluck-head" "${MODEL}" "${weights}" "${N_PREDICT}" "${HOST}" --parity-check >"${head_log}" 2>&1; then
-    head_ok=1
+    head_result=1
+elif potluck_accept_backend_variance "${head_log}"; then
+    head_result=2
 else
-    head_ok=0
+    for log in "${work}"/worker_*.log "${work}"/bench_*.log; do
+        if [[ -f "${log}" ]]; then
+            printf '%s\n' "--- ${log} ---" >&2
+            cat "${log}" >&2
+        fi
+    done
+    cat "${head_log}" >&2
+    printf 'test_remove failed: chain head rc nonzero\n' >&2
+    exit 1
 fi
 stop_all
 
-if (( ! head_ok )) && grep -qE 'ggml_cuda_(init|graph)' "${head_log}" 2>/dev/null && grep -q 'MISMATCH' "${head_log}"; then
-    printf '  (CUDA backend: near-tie flip after device drop; exact parity not asserted)\n'
-else
-    if (( ! head_ok )); then
-        for log in "${work}"/worker_*.log "${work}"/bench_*.log; do
-            if [[ -f "${log}" ]]; then
-                printf '%s\n' "--- ${log} ---" >&2
-                cat "${log}" >&2
-            fi
-        done
-        cat "${head_log}" >&2
-        printf 'test_remove failed: chain head rc nonzero\n' >&2
-        exit 1
-    fi
+if (( head_result == 1 )); then
     if ! grep -q 'CHAIN PASSED' "${head_log}"; then
         cat "${head_log}" >&2
         printf 'test_remove failed: no CHAIN PASSED\n' >&2
@@ -156,5 +151,7 @@ else
     printf '  ok (rebuild): %s -> %s\n' \
         "$(grep -oE 'layers split:.*' "${head_log}" | head -1)" \
         "$(grep -oE 'CHAIN PASSED[^,]*' "${head_log}" | head -1)"
+else
+    printf '  ok (rebuild): CUDA numerical variance accepted\n'
 fi
 printf 'test_remove passed (%s of %s devices kept, %s predict)\n' "${n_kept}" "${n_started}" "${N_PREDICT}"

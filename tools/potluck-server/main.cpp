@@ -123,11 +123,36 @@ std::vector<std::string> parse_hosts(const std::string & text) {
 }
 
 uint32_t json_u32(const json & object, const char * key, uint32_t fallback) {
-    if (!object.contains(key) || (!object[key].is_number_unsigned() && !object[key].is_number_integer())) {
+    if (!object.contains(key)) {
         return fallback;
     }
-    const auto value = object[key].get<int64_t>();
-    return value < 0 ? fallback : static_cast<uint32_t>(value);
+    const json & value = object.at(key);
+    uint64_t number = 0;
+    if (value.is_number_unsigned()) {
+        number = value.get<uint64_t>();
+    } else if (value.is_number_integer()) {
+        const int64_t signed_number = value.get<int64_t>();
+        if (signed_number < 0) {
+            throw std::runtime_error(std::string("invalid ") + key + ": expected a non-negative integer");
+        }
+        number = static_cast<uint64_t>(signed_number);
+    } else {
+        throw std::runtime_error(std::string("invalid ") + key + ": expected a non-negative integer");
+    }
+    if (number > UINT32_MAX) {
+        throw std::runtime_error(std::string("invalid ") + key + ": value is too large");
+    }
+    return static_cast<uint32_t>(number);
+}
+
+bool json_bool(const json & object, const char * key, bool fallback) {
+    if (!object.contains(key)) {
+        return fallback;
+    }
+    if (!object.at(key).is_boolean()) {
+        throw std::runtime_error(std::string("invalid ") + key + ": expected a boolean");
+    }
+    return object.at(key).get<bool>();
 }
 
 std::string shell_quote(const std::string & value) {
@@ -721,7 +746,11 @@ int main(int argc, char ** argv) {
                         throw std::runtime_error("missing messages");
                     }
                     common_chat_templates_inputs inputs;
-                    inputs.messages = common_chat_msgs_parse_oaicompat(req["messages"]);
+                    try {
+                        inputs.messages = common_chat_msgs_parse_oaicompat(req["messages"]);
+                    } catch (const std::exception & e) {
+                        throw std::runtime_error(std::string("invalid messages: ") + e.what());
+                    }
                     if (req.contains("reasoning_effort") && req["reasoning_effort"].is_string() &&
                         req["reasoning_effort"].get<std::string>() == "none") {
                         inputs.enable_thinking = false;
@@ -740,7 +769,7 @@ int main(int argc, char ** argv) {
                     n_predict = json_u32(req, "n_predict", n_predict_default);
                 }
                 const std::vector<llama_token> prompt = tokenize_prompt(vocab, prompt_text);
-                const bool stream = req.value("stream", false);
+                const bool stream = json_bool(req, "stream", false);
                 const std::string id = "chatcmpl-potluck-" + now_id();
                 const std::string created = now_id();
                 const auto common_chunk = [id, created, model_name](const json & choice) {
@@ -809,7 +838,10 @@ int main(int argc, char ** argv) {
                 response.set_content(result.dump(), "application/json");
             } catch (const std::exception & e) {
                 const std::string message = e.what();
-                response.status = message == "missing prompt" || message == "prompt is empty" || message == "missing messages" ? 400 : 503;
+                const bool client_error =
+                    message == "missing prompt" || message == "prompt is empty" ||
+                    message == "missing messages" || message.rfind("invalid ", 0) == 0;
+                response.status = client_error ? 400 : 503;
                 set_common_headers(response);
                 response.set_content(error_json(message).dump(), "application/json");
             }

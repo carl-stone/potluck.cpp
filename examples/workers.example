@@ -1,35 +1,10 @@
-# potluck-head workers file. One worker per line:
-#   "host:port [weight] [ram_mb] [vram_mb]"
+# Superseded manual configuration format.
 #
-# host:port  -- where potluck-worker listens on that machine. On each host, start
-#              the worker manually with that machine's own address, e.g.:
-#                ./potluck-worker models/Qwen3.8-27B-Q4_K_M.gguf 192.168.1.20 40000
-# weight     -- optional integer capability score, default 1. The head splits
-#              the model's layers proportionally to the weights (2 = ~twice the
-#              layers). --profile overwrites these with measured throughput.
-# ram_mb     -- optional per-machine RAM budget in MiB for THIS machine's layer
-#              weights + KV cache. Only enforced by --lp (HiGHS LP scheduler):
-#              the solver may give the machine at most floor(budget / bytes
-#              per layer) layers. Absent = unlimited.
-# vram_mb    -- optional per-machine GPU memory budget in MiB for offloaded
-#              layer weights. 0 forces the machine CPU-only. Only enforced by
-#              --lp, which also caps that worker's -ngl at the budget.
+# ADR 0006 requires automatic discovery, live profiling, device selection, and
+# heterogeneity-aware piped-ring window placement through potluck-server.
+# Product users must not provide hosts, ranks, weights, bounds, RAM budgets, or
+# VRAM budgets in a workers file.
 #
-# Both budgets are positional: to set vram_mb without ram_mb, write a generous
-# ram_mb first. Lines starting with '#' are ignored. Order matters: layer
-# window w belongs to line w, and hidden states flow from line 0 toward the
-# last line.
-
-# M4 laptop, local Metal worker (Mac): 16 GB unified, fast GPU.
-192.168.1.66:40000 3 16384 12288
-
-# PC with GTX 1650 SUPER (Arch Linux): only 4 GB VRAM -> keep the GPU budget
-# honest so --lp never offloads more than it can hold. CPU layers go to RAM.
-192.168.1.78:40001 2 12288 3584
-
-# pink M1 Air, remote Metal worker (16 GB unified).
-192.168.1.21:40002 1 12288 12288
-
-# headless Intel MBP (Ubuntu), CPU-only: vram_mb 0 keeps it offload-free.
-# Weights must be >= 1; omit the line entirely to leave the machine out.
-#192.168.1.60:40003 1 8192 0
+# The workers-file capability and this example are removal targets. This file
+# intentionally contains no usable configuration so it cannot be mistaken for
+# a supported Potluck deployment.

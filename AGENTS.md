@@ -8,6 +8,71 @@
 
 ---
 
+## Binding Potluck product architecture
+
+Before changing Potluck code, tests, or documentation, read
+`dev/decisions/0006-piped-ring-server-product.md` and
+`dev/decisions/0007-prima-direct-ring-zeromq.md`.
+
+Potluck has one execution architecture: an automatically formed,
+heterogeneity-aware piped ring served by an OpenAI-compatible head. Adjacent
+ring peers communicate directly through ZeroMQ; the head must not relay
+intermediate data for windows it does not execute. The product requires
+automatic live device profiling and selection, per-window prefetch, per-device
+CPU/CUDA/Metal placement, per-device GGUF shard loading, continuous batching,
+conversation slots, and resource-aware head participation. A full GGUF may
+exist on disk, but a worker loads only assigned window shards.
+
+Static execution, manual topology or placement, standalone ring/batch paths,
+whole-file prefetch as a substitute for per-window prefetch, global accelerator
+budgets, and one-request serving must be removed. Do not preserve them as
+diagnostics, fallbacks, compatibility modes, experiments, or provisional
+releases. Tests must exercise the integrated ring server. Component checks do
+not establish product completion.
+
+The custom PTLK/raw-TCP transport and coordinator-routed ring are conflicting
+legacy implementation. Remove them during the clean cutover. Do not preserve
+them as alternate transports, diagnostics, or compatibility modes.
+
+## Potluck decision authority
+
+- Direct user decisions and accepted Potluck ADRs are binding.
+- For an unresolved technical behavioral decision, defer to the documented and
+  coded behavior of [prima.cpp](https://github.com/OpenCPIL/prima.cpp), the
+  behavioral progenitor of Potluck's distributed runtime. Preserve the
+  observable behavior and purpose; do not invent or select a competing
+  architecture because it is more familiar.
+- A technical departure from prima.cpp requires explicit user approval and an
+  accepted Potluck ADR. Implementation details may differ when the behavioral
+  result is preserved and existing ADRs require the difference.
+- Prima.cpp is not the usability reference. Potluck's user-experience north
+  star is a simple normal local server: select a model, let Potluck discover and
+  operate the cluster automatically, and connect an ordinary client or agent
+  harness. Never expose ranks, workers, shards, bounds, weights, ports, or
+  distributed launch steps as the normal user flow.
+- Upstream llama.cpp supplies the modern inference engine and backends. It does
+  not override prima.cpp as the default distributed-behavior reference or the
+  Potluck usability directive.
+
+## Potluck test rules
+
+- **Classify by size.** Small tests use no network, database, filesystem,
+  external system, thread, or sleep. Medium integration tests may use localhost,
+  files, or threads to verify component communication. Large tests exercise the
+  complete product. Keep most tests Small and keep Large tests few.
+- **Keep tests independent and isolated.** Every test must pass in any order and
+  must not depend on state left by another test.
+- **Assert behavior, not implementation.** Use known-good output for known
+  input. Never weaken or delete a correct assertion only to make a test pass.
+- **Treat failure as evidence.** Correct bad tests when their contract is wrong;
+  do not alter a correct test to hide missing or broken product behavior.
+- **Keep tests deterministic and fast.** Avoid wall-clock timing and external
+  instability. Retries and sleeps belong only in Medium or Large tests when the
+  real boundary requires them.
+- **Test the decided product.** Product acceptance must exercise the integrated
+  resource-aware piped-ring server. Static, manual, or alternate architecture
+  tests are removal targets, not product coverage.
+
 ## Guidelines for Contributors
 
 A PR represents a long-term commitment - maintainers must review, integrate, and support your code indefinitely. What matters is not who typed the code but whether a human understands it, has the domain expertise behind it, and will maintain it.

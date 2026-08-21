@@ -351,17 +351,19 @@ if (TARGET gguf-model-data)
 endif()
 
 # ---------------------------------------------------------------------------
-# potluck.cpp static pipeline tests (single machine, Qwen3.5)
+# Legacy potluck.cpp PTLK/raw-TCP component tests
+# ADR 0007 requires direct-peer ZeroMQ product communication. These targets
+# remain only as pre-cutover evidence and must be removed or rewritten.
 # ---------------------------------------------------------------------------
 
-# Shared implementation of the potluck protocol + transport (POSIX TCP).
+# Shared implementation of the legacy protocol and transport.
 add_library(potluck-distributed STATIC
     ${PROJECT_SOURCE_DIR}/src/potluck-protocol.cpp
     ${PROJECT_SOURCE_DIR}/src/potluck-transport.cpp)
 target_include_directories(potluck-distributed PUBLIC ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(potluck-distributed PUBLIC llama)
 
-# Pure protocol + transport unit tests (no model required).
+# Legacy protocol and transport unit tests (no model required).
 llama_build_and_test(test-potluck-protocol.cpp)
 target_link_libraries(test-potluck-protocol PRIVATE potluck-distributed)
 llama_build_and_test(test-potluck-transport.cpp)
@@ -375,9 +377,9 @@ target_link_libraries(test-potluck-transport PRIVATE potluck-distributed)
 # under -O3 -DNDEBUG).
 llama_build_and_test(test-potluck-qwen35-stages.cpp ARGS ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
 
-# Separate-process stage correctness over a TCP loopback channel. This one
-# needs two processes (a "worker" that binds and a "head" that connects), so
-# CTest drives both roles through a shell script instead of a single add_test.
+# Legacy separate-process correctness over a raw-TCP loopback channel. This
+# requires two processes, so CTest drives both roles through a shell script.
+# It is not evidence for the required direct-peer ZeroMQ ring.
 add_executable(test-potluck-qwen35-process-stage test-potluck-qwen35-process-stage.cpp)
 target_link_libraries(test-potluck-qwen35-process-stage PRIVATE potluck-distributed)
 add_test(NAME test-potluck-qwen35-process-stage

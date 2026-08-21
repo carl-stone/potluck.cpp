@@ -1,13 +1,15 @@
 # ADR 0002: Per-device model shards
 
 - Date: 2026-08-20
-- Status: Accepted
+- Status: Superseded by ADR 0006
 
 ## Context
 
-prima.cpp requires a full local GGUF copy on every device. The headline
-difference of potluck.cpp must be that no device ever downloads, stores, or
-loads the whole model: a worker only needs the layers in its window.
+This decision introduced per-device shards. ADR 0006 keeps shards as the unit
+of worker loading but removes the requirement that a device must not download
+or store the complete model file. The binding invariant is that a worker never
+loads the complete model into memory; it loads only its assigned ring-window
+shards.
 
 The GGUF format supports exactly this: `gguf_init_empty()` plus
 `gguf_add_tensor` writes any subset of tensors, and the existing window loader
@@ -26,8 +28,8 @@ load time and fail loudly otherwise.
 
 ## Consequences
 
-- A 4-device cluster moves ~18.97 GB / 4 bytes per device instead of 18.97 GB
-  each.
+- A worker loads only the bytes needed for its assigned windows. A complete
+  model file may also exist on the device's storage.
 - First and last shards are visibly larger (embedding/output tensors); the
   shard table says so.
 - No protocol change: workers already take a model path on their command line.

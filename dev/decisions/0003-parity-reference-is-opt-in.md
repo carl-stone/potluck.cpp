@@ -1,7 +1,7 @@
 # ADR 0003: The parity reference is opt-in
 
 - Date: 2026-08-20
-- Status: Accepted
+- Status: Superseded by ADR 0006
 
 ## Context
 
@@ -13,9 +13,10 @@ single-token path, sacrificing prefill throughput.
 
 ## Decision
 
-Invert the flag: the in-process reference runs only under `--parity-check`
-(default off). Tests that verify token equality against the full model pass
-the flag explicitly. The throughput path never loads the whole model.
+ADR 0006 strengthens this boundary. A full-model reference is a test-only
+fixture mechanism and must not be a Potluck product capability or product
+binary option. Product heads and workers load only metadata and assigned window
+shards.
 
 ## Consequences
 
@@ -23,5 +24,5 @@ the flag explicitly. The throughput path never loads the whole model.
   head memory is independent of model size.
 - The batched prefill path is free to use large ubatches without violating a
   reference comparison.
-- Accuracy gates on the 0.8B fixture use `--parity-check`; a stranger's
-  deployment never pays for it.
+- Accuracy gates on small fixtures may use a separate full-model test process;
+  deployed Potluck binaries never load that reference.

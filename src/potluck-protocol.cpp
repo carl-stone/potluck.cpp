@@ -1,3 +1,7 @@
+// Legacy PTLK frame codec for the raw-TCP component path. ADR 0007 requires
+// direct peer-ring communication through ZeroMQ. Retain this only until its
+// component callers and tests are rewritten during the clean cutover.
+
 #include "potluck-protocol.h"
 
 #include <cstring>

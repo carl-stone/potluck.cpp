@@ -1,5 +1,13 @@
 # Benchmarks
 
+> **Non-product historical measurement.** These numbers measure static,
+> manually configured, coordinator-routed raw-TCP component paths that ADR 0006
+> and ADR 0007 require Potluck to remove. They are retained only as dated
+> evidence and must not guide product configuration or performance claims.
+> Product benchmarks must run the integrated resource-aware direct-peer ZeroMQ
+> piped-ring server with automatic placement, per-window prefetch, per-device
+> offload, continuous batching, and slots.
+
 All numbers below were measured on 2026-08-20.
 
 ## Hardware and build

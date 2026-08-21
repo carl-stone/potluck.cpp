@@ -1,3 +1,6 @@
+// Legacy raw-TCP transport implementation. ADR 0007 prohibits this from
+// surviving as a product path or alternate transport.
+
 #include "potluck-transport.h"
 
 #include <arpa/inet.h>

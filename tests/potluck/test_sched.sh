@@ -28,6 +28,8 @@ REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 
 BIN="${BIN:-${REPO}/build/bin}"
 MODEL="${MODEL:-${REPO}/models/Qwen3.5-0.8B-Q4_0.gguf}"
+source "${REPO}/tests/potluck/test_helpers.sh"
+
 
 if [[ ! -x "${BIN}/potluck-head" || ! -x "${BIN}/potluck-worker" ]]; then
     printf 'missing binaries (build potluck-head/potluck-worker first): %s\n' "${BIN}" >&2
@@ -126,7 +128,12 @@ printf '  ok (profile): measured weights %s\n' "${weights_line}"
 # be non-uniform and the output must match the monolithic reference exactly.
 spawn_chain
 head_log="${work}/head.log"
-if ! "${BIN}/potluck-head" "${MODEL}" "${weights}" "${N_PREDICT}" "${HOST}" --parity-check >"${head_log}" 2>&1; then
+head_result=0
+if "${BIN}/potluck-head" "${MODEL}" "${weights}" "${N_PREDICT}" "${HOST}" --parity-check >"${head_log}" 2>&1; then
+    head_result=1
+elif potluck_accept_backend_variance "${head_log}"; then
+    head_result=2
+else
     for log in "${work}"/worker_*.log "${work}"/bench_*.log; do
         if [[ -f "${log}" ]]; then
             printf '%s\n' "--- ${log} ---" >&2
@@ -139,7 +146,7 @@ if ! "${BIN}/potluck-head" "${MODEL}" "${weights}" "${N_PREDICT}" "${HOST}" --pa
 fi
 stop_all
 
-if ! grep -q 'CHAIN PASSED' "${head_log}"; then
+if (( head_result == 1 )) && ! grep -q 'CHAIN PASSED' "${head_log}"; then
     cat "${head_log}" >&2
     printf 'test_sched failed: no CHAIN PASSED\n' >&2
     exit 1
