@@ -163,10 +163,13 @@ import json, sys
 health, expected = json.loads(sys.argv[1]), int(sys.argv[2])
 assert health["status"] == "ok"
 assert health["workers"] == expected
-windows = health["windows"]
-assert len(windows) == expected
+windows = sorted(health["windows"], key=lambda w: w["start"])
+assert windows and windows[0]["start"] == 0
+for previous, current in zip(windows, windows[1:]):
+    assert current["start"] == previous["end"]
 assert all(w["start"] < w["end"] for w in windows)
-assert [w["index"] for w in windows] == list(range(expected))
+assert all(0 <= w["owner"] < expected for w in windows)
+assert [w["index"] for w in windows] == list(range(len(windows)))
 PY
 
 MODELS=$(curl -fsS "http://${HOST}:${PORT}/v1/models")
