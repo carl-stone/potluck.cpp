@@ -20,6 +20,10 @@
 #
 # Usage: test_gpu.sh [n_workers] [n_predict] [host]
 set -euo pipefail
+if [[ "${POTLUCK_SKIP_GPU_TESTS:-0}" == 1 ]]; then
+    printf 'test_gpu skipped (POTLUCK_SKIP_GPU_TESTS=1)\n'
+    exit 0
+fi
 
 N_WORKERS="${1:-3}"
 N_PREDICT="${2:-32}"

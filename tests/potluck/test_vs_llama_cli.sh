@@ -2,6 +2,10 @@
 # Compare the OpenAI chat endpoint with llama-cli's greedy single-turn path.
 # Usage: test_vs_llama_cli.sh [n_workers] [n_predict] [host] [port]
 set -euo pipefail
+if [[ "${POTLUCK_SKIP_CLI_PARITY:-0}" == 1 ]]; then
+    printf 'test_vs_llama_cli skipped (POTLUCK_SKIP_CLI_PARITY=1)\n'
+    exit 0
+fi
 
 N_WORKERS="${1:-2}"
 N_PREDICT="${2:-16}"

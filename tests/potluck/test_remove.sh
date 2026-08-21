@@ -14,6 +14,10 @@
 #
 # Usage: test_remove.sh [n_predict] [host]
 set -euo pipefail
+if [[ "${POTLUCK_SKIP_GPU_TESTS:-0}" == 1 ]]; then
+    printf 'test_remove skipped (POTLUCK_SKIP_GPU_TESTS=1)\n'
+    exit 0
+fi
 
 N_PREDICT="${1:-32}"
 HOST="${2:-127.0.0.1}"

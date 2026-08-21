@@ -47,6 +47,16 @@ numerics can vary at a near tie; the script accepts that case only when the
 log identifies CUDA and the mismatch is present, while plan and nonzero
 offload checks remain mandatory.
 
+## CI platform limits
+
+The macOS job runs the complete acceptance matrix on its Metal-capable host.
+The Ubuntu job still runs the CPU pipeline and all portable checks, but sets
+`POTLUCK_SKIP_GPU_TESTS=1` because its hosted runner has no accelerator.
+It also sets `POTLUCK_SKIP_CLI_PARITY=1`: x86 CPU kernels can choose a different
+near-tie token for a distributed stage split than the monolithic `llama-cli`
+reference. The M4 run remains the named check for exact server/CLI text parity;
+`test_chain.sh` remains the cross-platform full-model correctness check.
+
 The ring test explicitly covers these scenarios:
 
 - 2 workers, windows `[6,6]`;
