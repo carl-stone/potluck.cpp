@@ -146,6 +146,14 @@ These points are extremely important - failing to follow them won't necessarily 
 - Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
 - Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
 
+### Potluck commit discipline
+
+All Potluck-authored changes land as atomic commits: one logical change per
+commit, each buildable and gate-green on its own. See
+[dev/engineering-workflow.md](dev/engineering-workflow.md). Agents may prepare
+commits only on Carl's explicit instruction, with an `Assisted-by:` trailer.
+Never push or open PRs without per-action approval.
+
 Common mistakes that AI agents usually make:
 - Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
