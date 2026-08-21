@@ -58,7 +58,7 @@ jobs:
 
       - name: Build required binaries
         run: >-
-          cmake --build build --config Release --parallel
+          cmake --build build --config Release --parallel 2
           --target potluck-head potluck-worker potluck-server potluck-shard llama-cli
 
       - name: Download 0.8B fixture
