@@ -14,5 +14,6 @@ target_include_directories(potluck-server PRIVATE
     ${PROJECT_SOURCE_DIR}/common
     ${PROJECT_SOURCE_DIR}/vendor
 )
+target_compile_features(potluck-server PRIVATE cxx_std_17)
 
 target_link_libraries(potluck-server PRIVATE llama llama-common cpp-httplib)

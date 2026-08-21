@@ -10,6 +10,7 @@ target_include_directories(potluck-head PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src
     ${PROJECT_SOURCE_DIR}/common
 )
+target_compile_features(potluck-head PRIVATE cxx_std_17)
 
 if (POTLUCK_HIGHS)
     set(HIGHS_BUILD_TESTS OFF)
