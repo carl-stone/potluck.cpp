@@ -24,6 +24,19 @@ namespace {
     throw std::runtime_error(what);
 }
 
+const char * accel_kind_name(potluck::accel_kind kind) {
+    switch (kind) {
+        case potluck::accel_kind::metal:
+            return "metal";
+        case potluck::accel_kind::cuda:
+            return "cuda";
+        case potluck::accel_kind::other:
+            return "accelerator";
+        default:
+            return "none";
+    }
+}
+
 bool parse_u32(const std::string & text, uint32_t & value) {
     if (text.empty()) {
         return false;
@@ -196,6 +209,61 @@ int main(int argc, char ** argv) {
         if (!result_sender.set_send_timeout(startup_timeout_ms, error)) {
             fail("cannot set result startup timeout: " + error);
         }
+
+        // Report this device's accelerator so the head can plan layer placement.
+        potluck::accel_profile profile;
+        profile.rank = launch_rank;
+        const enum ggml_backend_dev_type wanted[] = {
+            GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_ACCEL
+        };
+        for (size_t ti = 0; ti < 2 && profile.kind == potluck::accel_kind::none; ++ti) {
+            for (size_t ri = 0; ri < ggml_backend_reg_count(); ++ri) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(ri);
+                for (size_t di = 0; di < ggml_backend_reg_dev_count(reg); ++di) {
+                    ggml_backend_dev_t dev = ggml_backend_reg_dev_get(reg, di);
+                    if (ggml_backend_dev_type(dev) != wanted[ti]) {
+                        continue;
+                    }
+                    size_t free_bytes = 0;
+                    size_t total_bytes = 0;
+                    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+                    if (total_bytes == 0) {
+                        continue;
+                    }
+                    profile.free_bytes = free_bytes;
+                    profile.total_bytes = total_bytes;
+                    const std::string name = ggml_backend_dev_name(dev);
+                    const std::string description = ggml_backend_dev_description(dev);
+                    if (name.rfind("MTL", 0) == 0 || description.find("Metal") != std::string::npos) {
+                        profile.kind = potluck::accel_kind::metal;
+                    } else if (name.rfind("CUDA", 0) == 0 || name.rfind("ROCm", 0) == 0 ||
+                               name.rfind("MUSA", 0) == 0 ||
+                               description.find("CUDA") != std::string::npos) {
+                        profile.kind = potluck::accel_kind::cuda;
+                    } else {
+                        profile.kind = potluck::accel_kind::other;
+                    }
+                    if (profile.kind != potluck::accel_kind::none) {
+                        break;
+                    }
+                }
+            }
+        }
+        std::vector<uint8_t> profile_payload;
+        if (!potluck::encode_accel_profile(profile, profile_payload)) {
+            fail("cannot encode accelerator profile");
+        }
+        potluck::message profile_message;
+        profile_message.type = potluck::message_type::profile_result;
+        profile_message.rank = launch_rank;
+        profile_message.payload = std::move(profile_payload);
+        if (!result_sender.send(profile_message, error)) {
+            fail("cannot send accelerator profile: " + error);
+        }
+        std::printf("WORKER rank %u accelerator %s free %zu MiB total %zu MiB\n",
+                    launch_rank, accel_kind_name(profile.kind),
+                    profile.free_bytes / (1024u * 1024u), profile.total_bytes / (1024u * 1024u));
+        std::fflush(stdout);
 
         std::printf("WORKER rank %u bound %s next %s\n", launch_rank,
                     peer.endpoint().c_str(), peer.next_endpoint().c_str());

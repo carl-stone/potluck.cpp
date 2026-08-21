@@ -305,6 +305,95 @@ std::vector<potluck::ring_window> build_ring_route(uint32_t n_workers, uint32_t 
     return windows;
 }
 
+const char * accel_kind_name(potluck::accel_kind kind) {
+    switch (kind) {
+        case potluck::accel_kind::metal:
+            return "metal";
+        case potluck::accel_kind::cuda:
+            return "cuda";
+        case potluck::accel_kind::other:
+            return "accelerator";
+        default:
+            return "none";
+    }
+}
+
+// Workers report their accelerator before asking for a schedule. Missing or
+// timed-out profiles mean CPU-only execution for that worker.
+std::vector<potluck::accel_profile> collect_accel_profiles(ServerRing & ring, uint32_t n_workers) {
+    constexpr int profile_timeout_ms = 60000;
+    if (!ring.result.set_receive_timeout(profile_timeout_ms, ring.error)) {
+        throw std::runtime_error("cannot set ring profile timeout: " + ring.error);
+    }
+    std::vector<potluck::accel_profile> profiles(n_workers);
+    std::vector<bool> seen(n_workers, false);
+    for (uint32_t received = 0; received < n_workers; ++received) {
+        potluck::message message;
+        if (!ring.result.receive(message, ring.error)) {
+            throw std::runtime_error("accelerator profile collection stopped at " +
+                                     std::to_string(received) + " of " +
+                                     std::to_string(n_workers) + " workers: " + ring.error);
+        }
+        if (message.type != potluck::message_type::profile_result ||
+            message.rank >= n_workers || seen[message.rank]) {
+            throw std::runtime_error("ring worker sent an unexpected accelerator profile");
+        }
+        if (!potluck::decode_accel_profile(message.payload.data(), message.payload.size(),
+                                           profiles[message.rank], ring.error)) {
+            throw std::runtime_error("cannot decode accelerator profile: " + ring.error);
+        }
+        if (profiles[message.rank].rank != message.rank) {
+            throw std::runtime_error("accelerator profile rank mismatch");
+        }
+        seen[message.rank] = true;
+        const potluck::accel_profile & profile = profiles[message.rank];
+        std::printf("potluck-server: worker %u accelerator %s free %llu MiB total %llu MiB\n",
+                    message.rank, accel_kind_name(profile.kind),
+                    static_cast<unsigned long long>(profile.free_bytes / (1024ull * 1024ull)),
+                    static_cast<unsigned long long>(profile.total_bytes / (1024ull * 1024ull)));
+    }
+    std::fflush(stdout);
+    return profiles;
+}
+
+// Spend each worker's usable accelerator memory across its own windows in ring
+// order. Layers stay on CPU when the device is absent, small, or busy.
+void assign_gpu_layers(std::vector<potluck::ring_window> & windows,
+                       const std::vector<potluck::accel_profile> & profiles,
+                       uint32_t n_workers, uint64_t model_bytes, uint32_t n_layer,
+                       uint32_t n_head_kv, uint32_t head_dim, uint32_t n_ctx) {
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    constexpr uint64_t window_slack_bytes = 64 * mib;
+    constexpr uint64_t min_device_reserve_bytes = 512 * mib;
+    if (windows.empty() || profiles.size() != n_workers || n_layer == 0) {
+        throw std::runtime_error("cannot plan placement without a route and profiles");
+    }
+    std::vector<int64_t> budget(n_workers, 0);
+    for (uint32_t rank = 0; rank < n_workers; ++rank) {
+        const potluck::accel_profile & profile = profiles[rank];
+        if (profile.kind == potluck::accel_kind::none || profile.total_bytes == 0) {
+            continue;
+        }
+        // Keep desktop memory responsive on unified-memory hosts.
+        const uint64_t reserve = std::max(min_device_reserve_bytes, profile.total_bytes / 8);
+        budget[rank] = profile.free_bytes > reserve && profile.free_bytes - reserve > 0
+            ? static_cast<int64_t>(profile.free_bytes - reserve) : 0;
+    }
+    const uint64_t weights_per_layer = model_bytes / n_layer;
+    const uint64_t kv_per_layer = 2ull * n_head_kv * head_dim * 2ull * n_ctx; // K and V, f16
+    const uint64_t layer_cost = weights_per_layer + kv_per_layer;
+    for (potluck::ring_window & window : windows) {
+        int64_t affordable = static_cast<int64_t>(layer_cost) == 0
+            ? 0 : (budget[window.owner] - static_cast<int64_t>(window_slack_bytes)) /
+                      static_cast<int64_t>(layer_cost);
+        affordable = std::max<int64_t>(affordable, 0);
+        const int64_t span = window.end - window.start;
+        const int32_t n_gpu_layers = static_cast<int32_t>(std::min(affordable, span));
+        window.n_gpu_layers = n_gpu_layers;
+        budget[window.owner] -= static_cast<int64_t>(n_gpu_layers) * static_cast<int64_t>(layer_cost);
+    }
+}
+
 bool launch_remote_worker(const bootstrap_node & bootstrap, const std::string & model,
                           const ring_worker & worker, const std::string & result_endpoint,
                           uint32_t index) {
@@ -670,6 +759,16 @@ int main(int argc, char ** argv) {
         if (n_layer == 0) {
             throw std::runtime_error("model metadata reports zero layers");
         }
+        uint32_t head_dim = 0;
+        char key_length_buf[64] = {0};
+        if (llama_model_meta_val_str(meta, "attention.key_length", key_length_buf,
+                                     sizeof(key_length_buf)) > 0) {
+            head_dim = static_cast<uint32_t>(std::atof(key_length_buf));
+        }
+        if (head_dim == 0) {
+            const int32_t n_head = llama_model_n_head(meta);
+            head_dim = n_head > 0 ? static_cast<uint32_t>(llama_model_n_embd(meta) / n_head) : 0;
+        }
         const std::string model_name = basename_of(model_path);
         common_chat_templates_ptr chat_templates = common_chat_templates_init(meta, "");
 
@@ -802,6 +901,19 @@ int main(int argc, char ** argv) {
             }
             launch_local_workers(worker_path, worker_models, ring.workers, ring.result_endpoint);
         }
+        uint64_t model_bytes = 0;
+        if (shard_dir.empty()) {
+            model_bytes = std::filesystem::file_size(model_path);
+        } else {
+            for (const std::string & path : worker_models) {
+                model_bytes += std::filesystem::file_size(path);
+            }
+        }
+        const std::vector<potluck::accel_profile> profiles =
+            collect_accel_profiles(ring, n_workers);
+        assign_gpu_layers(ring.windows, profiles, n_workers, model_bytes, n_layer,
+                          llama_model_n_head_kv(meta), head_dim, n_ctx);
+        std::fflush(stdout);
         configure_ring(ring, n_layer, n_ctx, n_seq_max, n_ubatch, seed, temp, top_p);
 
         httplib::Server server;
