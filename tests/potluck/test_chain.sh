@@ -85,7 +85,7 @@ for i in $(seq 0 $((N_WORKERS - 1))); do
         worker_model="${worker_models[i]}"
     fi
     [[ -f "${worker_model}" ]] || { printf 'missing worker model: %s\n' "${worker_model}" >&2; exit 2; }
-    "${BIN}/potluck-worker" "${worker_model}" "${HOST}" $((PORT_BASE + i)) "${ngl_args[@]}" >"${work}/worker_${i}.log" 2>&1 &
+    "${BIN}/potluck-worker" "${worker_model}" "${HOST}" $((PORT_BASE + i)) "${ngl_args[@]+"${ngl_args[@]}"}" >"${work}/worker_${i}.log" 2>&1 &
     pids+=($!)
 done
 
@@ -93,7 +93,7 @@ done
 sleep 2
 
 head_log="${work}/head.log"
-if ! "${BIN}/potluck-head" "${MODEL}" "${workers}" "${N_PREDICT}" "${HOST}" "${parity_args[@]}" "${ngl_args[@]}" "${extra_args[@]}" >"${head_log}" 2>&1; then
+if ! "${BIN}/potluck-head" "${MODEL}" "${workers}" "${N_PREDICT}" "${HOST}" "${parity_args[@]+"${parity_args[@]}"}" "${ngl_args[@]+"${ngl_args[@]}"}" "${extra_args[@]+"${extra_args[@]}"}" >"${head_log}" 2>&1; then
     cat "${head_log}" >&2
     printf 'potluck chain test failed (head rc nonzero)\n' >&2
     exit 1
