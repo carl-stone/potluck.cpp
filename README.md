@@ -209,10 +209,10 @@ bash scripts/install-git-hooks.sh
 
 The hook runs `scripts/pre-push-check.sh`: it configures a release build with
 `POTLUCK_HIGHS=OFF`, builds the required binaries with two parallel jobs, and
-runs `tests/potluck/run_all.sh`. The ignored
-`models/Qwen3.5-0.8B-Q4_0.gguf` fixture must exist locally, or
-`POTLUCK_TEST_MODEL` must point to it. Run the check script directly to verify
-the same gate without pushing.
+runs `tests/potluck/run_all.sh`. The test model is fetched automatically from
+the pinned Hugging Face source when missing; set `POTLUCK_TEST_MODEL` to use a
+local copy. Run the check script directly to verify the same gate without
+pushing.
 
 See [`dev/parity-and-accuracy.md`](dev/parity-and-accuracy.md) for the
 distinction between inference accuracy and feature coverage.
