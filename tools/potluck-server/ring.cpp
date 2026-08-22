@@ -1080,7 +1080,10 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
                        worker.device.bootstrap.ssh_target == probe.bootstrap.ssh_target;
             });
         if (current != current_workers.end() &&
-            materially_changed(current->device.usable_bytes(), probe.usable_bytes())) {
+            (materially_changed(current->device.usable_bytes(), probe.usable_bytes()) ||
+             current->device.bootstrap.ssh_port != probe.bootstrap.ssh_port ||
+             current->device.bootstrap.ring_host != probe.bootstrap.ring_host ||
+             current->device.bootstrap.ring_port != probe.bootstrap.ring_port)) {
             changed = true;
         }
     }

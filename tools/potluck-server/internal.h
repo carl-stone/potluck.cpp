@@ -964,7 +964,8 @@ private:
                 try {
                     result = refresh_(detail);
                 } catch (const std::exception & exception) {
-                    detail = exception.what();
+                    detail = "topology refresh deferred: " + std::string(exception.what());
+                    result = topology_refresh_result::unchanged;
                 }
                 if (result == topology_refresh_result::unchanged ||
                     result == topology_refresh_result::rebuilt) {

@@ -91,6 +91,12 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
             if (output.type == potluck::message_type::heartbeat_ack) {
                 continue;
             }
+            if (output.type == potluck::message_type::error) {
+                const std::string detail(output.payload.begin(), output.payload.end());
+                throw std::runtime_error(
+                    "worker " + std::to_string(output.rank) + " failed: " +
+                    (detail.empty() ? std::string("no detail") : detail));
+            }
             if (output.sequence < input.sequence) {
                 continue;
             }
