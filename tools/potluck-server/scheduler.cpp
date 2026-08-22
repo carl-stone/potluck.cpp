@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include <sys/resource.h>
+
 namespace {
 
 size_t first_stop_offset(const std::string & text, const std::vector<std::string> & stops) {

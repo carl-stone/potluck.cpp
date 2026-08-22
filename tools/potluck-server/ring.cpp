@@ -64,7 +64,7 @@ double host_cpu_load() {
 
 uint64_t adaptive_head_reserve(const potluck::accel_profile & profile, double load) {
     constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
-    uint64_t reserve = std::max(4ull * gib, profile.host_total_bytes / 4);
+    uint64_t reserve = std::max(4 * gib, profile.host_total_bytes / 4);
     if (load >= 0.75) {
         reserve = std::max(reserve, profile.host_total_bytes / 2);
     }
