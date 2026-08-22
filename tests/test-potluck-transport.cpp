@@ -77,6 +77,23 @@ int main() {
     potluck::message echoed;
     CHECK(moved.receive(echoed, error));
     check_equal(echoed, reply);
+    potluck::message heartbeat;
+    heartbeat.type = potluck::message_type::heartbeat;
+    heartbeat.rank = 1;
+    heartbeat.sequence = 44;
+    CHECK(moved.send(heartbeat, error));
+    potluck::message received_heartbeat;
+    CHECK(right.receive(received_heartbeat, error));
+    check_equal(received_heartbeat, heartbeat);
+
+    potluck::message heartbeat_ack;
+    heartbeat_ack.type = potluck::message_type::heartbeat_ack;
+    heartbeat_ack.rank = 1;
+    heartbeat_ack.sequence = heartbeat.sequence;
+    CHECK(right.send(heartbeat_ack, error));
+    potluck::message received_ack;
+    CHECK(moved.receive(received_ack, error));
+    check_equal(received_ack, heartbeat_ack);
 
     potluck::message oversized_metadata = sent;
     oversized_metadata.shape.assign(potluck::ring_max_shape_dims + 1, 1);

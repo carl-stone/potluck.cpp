@@ -22,6 +22,9 @@ enum class message_type : uint16_t {
     batch_decode = 9,
     batch_result = 10,
     slot_config = 11,
+    // Control liveness uses the sequence as a nonce and never enters the data path.
+    heartbeat = 12,
+    heartbeat_ack = 13,
     error = 255,
 };
 

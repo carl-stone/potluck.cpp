@@ -6,10 +6,13 @@
 #include "llama-model.h"
 #include "ggml-backend.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -17,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -181,8 +185,18 @@ int main(int argc, char ** argv) {
     uint32_t launch_rank = 0;
     potluck::ring_peer peer;
     potluck::ring_sender result_sender;
+    std::mutex inbox_mutex;
+    std::condition_variable inbox_cv;
+    std::deque<potluck::message> inbox;
+    std::string inbox_error;
+    std::atomic<bool> receiver_stopping{false};
+    std::thread receiver_thread;
 
     auto cleanup = [&]() noexcept {
+        receiver_stopping.store(true);
+        if (receiver_thread.joinable()) {
+            receiver_thread.join();
+        }
         for (auto & entry : samplers) {
             if (entry.second != nullptr) {
                 llama_sampler_free(entry.second);
@@ -391,19 +405,79 @@ int main(int argc, char ** argv) {
             fail("cannot report worker readiness: " + error);
         }
 
-        // A dead next peer must surface before the long inference timeout.
+        constexpr int peer_receive_timeout_ms = 250;
         constexpr int peer_send_timeout_ms = 5000;
-        if (!peer.set_timeouts(decode_timeout_ms, peer_send_timeout_ms, error)) {
+        if (!peer.set_timeouts(peer_receive_timeout_ms, peer_send_timeout_ms, error)) {
             fail("cannot set ring decode timeouts: " + error);
         }
         if (!result_sender.set_send_timeout(decode_timeout_ms, error)) {
             fail("cannot set result decode timeout: " + error);
         }
+        receiver_thread = std::thread([&] {
+            std::string heartbeat_error;
+            potluck::ring_sender heartbeat_sender =
+                potluck::ring_sender::connect(result_endpoint, heartbeat_error);
+            if (!heartbeat_sender.valid() ||
+                !heartbeat_sender.set_send_timeout(peer_send_timeout_ms, heartbeat_error)) {
+                {
+                    std::lock_guard<std::mutex> lock(inbox_mutex);
+                    inbox_error = "cannot create heartbeat result sender: " + heartbeat_error;
+                }
+                inbox_cv.notify_one();
+                return;
+            }
+            for (;;) {
+                potluck::message received;
+                std::string receive_error;
+                if (!peer.receive(received, receive_error)) {
+                    if (receiver_stopping.load()) {
+                        break;
+                    }
+                    if (receive_error.find("timeout") != std::string::npos) {
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(inbox_mutex);
+                        inbox_error = "ring receive failed: " + receive_error;
+                    }
+                    inbox_cv.notify_one();
+                    break;
+                }
+                if (received.type == potluck::message_type::heartbeat) {
+                    potluck::message acknowledgement;
+                    acknowledgement.type = potluck::message_type::heartbeat_ack;
+                    acknowledgement.rank = config.index;
+                    acknowledgement.sequence = received.sequence;
+                    if (!heartbeat_sender.send(acknowledgement, receive_error)) {
+                        {
+                            std::lock_guard<std::mutex> lock(inbox_mutex);
+                            inbox_error = "cannot acknowledge heartbeat: " + receive_error;
+                        }
+                        inbox_cv.notify_one();
+                        break;
+                    }
+                    continue;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(inbox_mutex);
+                    inbox.push_back(std::move(received));
+                }
+                inbox_cv.notify_one();
+            }
+        });
 
         for (;;) {
             potluck::message message;
-            if (!peer.receive(message, error)) {
-                fail("ring receive failed: " + error);
+            {
+                std::unique_lock<std::mutex> lock(inbox_mutex);
+                inbox_cv.wait(lock, [&] {
+                    return !inbox.empty() || !inbox_error.empty();
+                });
+                if (!inbox_error.empty()) {
+                    fail(inbox_error);
+                }
+                message = std::move(inbox.front());
+                inbox.pop_front();
             }
             if (message.type == potluck::message_type::reset) {
                 clear_stages(stages);

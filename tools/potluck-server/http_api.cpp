@@ -80,11 +80,21 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
             response.status = 204;
         });
         server.Get("/health", [&session, &scheduler, set_common_headers](const httplib::Request &, httplib::Response & response) {
+            const bool recovery_exhausted = scheduler.recovery_exhausted();
+            const bool rebuilding = scheduler.rebuilding();
+            const std::string recovery_error = scheduler.recovery_error();
+            json slots = scheduler.health();
             std::lock_guard<std::mutex> ring_lock(session.mutex);
-            json health = { { "status", (scheduler.rebuilding() || !session.healthy)
-                                        ? "rebuilding" : "ok" },
+            const char * status = recovery_exhausted ? "failed"
+                                : (rebuilding || !session.healthy) ? "rebuilding" : "ok";
+            json health = { { "status", status },
                             { "workers", session.ring.workers.size() },
-                            { "windows", json::array() }, { "slots", scheduler.health() } };
+                            { "windows", json::array() }, { "slots", std::move(slots) } };
+            if (std::string(status) != "ok") {
+                health["reason"] = !recovery_error.empty() ? recovery_error
+                                    : session.health_reason.empty() ? "ring recovery in progress"
+                                                                    : session.health_reason;
+            }
             for (size_t i = 0; i < session.ring.windows.size(); ++i) {
                 const potluck::ring_window & window = session.ring.windows[i];
                 const ring_worker & worker = session.ring.workers[window.owner];
@@ -211,8 +221,12 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 if (!slot) {
                     response.status = 503;
                     set_common_headers(response);
-                    const char * message = scheduler.rebuilding()
-                        ? "cluster is rebuilding; retry" : "all conversation slots are busy";
+                    std::string message = "all conversation slots are busy";
+                    if (scheduler.recovery_exhausted()) {
+                        message = "cluster recovery failed: " + scheduler.recovery_error();
+                    } else if (scheduler.rebuilding()) {
+                        message = "cluster is rebuilding; retry";
+                    }
                     response.set_content(error_json(message).dump(), "application/json");
                     return;
                 }

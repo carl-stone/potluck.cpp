@@ -429,9 +429,14 @@ int main(int argc, char ** argv) {
         httplib::Server server;
         slot_scheduler scheduler(ring, vocab, n_seq_max, n_ubatch,
                                   [&](std::string & error) {
-                                      return rebuild_ring(session, options, error);
+                                      return rebuild_ring(session, options, false, error);
+                                  },
+                                  [&](std::string & error) {
+                                      return heartbeat_ring(session, error);
+                                  },
+                                  [&](std::string & error) {
+                                      return refresh_ring_if_needed(session, options, error);
                                   });
-        scheduler.start();
         setup_http_routes(server, session, scheduler, vocab, model_name,
                           chat_templates, n_predict_default, temp, top_p, seed);
         std::printf("potluck-server: listening on http://%s:%u (%zu workers, %zu ring windows, model %s)\n",
@@ -468,7 +473,9 @@ int main(int argc, char ** argv) {
                         bytes_per_token, peak_rss_mb());
             std::fflush(stdout);
         }
+        scheduler.start();
         const auto shutdown = [&]() {
+            session.stopping.store(true);
             scheduler.stop();
             if (!session.ring.controls.empty()) {
                 std::string reset_error;
@@ -493,6 +500,7 @@ int main(int argc, char ** argv) {
         try {
             if (server.bind_to_port(host.c_str(), http_port)) {
                 server_signal_wakeup signal_wakeup([&] {
+                    session.stopping.store(true);
                     scheduler.request_stop();
                     server.stop();
                 });

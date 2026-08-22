@@ -166,15 +166,20 @@ The remaining product gaps are explicit:
 - DNS-SD discovery, bounded pre-launch probing, capacity admission,
   heterogeneous window sizing, automatic model distribution, and accelerator
   placement are implemented in the startup lifecycle.
-- Per-window prefetch remains unimplemented. Admission keeps every assigned
-  window resident on its device, so whole-file presence covers the current
-  schedule.
-- Head resource reservation and automatic head participation are implemented
-  at startup. They do not yet adapt to changing user load.
-- The server provides continuous HTTP batching, isolated conversation slots,
-  per-request sampling, and a single rebuild attempt with 30-second backoff.
-- Worker failure migration and safe request retry are unfinished. A failed
-  request receives a rebuild error; completed token state is not migrated.
+- Partial Potluck models suppress whole-file mmap prefetch. Each worker advises
+  only the mapped tensors for its first owned window, then advises its next owned
+  window after each ring pass.
+- Head resource reservation and automatic head participation are re-profiled
+  during idle topology checks; CPU load and host memory can remove or restore
+  head windows.
+- Ring workers answer sequence-checked control heartbeats during idle and active
+  execution. A lost worker ends a non-streaming request with a retryable 503.
+  A streaming request that already sent output ends with an SSE error; the client
+  must discard the partial output before retrying. The server then reconnects
+  and rebuilds from live admitted devices.
+- Recovery uses bounded exponential backoff with deterministic jitter and a
+  terminal health reason after repeated failures. Topology checks never rebuild
+  an active request.
 - The OpenAI-compatible HTTP surface is a subset; full request, response,
   error, usage, streaming, and cancellation parity is unfinished.
 - Authentication, encryption, credential handling, and tenant or prompt

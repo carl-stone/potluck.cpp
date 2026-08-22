@@ -4,12 +4,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <poll.h>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -28,7 +30,80 @@
 
 namespace {
 
+bool worker_process_alive(pid_t pid, const std::string & label, std::string & error) {
+    if (pid <= 0) {
+        error = label + " has no process";
+        return false;
+    }
+    int status = 0;
+    const pid_t waited = waitpid(pid, &status, WNOHANG);
+    if (waited == pid) {
+        error = label + " exited";
+        return false;
+    }
+    if (waited < 0 && errno != EINTR) {
+        error = label + " wait failed: " + std::string(std::strerror(errno));
+        return false;
+    }
+    if (kill(pid, 0) != 0 && errno != EPERM) {
+        error = label + " is not running";
+        return false;
+    }
+    return true;
 }
+
+double host_cpu_load() {
+    double loads[1] = {0.0};
+    if (getloadavg(loads, 1) != 1) {
+        return 0.0;
+    }
+    const unsigned cores = std::max(1u, std::thread::hardware_concurrency());
+    return std::max(0.0, loads[0] / static_cast<double>(cores));
+}
+
+uint64_t adaptive_head_reserve(const potluck::accel_profile & profile, double load) {
+    constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+    uint64_t reserve = std::max(4ull * gib, profile.host_total_bytes / 4);
+    if (load >= 0.75) {
+        reserve = std::max(reserve, profile.host_total_bytes / 2);
+    }
+    if (load >= 1.0) {
+        reserve = std::max(reserve, profile.host_total_bytes * 3 / 4);
+    }
+    return reserve;
+}
+
+bool materially_changed(uint64_t old_value, uint64_t new_value) {
+    const uint64_t larger = std::max(old_value, new_value);
+    if (larger == 0) {
+        return old_value != new_value;
+    }
+    const uint64_t difference = old_value > new_value
+        ? old_value - new_value : new_value - old_value;
+    return difference > larger / 8;
+}
+
+std::set<std::string> remote_targets(const std::vector<planned_worker> & workers) {
+    std::set<std::string> result;
+    for (const planned_worker & worker : workers) {
+        if (worker.kind == worker_kind::remote) {
+            result.insert(worker.device.bootstrap.ssh_target);
+        }
+    }
+    return result;
+}
+
+std::set<std::string> probe_targets(const std::vector<device_probe> & probes) {
+    std::set<std::string> result;
+    for (const device_probe & probe : probes) {
+        if (probe.ok) {
+            result.insert(probe.bootstrap.ssh_target);
+        }
+    }
+    return result;
+}
+
+} // namespace
 uint16_t free_port() {
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -126,11 +201,19 @@ void terminate_child_process(pid_t pid) {
     if (pid <= 0) {
         return;
     }
+    int status = 0;
+    pid_t result = 0;
+    do {
+        result = waitpid(pid, &status, WNOHANG);
+    } while (result < 0 && errno == EINTR);
+    if (result == pid || (result < 0 && errno == ECHILD)) {
+        return;
+    }
     (void) kill(-pid, SIGTERM);
     (void) kill(pid, SIGTERM);
-    int status = 0;
+    status = 0;
     for (int attempt = 0; attempt < 50; ++attempt) {
-        const pid_t result = waitpid(pid, &status, WNOHANG);
+        result = waitpid(pid, &status, WNOHANG);
         if (result == pid || (result < 0 && errno == ECHILD)) {
             return;
         }
@@ -453,6 +536,143 @@ bool reset_ring_workers(ServerRing & ring, std::string & error) {
     }
     return error.empty();
 }
+bool ring_workers_alive(ring_session & session, std::string & error) {
+    std::vector<planned_worker> planned;
+    {
+        std::lock_guard<std::mutex> lock(session.mutex);
+        if (!session.healthy) {
+            error = session.health_reason.empty()
+                ? "ring is not healthy" : session.health_reason;
+            return false;
+        }
+        planned = session.workers;
+    }
+    if (planned.empty()) {
+        error = "ring has no workers";
+        return false;
+    }
+    for (size_t index = 0; index < planned.size(); ++index) {
+        const planned_worker & worker = planned[index];
+        const pid_t pid = worker.kind == worker_kind::local
+            ? worker.local_pid : worker.remote_ssh_pid;
+        if (!worker_process_alive(pid, "worker " + std::to_string(index), error)) {
+            return false;
+        }
+    }
+    error.clear();
+    return true;
+}
+
+bool heartbeat_ring(ring_session & session, std::string & error) {
+    constexpr int send_timeout_ms = 250;
+    constexpr int receive_timeout_ms = 250;
+    constexpr int heartbeat_wait_ms = 1000;
+    constexpr uint32_t max_misses = 3;
+    error.clear();
+
+    if (!ring_workers_alive(session, error)) {
+        return false;
+    }
+    std::vector<planned_worker> planned;
+    {
+        std::lock_guard<std::mutex> lock(session.mutex);
+        planned = session.workers;
+    }
+    if (session.ring.controls.size() != planned.size()) {
+        error = "ring control path is incomplete";
+        return false;
+    }
+    for (size_t index = 0; index < planned.size(); ++index) {
+        if (!session.ring.controls[index].valid()) {
+            error = "worker " + std::to_string(index) + " control socket is closed";
+            return false;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (session.ring.last_heartbeat.time_since_epoch().count() != 0 &&
+        now - session.ring.last_heartbeat < std::chrono::seconds(1)) {
+        return true;
+    }
+
+    const uint64_t sequence = ++session.ring.heartbeat_sequence;
+    std::vector<bool> seen(planned.size(), false);
+    for (size_t index = 0; index < planned.size(); ++index) {
+        potluck::message heartbeat;
+        heartbeat.type = potluck::message_type::heartbeat;
+        heartbeat.rank = static_cast<uint32_t>(index);
+        heartbeat.sequence = sequence;
+        std::string send_error;
+        if (!session.ring.controls[index].set_send_timeout(send_timeout_ms, send_error) ||
+            !session.ring.controls[index].send(heartbeat, send_error)) {
+            error = "worker " + std::to_string(index) + " heartbeat send failed: " + send_error;
+            return false;
+        }
+    }
+    if (!session.ring.result.set_receive_timeout(receive_timeout_ms, error)) {
+        return false;
+    }
+
+    std::deque<potluck::message> deferred;
+    while (!session.ring.pending_results.empty()) {
+        deferred.push_back(std::move(session.ring.pending_results.front()));
+        session.ring.pending_results.pop_front();
+    }
+    size_t acknowledgements = 0;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(heartbeat_wait_ms);
+    while (acknowledgements < planned.size()) {
+        if (session.stopping.load()) {
+            break;
+        }
+        potluck::message response;
+        if (!session.ring.result.receive(response, error)) {
+            if (error.find("timeout") != std::string::npos &&
+                std::chrono::steady_clock::now() < deadline) {
+                continue;
+            }
+            break;
+        }
+        if (response.type != potluck::message_type::heartbeat_ack) {
+            deferred.push_back(std::move(response));
+            continue;
+        }
+        if (response.sequence < sequence) {
+            continue;
+        }
+        if (response.sequence > sequence || response.rank >= planned.size() ||
+            seen[response.rank]) {
+            error = "invalid heartbeat acknowledgement";
+            break;
+        }
+        seen[response.rank] = true;
+        ++acknowledgements;
+    }
+    while (!deferred.empty()) {
+        session.ring.pending_results.push_front(std::move(deferred.back()));
+        deferred.pop_back();
+    }
+    if (session.stopping.load()) {
+        error.clear();
+        return true;
+    }
+    (void) session.ring.result.set_receive_timeout(receive_timeout_ms, session.ring.error);
+    session.ring.last_heartbeat = std::chrono::steady_clock::now();
+    if (acknowledgements == planned.size()) {
+        session.ring.heartbeat_misses = 0;
+        std::lock_guard<std::mutex> lock(session.mutex);
+        session.last_heartbeat = session.ring.last_heartbeat;
+        return true;
+    }
+    ++session.ring.heartbeat_misses;
+    if (session.ring.heartbeat_misses < max_misses) {
+        error.clear();
+        return true;
+    }
+    if (error.empty()) {
+        error = "heartbeat acknowledgement timed out";
+    }
+    return false;
+}
 bool bring_up_ring(ring_session & target, ring_startup_options & options,
                    std::string & error) {
     if (options.bootstrap_nodes == nullptr || options.digest_cache == nullptr) {
@@ -521,6 +741,7 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         bool head_participates = false;
         uint64_t head_budget = 0;
         uint64_t head_reserve = 4ull * 1024ull * 1024ull * 1024ull;
+        double head_load = 0.0;
         if (has_remote) {
             candidates = probe_remote_candidates(bootstrap_nodes);
             if (has_staged_payload) {
@@ -557,7 +778,8 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                                  head.error.c_str());
                 } else {
                     head.host = "head";
-                    head_reserve = std::max(head_reserve, head.profile.host_total_bytes / 4);
+                    head_load = host_cpu_load();
+                    head_reserve = adaptive_head_reserve(head.profile, head_load);
                     head_budget = head.profile.host_free_bytes > head_reserve
                         ? head.profile.host_free_bytes - head_reserve : 0;
                 }
@@ -727,6 +949,14 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         target.ring = std::move(ring);
         target.workers = std::move(planned);
         target.healthy = true;
+        target.health_reason.clear();
+        target.head_participates = head_participates;
+        target.has_head_profile = has_remote && head_share == "auto" && head.ok;
+        target.head_budget = head_budget;
+        target.head_reserve = head_reserve;
+        target.head_cpu_load = head_load;
+        target.head_profile = head.profile;
+        target.last_heartbeat = {};
         error.clear();
         return true;
     } catch (const std::exception & exception) {
@@ -739,23 +969,23 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         }
         stop_planned_workers(planned);
         target.healthy = false;
+        target.health_reason = exception.what();
         error = exception.what();
         return false;
     }
 }
 bool rebuild_ring(ring_session & session, ring_startup_options & options,
-                  std::string & error) {
+                  bool restore_on_failure, std::string & error) {
     std::vector<planned_worker> old_workers;
     {
         std::lock_guard<std::mutex> lock(session.mutex);
         session.healthy = false;
+        session.health_reason = "ring rebuild in progress";
     }
     if (!session.ring.controls.empty()) {
         std::string reset_error;
-        if (!reset_ring_workers(session.ring, reset_error) &&
-            !reset_error.empty()) {
-            std::fprintf(stderr, "potluck-server: old ring reset: %s\n",
-                         reset_error.c_str());
+        if (!reset_ring_workers(session.ring, reset_error) && !reset_error.empty()) {
+            std::fprintf(stderr, "potluck-server: old ring reset: %s\n", reset_error.c_str());
         }
     }
     {
@@ -763,15 +993,198 @@ bool rebuild_ring(ring_session & session, ring_startup_options & options,
         old_workers = std::move(session.workers);
     }
     stop_planned_workers(old_workers);
-    ring_session replacement;
-    if (!bring_up_ring(replacement, options, error)) {
-        return false;
+
+    const auto install = [&](ring_session & source) {
+        std::lock_guard<std::mutex> lock(session.mutex);
+        session.ring = std::move(source.ring);
+        session.workers = std::move(source.workers);
+        session.healthy = true;
+        session.health_reason.clear();
+        session.head_participates = source.head_participates;
+        session.has_head_profile = source.has_head_profile;
+        session.head_budget = source.head_budget;
+        session.head_reserve = source.head_reserve;
+        session.head_cpu_load = source.head_cpu_load;
+        session.head_profile = source.head_profile;
+        session.last_heartbeat = {};
+    };
+
+    ring_session rebuilt;
+    if (bring_up_ring(rebuilt, options, error)) {
+        install(rebuilt);
+        return true;
+    }
+    const std::string rebuild_error = error.empty() ? "ring rebuild failed" : error;
+    if (restore_on_failure) {
+        std::vector<bootstrap_node> rollback_nodes;
+        std::set<std::string> rollback_targets;
+        for (const planned_worker & worker : old_workers) {
+            if (worker.kind == worker_kind::remote &&
+                rollback_targets.insert(worker.device.bootstrap.ssh_target).second) {
+                rollback_nodes.push_back(worker.device.bootstrap);
+            }
+        }
+        ring_startup_options rollback_options = options;
+        rollback_options.hosts_spec = "existing-ring";
+        rollback_options.bootstrap_nodes = &rollback_nodes;
+        ring_session restored;
+        std::string restore_error;
+        if (bring_up_ring(restored, rollback_options, restore_error)) {
+            install(restored);
+            error = rebuild_error;
+            return false;
+        }
+        error = rebuild_error + "; prior ring restore failed: " +
+            (restore_error.empty() ? "no detail" : restore_error);
     }
     {
         std::lock_guard<std::mutex> lock(session.mutex);
-        session.ring = std::move(replacement.ring);
-        session.workers = std::move(replacement.workers);
-        session.healthy = true;
+        session.health_reason = error;
     }
-    return true;
+    return false;
+}
+topology_refresh_result refresh_ring_if_needed(ring_session & session,
+                                               ring_startup_options & options,
+                                               std::string & error) {
+    error.clear();
+    if (options.workers_option || options.bootstrap_nodes == nullptr) {
+        return topology_refresh_result::unchanged;
+    }
+
+    std::vector<planned_worker> current_workers;
+    {
+        std::lock_guard<std::mutex> lock(session.mutex);
+        current_workers = session.workers;
+    }
+    const std::set<std::string> current_remote = remote_targets(current_workers);
+
+    std::vector<bootstrap_node> candidates;
+    try {
+        candidates = options.hosts_spec.empty()
+            ? discover_bootstrap_nodes() : *options.bootstrap_nodes;
+    } catch (const std::exception & exception) {
+        error = "topology discovery deferred: " + std::string(exception.what());
+        return topology_refresh_result::unchanged;
+    }
+
+    std::vector<device_probe> probes = probe_remote_candidates(candidates);
+    bool changed = false;
+    for (const device_probe & probe : probes) {
+        if (!probe.ok) {
+            continue;
+        }
+        const auto current = std::find_if(
+            current_workers.begin(), current_workers.end(),
+            [&](const planned_worker & worker) {
+                return worker.kind == worker_kind::remote &&
+                       worker.device.bootstrap.ssh_target == probe.bootstrap.ssh_target;
+            });
+        if (current != current_workers.end() &&
+            materially_changed(current->device.usable_bytes(), probe.usable_bytes())) {
+            changed = true;
+        }
+    }
+
+    std::vector<device_probe> valid;
+    for (const device_probe & probe : probes) {
+        if (probe.ok) {
+            valid.push_back(probe);
+        }
+    }
+    if (valid.empty()) {
+        error = "topology probes deferred: no remote candidate responded";
+        return topology_refresh_result::unchanged;
+    }
+    const std::set<std::string> responding_remote = probe_targets(valid);
+    for (const std::string & target : current_remote) {
+        if (responding_remote.count(target) == 0) {
+            error = "topology probe deferred for current worker " + target;
+            return topology_refresh_result::unchanged;
+        }
+    }
+    std::vector<device_probe> replacement_devices;
+    try {
+        const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
+        replacement_devices = admit_devices(
+            valid, options.n_layer, model_bytes, options.n_head_kv,
+            options.head_dim, options.n_ctx, true);
+        if (probe_targets(replacement_devices) != current_remote) {
+            changed = true;
+        }
+    } catch (const std::exception & exception) {
+        changed = true;
+        error = exception.what();
+    }
+
+    if (options.head_share == "auto") {
+        device_probe head = probe_local_worker(options.worker_path);
+        bool current_head = false;
+        bool has_current_head = false;
+        uint64_t current_budget = 0;
+        uint64_t current_reserve = 0;
+        {
+            std::lock_guard<std::mutex> lock(session.mutex);
+            current_head = session.head_participates;
+            has_current_head = session.has_head_profile;
+            current_budget = session.head_budget;
+            current_reserve = session.head_reserve;
+        }
+        if (!head.ok) {
+            error = "head reserve probe deferred: " + head.error;
+            return topology_refresh_result::unchanged;
+        } else {
+            const double load = host_cpu_load();
+            const uint64_t reserve = adaptive_head_reserve(head.profile, load);
+            head.placement_usable_limit = head.profile.host_free_bytes > reserve
+                ? head.profile.host_free_bytes - reserve : 0;
+            const uint64_t budget = head.placement_usable_limit;
+            const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
+            const uint64_t layer_cost = route_layer_cost(
+                options.n_layer, model_bytes, options.n_head_kv,
+                options.head_dim, options.n_ctx);
+            const bool participating =
+                budget >= 2ull * 1024ull * 1024ull * 1024ull &&
+                head.usable_bytes() >= layer_cost;
+            if (participating) {
+                replacement_devices.push_back(head);
+            }
+            changed = changed || !has_current_head || current_head != participating ||
+                      materially_changed(current_budget, budget) ||
+                      materially_changed(current_reserve, reserve);
+        }
+    }
+    const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
+    const uint64_t layer_cost = route_layer_cost(
+        options.n_layer, model_bytes, options.n_head_kv, options.head_dim, options.n_ctx);
+    uint64_t feasible_layers = 0;
+    for (const device_probe & device : replacement_devices) {
+        const uint64_t device_layers = std::min<uint64_t>(
+            options.n_layer, device.usable_bytes() / layer_cost);
+        feasible_layers = std::min<uint64_t>(
+            options.n_layer, feasible_layers + device_layers);
+    }
+    if (feasible_layers < options.n_layer) {
+        error = "topology refresh deferred: replacement devices cannot cover the model";
+        return topology_refresh_result::unchanged;
+    }
+
+
+    if (!changed) {
+        return topology_refresh_result::unchanged;
+    }
+    const std::string reason = error.empty()
+        ? "discovery, capacity, or head reserve changed" : error;
+    std::string rebuild_error;
+    if (!rebuild_ring(session, options, true, rebuild_error)) {
+        bool restored = false;
+        {
+            std::lock_guard<std::mutex> lock(session.mutex);
+            restored = session.healthy;
+        }
+        error = reason + "; rebuild deferred: " + rebuild_error;
+        return restored ? topology_refresh_result::unchanged
+                        : topology_refresh_result::failed;
+    }
+    error = reason;
+    return topology_refresh_result::rebuilt;
 }

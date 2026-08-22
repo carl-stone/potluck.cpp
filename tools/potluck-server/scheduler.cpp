@@ -25,7 +25,8 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
                                  uint32_t n_logits,
                                  serve_stats * stats,
                                  std::function<bool()> should_cancel,
-                                 bool * batch_started) {
+                                 bool * batch_started,
+                                 std::function<bool(std::string &)> heartbeat) {
     if (batch_started != nullptr) {
         *batch_started = false;
     }
@@ -39,7 +40,7 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
     potluck::message input;
     input.type = potluck::message_type::batch_decode;
     input.flags = 0;
-    input.sequence = positions.empty() ? 0 : static_cast<uint64_t>(positions.back());
+    input.sequence = ++ring.batch_sequence;
     if (!potluck::encode_batch_payload(positions, sequences, tokens, nullptr, 0,
                                        clear_seq, trim_seq, trim_to, n_logits, input.payload)) {
         throw std::runtime_error("cannot encode ring batch");
@@ -78,7 +79,24 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
             cancel_requested = true;
             cancel_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         }
-        if (ring.result.receive(output, ring.error)) {
+        bool received = false;
+        if (!ring.pending_results.empty()) {
+            output = std::move(ring.pending_results.front());
+            ring.pending_results.pop_front();
+            received = true;
+        } else {
+            received = ring.result.receive(output, ring.error);
+        }
+        if (received) {
+            if (output.type == potluck::message_type::heartbeat_ack) {
+                continue;
+            }
+            if (output.sequence < input.sequence) {
+                continue;
+            }
+            if (output.sequence != input.sequence) {
+                throw std::runtime_error("ring result sequence is ahead of the active batch");
+            }
             if (cancel_requested) {
                 throw request_cancelled("request cancelled");
             }
@@ -86,6 +104,15 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
         }
         if (ring.error.find("timeout") == std::string::npos) {
             throw std::runtime_error("ring result receiver closed: " + ring.error);
+        }
+        if (heartbeat && !cancel_requested) {
+            std::string heartbeat_error;
+            if (!heartbeat(heartbeat_error)) {
+                throw std::runtime_error("worker transport lost: " +
+                                         (heartbeat_error.empty()
+                                              ? std::string("heartbeat failed")
+                                              : heartbeat_error));
+            }
         }
         const auto now = std::chrono::steady_clock::now();
         if (cancel_requested && now >= cancel_deadline) {

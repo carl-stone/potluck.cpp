@@ -8,6 +8,7 @@
 #include "potluck_runtime.h"
 #include <cpp-httplib/httplib.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -15,6 +16,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -84,6 +86,11 @@ struct ServerRing {
     std::string result_endpoint;
     std::vector<potluck::ring_sender> controls;
     potluck::ring_sender ingress;
+    std::deque<potluck::message> pending_results;
+    uint64_t batch_sequence = 0;
+    uint64_t heartbeat_sequence = 0;
+    uint32_t heartbeat_misses = 0;
+    std::chrono::steady_clock::time_point last_heartbeat{};
     std::string error;
 };
 
@@ -91,6 +98,15 @@ struct ring_session {
     ServerRing ring;
     std::vector<planned_worker> workers;
     bool healthy = false;
+    std::string health_reason;
+    bool head_participates = false;
+    bool has_head_profile = false;
+    uint64_t head_budget = 0;
+    uint64_t head_reserve = 0;
+    double head_cpu_load = 0.0;
+    potluck::accel_profile head_profile;
+    std::chrono::steady_clock::time_point last_heartbeat{};
+    std::atomic<bool> stopping { false };
     mutable std::mutex mutex;
 };
 
@@ -204,7 +220,19 @@ bool reset_ring_workers(ServerRing & ring, std::string & error);
 bool bring_up_ring(ring_session & target, ring_startup_options & options,
                    std::string & error);
 bool rebuild_ring(ring_session & session, ring_startup_options & options,
-                  std::string & error);
+                  bool restore_on_failure, std::string & error);
+bool heartbeat_ring(ring_session & session, std::string & error);
+bool ring_workers_alive(ring_session & session, std::string & error);
+
+enum class topology_refresh_result {
+    unchanged,
+    rebuilt,
+    failed,
+};
+
+topology_refresh_result refresh_ring_if_needed(ring_session & session,
+                                               ring_startup_options & options,
+                                               std::string & error);
 
 class request_cancelled final : public std::runtime_error {
 public:
@@ -219,7 +247,8 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
                                  uint32_t n_logits,
                                  serve_stats * stats = nullptr,
                                  std::function<bool()> should_cancel = {},
-                                 bool * batch_started = nullptr);
+                                 bool * batch_started = nullptr,
+                                 std::function<bool(std::string &)> heartbeat = {});
 
 std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab, const std::string & text);
 std::string token_piece(const llama_vocab * vocab, llama_token token);
@@ -293,10 +322,15 @@ struct batch_item {
 class slot_scheduler {
 public:
     slot_scheduler(ServerRing & ring, const llama_vocab * vocab, uint32_t n_slots,
-                   uint32_t prefill_batch, std::function<bool(std::string &)> rebuild = {})
+                   uint32_t prefill_batch, std::function<bool(std::string &)> rebuild = {},
+                   std::function<bool(std::string &)> heartbeat = {},
+                   std::function<topology_refresh_result(std::string &)> refresh = {})
         : ring_(ring), vocab_(vocab),
           prefill_batch_(std::max<uint32_t>(1, prefill_batch)),
-          rebuild_(std::move(rebuild)) {
+          rebuild_(std::move(rebuild)),
+          heartbeat_(std::move(heartbeat)),
+          refresh_(std::move(refresh)),
+          next_topology_check_(std::chrono::steady_clock::now() + std::chrono::seconds(5)) {
         slots_.reserve(std::max<uint32_t>(1, n_slots));
         for (uint32_t i = 0; i < std::max<uint32_t>(1, n_slots); ++i) {
             auto slot = std::make_shared<scheduled_slot>();
@@ -402,7 +436,15 @@ public:
     }
     bool rebuilding() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return rebuilding_;
+        return rebuilding_ || recovery_exhausted_;
+    }
+    bool recovery_exhausted() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return recovery_exhausted_;
+    }
+    std::string recovery_error() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return recovery_error_;
     }
 
 
@@ -563,7 +605,8 @@ private:
                 try {
                     (void) drive_batch(ring_, empty, empty, empty, clear_slot->seq,
                                        -1, -1, 0, nullptr,
-                                       [this] { return is_stopping(); });
+                                       [this] { return is_stopping(); },
+                                       nullptr, heartbeat_);
                 } catch (const request_cancelled &) {
                     return;
                 }
@@ -663,6 +706,9 @@ private:
         const uint32_t n_logits = static_cast<uint32_t>(decode.size() + prefill_logits.size());
         const int32_t clear_seq = clear_slot ? clear_slot->seq : -1;
         const auto batch_cancelled = [&]() {
+            if (is_stopping()) {
+                return true;
+            }
             for (const auto & slot : selected) {
                 std::lock_guard<std::mutex> lock(slot->mutex);
                 if (slot->cancelled) {
@@ -689,7 +735,7 @@ private:
         try {
             result = drive_batch(
                 ring_, positions, sequences, tokens, clear_seq, -1, -1, n_logits,
-                nullptr, batch_cancelled, &batch_started);
+                nullptr, batch_cancelled, &batch_started, heartbeat_);
         } catch (const request_cancelled &) {
             if (batch_started) {
                 fail_selected();
@@ -756,6 +802,36 @@ private:
         work_cv_.notify_all();
     }
 
+    std::chrono::milliseconds retry_delay_locked() {
+        const uint32_t exponent = std::min<uint32_t>(
+            rebuild_attempts_ == 0 ? 0 : rebuild_attempts_ - 1, 7);
+        const uint64_t base = std::min<uint64_t>(30000ull, 250ull << exponent);
+        jitter_state_ ^= jitter_state_ << 7;
+        jitter_state_ ^= jitter_state_ >> 9;
+        jitter_state_ ^= jitter_state_ << 8;
+        const int jitter_percent = static_cast<int>(jitter_state_ % 41) - 20;
+        const uint64_t adjusted = base * static_cast<uint64_t>(100 + jitter_percent) / 100;
+        return std::chrono::milliseconds(std::max<uint64_t>(1, adjusted));
+    }
+
+    bool schedule_rebuild_retry_locked(const std::string & detail,
+                                       std::chrono::milliseconds & delay) {
+        ++rebuild_attempts_;
+        rebuilding_ = true;
+        recovery_error_ = detail.empty() ? "ring rebuild failed" : detail;
+        constexpr uint32_t max_rebuild_attempts = 6;
+        if (rebuild_attempts_ >= max_rebuild_attempts) {
+            recovery_exhausted_ = true;
+            recovery_error_ = "ring recovery exhausted after " +
+                              std::to_string(rebuild_attempts_) + " attempts: " +
+                              recovery_error_;
+            return false;
+        }
+        delay = retry_delay_locked();
+        next_rebuild_ = std::chrono::steady_clock::now() + delay;
+        return true;
+    }
+
     void attempt_rebuild() {
         std::string detail;
         bool rebuilt = false;
@@ -764,12 +840,35 @@ private:
         } catch (const std::exception & exception) {
             detail = exception.what();
         }
-        std::printf("potluck-server: ring rebuild %s: %s\n",
-                    rebuilt ? "succeeded" : "failed",
-                    detail.empty() ? (rebuilt ? "ring is ready" : "no detail") : detail.c_str());
+        std::chrono::milliseconds delay(0);
+        bool retry = false;
+        bool exhausted = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            rebuilding_ = !rebuilt;
+            if (rebuilt) {
+                rebuilding_ = false;
+                recovery_exhausted_ = false;
+                rebuild_attempts_ = 0;
+                recovery_error_.clear();
+                next_rebuild_ = {};
+                next_topology_check_ = std::chrono::steady_clock::now() +
+                                       std::chrono::seconds(5);
+            } else {
+                retry = schedule_rebuild_retry_locked(detail, delay);
+                exhausted = recovery_exhausted_;
+            }
+        }
+        if (rebuilt) {
+            std::printf("potluck-server: ring rebuild succeeded: %s\n",
+                        detail.empty() ? "ring is ready" : detail.c_str());
+            std::fflush(stdout);
+        } else if (exhausted) {
+            std::fprintf(stderr, "potluck-server: ring rebuild terminal: %s\n",
+                         recovery_error().c_str());
+        } else if (retry) {
+            std::fprintf(stderr, "potluck-server: ring rebuild failed; retrying in %lld ms: %s\n",
+                         static_cast<long long>(delay.count()),
+                         detail.empty() ? "no detail" : detail.c_str());
         }
         work_cv_.notify_all();
     }
@@ -778,15 +877,21 @@ private:
         for (;;) {
             std::vector<std::shared_ptr<scheduled_slot>> active;
             bool retry_rebuild = false;
+            bool refresh_topology = false;
+            bool waiting_for_rebuild = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 work_cv_.wait_for(lock, std::chrono::seconds(1), [&] {
                     if (stopping_) {
                         return true;
                     }
-                    if (rebuilding_ && rebuild_ &&
-                        std::chrono::steady_clock::now() - last_rebuild_ >=
-                            std::chrono::seconds(30)) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (rebuilding_ && !recovery_exhausted_ && rebuild_ &&
+                        next_rebuild_.time_since_epoch().count() != 0 &&
+                        now >= next_rebuild_) {
+                        return true;
+                    }
+                    if (!rebuilding_ && refresh_ && now >= next_topology_check_) {
                         return true;
                     }
                     for (const auto & slot : slots_) {
@@ -803,12 +908,28 @@ private:
                 if (stopping_) {
                     return;
                 }
-                if (rebuilding_ && rebuild_ &&
-                    std::chrono::steady_clock::now() - last_rebuild_ >=
-                        std::chrono::seconds(30)) {
-                    last_rebuild_ = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                bool slots_idle = true;
+                for (const auto & slot : slots_) {
+                    std::lock_guard<std::mutex> slot_lock(slot->mutex);
+                    if (slot->state == slot_state::queued ||
+                        slot->state == slot_state::prefill ||
+                        slot->state == slot_state::decode ||
+                        slot->state == slot_state::cancelled) {
+                        slots_idle = false;
+                        break;
+                    }
+                }
+                if (rebuilding_ && !recovery_exhausted_ && rebuild_ &&
+                    next_rebuild_.time_since_epoch().count() != 0 &&
+                    now >= next_rebuild_) {
                     retry_rebuild = true;
-                } else {
+                    next_rebuild_ = {};
+                } else if (!rebuilding_ && slots_idle && refresh_ && now >= next_topology_check_) {
+                    rebuilding_ = true;
+                    refresh_topology = true;
+                    next_topology_check_ = now + std::chrono::seconds(5);
+                } else if (!rebuilding_) {
                     for (const auto & slot : slots_) {
                         std::lock_guard<std::mutex> slot_lock(slot->mutex);
                         if (slot->state == slot_state::queued) {
@@ -826,40 +947,117 @@ private:
                             active.push_back(slot);
                         }
                     }
+                } else {
+                    waiting_for_rebuild = true;
                 }
             }
             if (retry_rebuild) {
                 attempt_rebuild();
                 continue;
             }
+            if (waiting_for_rebuild) {
+                continue;
+            }
+            if (refresh_topology) {
+                std::string detail;
+                topology_refresh_result result = topology_refresh_result::failed;
+                try {
+                    result = refresh_(detail);
+                } catch (const std::exception & exception) {
+                    detail = exception.what();
+                }
+                if (result == topology_refresh_result::unchanged ||
+                    result == topology_refresh_result::rebuilt) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    rebuilding_ = false;
+                    recovery_exhausted_ = false;
+                    rebuild_attempts_ = 0;
+                    recovery_error_.clear();
+                    next_rebuild_ = {};
+                    next_topology_check_ = std::chrono::steady_clock::now() +
+                                           std::chrono::seconds(5);
+                    if (!detail.empty()) {
+                        std::printf("potluck-server: topology refresh %s: %s\n",
+                                    result == topology_refresh_result::rebuilt
+                                        ? "rebuilt" : "unchanged", detail.c_str());
+                    }
+                } else {
+                    std::chrono::milliseconds delay(0);
+                    bool retry = false;
+                    bool exhausted = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        retry = schedule_rebuild_retry_locked(detail, delay);
+                        exhausted = recovery_exhausted_;
+                    }
+                    if (exhausted) {
+                        std::fprintf(stderr,
+                                     "potluck-server: topology refresh recovery terminal: %s\n",
+                                     recovery_error().c_str());
+                    } else if (retry) {
+                        std::fprintf(stderr,
+                                     "potluck-server: topology refresh rebuild failed; retrying in %lld ms: %s\n",
+                                     static_cast<long long>(delay.count()),
+                                     detail.empty() ? "no detail" : detail.c_str());
+                    }
+                }
+                work_cv_.notify_all();
+                continue;
+            }
             if (active.empty()) {
+                if (heartbeat_) {
+                    std::string heartbeat_error;
+                    if (!heartbeat_(heartbeat_error)) {
+                        bool start_rebuild = false;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            if (!rebuilding_) {
+                                rebuilding_ = true;
+                                recovery_exhausted_ = false;
+                                recovery_error_.clear();
+                                rebuild_attempts_ = 0;
+                                next_rebuild_ = std::chrono::steady_clock::now();
+                                start_rebuild = true;
+                            }
+                        }
+                        if (start_rebuild) {
+                            std::fprintf(stderr,
+                                         "potluck-server: heartbeat lost: %s\n",
+                                         heartbeat_error.empty()
+                                             ? "no detail" : heartbeat_error.c_str());
+                            attempt_rebuild();
+                            continue;
+                        }
+                    }
+                }
                 work_cv_.notify_all();
                 continue;
             }
             try {
                 run_round(active);
-            } catch (const std::exception &) {
+            } catch (const std::exception & exception) {
                 if (is_stopping()) {
                     return;
                 }
                 bool start_rebuild = false;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    const auto now = std::chrono::steady_clock::now();
                     if (!rebuilding_) {
                         rebuilding_ = true;
-                        if (last_rebuild_.time_since_epoch().count() == 0 ||
-                            now - last_rebuild_ >= std::chrono::seconds(30)) {
-                            last_rebuild_ = now;
-                            start_rebuild = true;
-                        }
+                        recovery_exhausted_ = false;
+                        recovery_error_.clear();
+                        rebuild_attempts_ = 0;
+                        next_rebuild_ = std::chrono::steady_clock::now();
+                        start_rebuild = true;
                     }
                 }
                 for (const auto & slot : active) {
-                    finish(slot, "cluster is rebuilding; retry");
+                    finish(slot, "request interrupted by ring rebuild; retry");
                 }
                 reap_cancelled();
                 if (start_rebuild) {
+                    std::fprintf(stderr, "potluck-server: request transport failed: %s\n",
+                                 exception.what());
                     work_cv_.notify_all();
                     attempt_rebuild();
                 }
@@ -872,15 +1070,21 @@ private:
     const llama_vocab * vocab_;
     uint32_t prefill_batch_;
     std::function<bool(std::string &)> rebuild_;
-    std::chrono::steady_clock::time_point last_rebuild_{};
+    std::function<bool(std::string &)> heartbeat_;
+    std::function<topology_refresh_result(std::string &)> refresh_;
+    std::chrono::steady_clock::time_point next_rebuild_{};
+    std::chrono::steady_clock::time_point next_topology_check_{};
+    uint32_t rebuild_attempts_ = 0;
     bool rebuilding_ = false;
+    bool recovery_exhausted_ = false;
+    std::string recovery_error_;
+    uint64_t jitter_state_ = 0x9e3779b97f4a7c15ull;
     mutable std::mutex mutex_;
     std::condition_variable work_cv_;
     std::vector<std::shared_ptr<scheduled_slot>> slots_;
     std::thread thread_;
     bool stopping_ = false;
 };
-
 
 void setup_http_routes(httplib::Server & server, ring_session & session,
                        slot_scheduler & scheduler, const llama_vocab * vocab,

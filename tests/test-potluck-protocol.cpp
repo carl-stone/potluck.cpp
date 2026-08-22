@@ -261,5 +261,20 @@ int main() {
         CHECK(error == "invalid slot config sequence");
     }
 
+    {
+        const potluck::message heartbeat{
+            potluck::message_type::heartbeat, 0, 1, 0x123456789abcdef0ull,
+            potluck::data_type::none, {}, {}
+        };
+        const potluck::message reply{
+            potluck::message_type::heartbeat_ack, 0, heartbeat.rank,
+            heartbeat.sequence, potluck::data_type::none, {}, {}
+        };
+        CHECK(heartbeat.type != reply.type);
+        CHECK(heartbeat.sequence == reply.sequence);
+        CHECK(static_cast<uint16_t>(heartbeat.type) == 12);
+        CHECK(static_cast<uint16_t>(reply.type) == 13);
+    }
+
     return 0;
 }

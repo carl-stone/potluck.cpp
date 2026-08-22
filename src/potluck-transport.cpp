@@ -148,6 +148,8 @@ bool valid_message_type(uint16_t type) {
         case message_type::batch_decode:
         case message_type::batch_result:
         case message_type::slot_config:
+        case message_type::heartbeat:
+        case message_type::heartbeat_ack:
         case message_type::error:
             return true;
     }
