@@ -5,6 +5,10 @@ endif()
 
 add_executable(potluck-server
     main.cpp
+    admission.cpp
+    ring.cpp
+    scheduler.cpp
+    http_api.cpp
 )
 
 target_include_directories(potluck-server PRIVATE
