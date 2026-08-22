@@ -2,7 +2,7 @@
 // ZeroMQ piped ring. Requests traverse the configured ring route.
 
 #include "llama.h"
-#include "common.h"
+#include "arg.h"
 #include "chat.h"
 #include "nlohmann/json.hpp"
 #include "potluck-discovery.h"
@@ -263,6 +263,42 @@ std::string ring_host(const std::string & bootstrap_host) {
     }
     return host;
 }
+std::string resolve_hf_model(const std::string & repo,
+                             const std::string & file,
+                             const std::string & token,
+                             bool offline) {
+    common_params params;
+    params.hf_token = token;
+    params.offline = offline;
+    params.model.hf_repo = repo;
+    params.model.hf_file = file;
+
+    try {
+        common_models_handler handler = common_models_handler_init(params, LLAMA_EXAMPLE_SERVER);
+        if (common_models_handler_is_preset_repo(handler)) {
+            throw std::runtime_error("repository contains a preset, not a GGUF model");
+        }
+        if (handler.plan.primary.path.empty() || handler.plan.model_files.empty()) {
+            throw std::runtime_error("repository has no compatible GGUF model");
+        }
+        common_models_handler_apply(handler, params);
+    } catch (const std::exception & e) {
+        throw std::runtime_error("failed to resolve Hugging Face model '" + repo + "': " + e.what());
+    }
+
+    if (params.model.path.empty()) {
+        throw std::runtime_error("failed to resolve Hugging Face model '" + repo +
+                                 "': download did not produce a model path");
+    }
+    std::error_code path_error;
+    if (!std::filesystem::is_regular_file(params.model.path, path_error)) {
+        std::string detail = path_error ? ": " + path_error.message() : std::string();
+        throw std::runtime_error("failed to resolve Hugging Face model '" + repo +
+                                 "': resolved path is not a file: " + params.model.path + detail);
+    }
+    return params.model.path;
+}
+
 
 
 
@@ -280,6 +316,11 @@ std::string ring_host(const std::string & bootstrap_host) {
 int main(int argc, char ** argv) {
     try {
         std::string model_path;
+        std::string hf_repo;
+        std::string hf_file;
+        const char * hf_token_env = std::getenv("HF_TOKEN");
+        std::string hf_token = hf_token_env == nullptr ? std::string() : hf_token_env;
+        bool hf_offline = false;
         std::string host = "127.0.0.1";
         std::string hosts_spec;
         std::string launch;
@@ -305,6 +346,12 @@ int main(int argc, char ** argv) {
                 return argv[i];
             };
             if (arg == "-m" || arg == "--model") model_path = take("--model");
+            else if (arg == "-hf" || arg == "-hfr" || arg == "--hf" || arg == "--hf-repo") {
+                hf_repo = take("--hf-repo");
+            }
+            else if (arg == "-hff" || arg == "--hf-file") hf_file = take("--hf-file");
+            else if (arg == "-hft" || arg == "--hf-token") hf_token = take("--hf-token");
+            else if (arg == "--offline") hf_offline = true;
             else if (arg == "--host") host = take("--host");
             else if (arg == "--port") http_port = static_cast<uint16_t>(std::stoul(take("--port")));
             else if (arg == "--workers") {
@@ -327,11 +374,22 @@ int main(int argc, char ** argv) {
             else if (arg == "--n-predict") n_predict_default = static_cast<uint32_t>(std::stoul(take("--n-predict")));
             else if (arg == "--bench") bench = true;
             else throw std::runtime_error(
-                "usage: potluck-server -m model.gguf [--workers N] [--slots N] [--ubatch N] "
+                "usage: potluck-server -m model.gguf | -hf owner/repo[:quant] "
+                "[--hf-file FILE] [--hf-token TOKEN] [--offline] "
+                "[--workers N] [--slots N] [--ubatch N] "
                 "[--head-share auto|off] [--hosts a,b,c --launch ssh]");
         }
-        if (model_path.empty()) {
-            throw std::runtime_error("need -m model.gguf");
+        if (model_path.empty() && hf_repo.empty()) {
+            throw std::runtime_error("need -m model.gguf or -hf owner/repo[:quant]");
+        }
+        if (!model_path.empty() && !hf_repo.empty()) {
+            throw std::runtime_error("cannot combine -m/--model with -hf/--hf-repo");
+        }
+        if (!hf_file.empty() && hf_repo.empty()) {
+            throw std::runtime_error("-hff/--hf-file requires -hf/--hf-repo");
+        }
+        if (!hf_repo.empty()) {
+            model_path = resolve_hf_model(hf_repo, hf_file, hf_token, hf_offline);
         }
         if (head_share != "auto" && head_share != "off") {
             throw std::runtime_error("--head-share must be auto or off");
@@ -359,7 +417,7 @@ int main(int argc, char ** argv) {
         model_params.check_tensors = false;
         llama_model * meta = llama_model_load_from_file(model_path.c_str(), model_params);
         if (meta == nullptr) {
-            throw std::runtime_error("cannot load model metadata");
+            throw std::runtime_error("cannot load model metadata from " + model_path);
         }
         const llama_vocab * vocab = llama_model_get_vocab(meta);
         const uint32_t n_layer = static_cast<uint32_t>(llama_model_n_layer(meta));
@@ -376,7 +434,8 @@ int main(int argc, char ** argv) {
             const int32_t n_head = llama_model_n_head(meta);
             head_dim = n_head > 0 ? static_cast<uint32_t>(llama_model_n_embd(meta) / n_head) : 0;
         }
-        const std::string model_name = basename_of(model_path);
+        const std::string model_identity = hf_repo.empty() ? basename_of(model_path) : hf_repo;
+        const std::string worker_model_name = basename_of(model_path);
         common_chat_templates_ptr chat_templates = common_chat_templates_init(meta, "");
 
         std::vector<bootstrap_node> bootstrap_nodes;
@@ -395,7 +454,7 @@ int main(int argc, char ** argv) {
         ring_startup_options options;
         options.hosts_spec = hosts_spec;
         options.model_path = model_path;
-        options.model_name = model_name;
+        options.model_name = worker_model_name;
         options.worker_path = exe_dir(argv[0]) + "/potluck-worker";
         options.host = host;
         options.head_share = head_share;
@@ -437,7 +496,7 @@ int main(int argc, char ** argv) {
                                   [&](std::string & error) {
                                       return refresh_ring_if_needed(session, options, error);
                                   });
-        setup_http_routes(server, session, scheduler, vocab, model_name,
+        setup_http_routes(server, session, scheduler, vocab, model_identity,
                           chat_templates, n_predict_default, temp, top_p, seed);
         std::printf("potluck-server: listening on http://%s:%u (%zu workers, %zu ring windows, model %s)\n",
                     host.c_str(), http_port, ring.workers.size(), ring.windows.size(), model_path.c_str());

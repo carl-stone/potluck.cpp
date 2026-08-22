@@ -808,6 +808,7 @@ bool ensure_remote_model(const bootstrap_node & bootstrap, const std::string & m
                          const std::string & digest, std::string & error) {
     error.clear();
     const std::string name = basename_of(model_path);
+    const std::string source = canonical_model_path(model_path).string();
     const std::string ssh = ssh_options(bootstrap);
     const std::string remote_check =
         "(cd ~/potluck && (sha256sum " + shell_quote(name) +
@@ -842,7 +843,7 @@ bool ensure_remote_model(const bootstrap_node & bootstrap, const std::string & m
     std::printf("potluck-server: sending %s to %s (%llu MiB)\n", name.c_str(),
                 bootstrap.ring_host.c_str(),
                 static_cast<unsigned long long>(
-                    std::filesystem::file_size(model_path) / (1024ull * 1024ull)));
+                    std::filesystem::file_size(source) / (1024ull * 1024ull)));
     std::fflush(stdout);
     const std::string mkdir = ssh + " " + shell_quote(bootstrap.ssh_target) +
         " " + shell_quote("mkdir -p ~/potluck");
@@ -851,7 +852,7 @@ bool ensure_remote_model(const bootstrap_node & bootstrap, const std::string & m
         return false;
     }
     const std::string rsync = "rsync -a --whole-file --partial --inplace -e " +
-        shell_quote(ssh) + " " + shell_quote(model_path) + " " +
+        shell_quote(ssh) + " " + shell_quote(source) + " " +
         shell_quote(bootstrap.ssh_target + ":potluck/" + name);
     if (std::system(rsync.c_str()) != 0) {
         error = "model transfer failed";
