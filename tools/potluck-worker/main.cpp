@@ -836,6 +836,7 @@ int main(int argc, char ** argv) {
                         output.payload.insert(output.payload.end(), metadata.begin(), metadata.end());
                     }
                 } else {
+                    output.type = potluck::message_type::batch_result;
                     const size_t hidden_width = static_cast<size_t>(stage.n_embd);
                     if (hidden_width == 0 ||
                         n_entries > potluck::max_payload_bytes /
