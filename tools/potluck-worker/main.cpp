@@ -229,7 +229,7 @@ std::vector<potluck::token_logprob> make_logprobs(
 
     struct candidate {
         llama_token token;
-        float logprob;
+        double logprob;
     };
     std::vector<candidate> candidates;
     candidates.reserve(n_vocab);
@@ -242,15 +242,16 @@ std::vector<potluck::token_logprob> make_logprobs(
         if (!std::isfinite(logits[token])) {
             continue;
         }
-        const double weight = std::exp(static_cast<double>(logits[token] - max_logit));
-        normalizer += weight;
-        candidates.push_back({ static_cast<llama_token>(token), static_cast<float>(weight) });
+        const double log_weight = static_cast<double>(logits[token] - max_logit);
+        normalizer += std::exp(log_weight);
+        candidates.push_back({ static_cast<llama_token>(token), log_weight });
     }
     if (normalizer <= 0.0 || candidates.empty()) {
         return {};
     }
+    const double log_normalizer = std::log(normalizer);
     for (auto & item : candidates) {
-        item.logprob = static_cast<float>(std::log(static_cast<double>(item.logprob) / normalizer));
+        item.logprob -= log_normalizer;
     }
     const size_t keep = std::max<size_t>(1, config.top_logprobs);
     const size_t limit = std::min(keep, candidates.size());
@@ -262,7 +263,8 @@ std::vector<potluck::token_logprob> make_logprobs(
     result.reserve(limit + 1);
     bool selected_present = false;
     for (size_t i = 0; i < limit; ++i) {
-        result.push_back({ static_cast<int32_t>(candidates[i].token), candidates[i].logprob });
+        result.push_back({ static_cast<int32_t>(candidates[i].token),
+                           static_cast<float>(candidates[i].logprob) });
         selected_present = selected_present || candidates[i].token == sampled;
     }
     if (!selected_present) {
@@ -271,7 +273,8 @@ std::vector<potluck::token_logprob> make_logprobs(
                                              return item.token == sampled;
                                          });
         if (found != candidates.end()) {
-            result.push_back({ static_cast<int32_t>(found->token), found->logprob });
+            result.push_back({ static_cast<int32_t>(found->token),
+                               static_cast<float>(found->logprob) });
         }
     }
     return result;
@@ -824,6 +827,10 @@ int main(int argc, char ** argv) {
                         if (!potluck::encode_batch_logprobs(output_logprobs, metadata)) {
                             fail("cannot encode token logprobs at window " +
                                  std::to_string(window_index));
+                        }
+                        if (output.payload.size() > potluck::max_payload_bytes ||
+                            metadata.size() > potluck::max_payload_bytes - output.payload.size()) {
+                            fail("token logprob payload exceeds transport limit");
                         }
                         output.shape = { output.payload.size() };
                         output.payload.insert(output.payload.end(), metadata.begin(), metadata.end());
