@@ -1,4 +1,5 @@
 #include "../src/potluck-protocol.h"
+#include "../tools/potluck-server/internal.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -320,6 +321,27 @@ int main() {
         CHECK(heartbeat.sequence == reply.sequence);
         CHECK(static_cast<uint16_t>(heartbeat.type) == 12);
         CHECK(static_cast<uint16_t>(reply.type) == 13);
+    }
+    {
+        constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
+        device_probe head;
+        head.profile.host_total_bytes = 16ull * gib;
+        head.profile.host_free_bytes = 5ull * gib;
+        const head_participation_plan excluded =
+            plan_head_participation(head, 4ull * gib, 3ull * gib);
+        CHECK(excluded.budget == 1ull * gib);
+        CHECK(!excluded.participates);
+
+        head.profile.host_free_bytes = 12ull * gib;
+        const head_participation_plan included =
+            plan_head_participation(head, 4ull * gib, 3ull * gib);
+        CHECK(included.budget == 8ull * gib);
+        CHECK(included.participates);
+
+        const head_participation_plan reserve_excluded =
+            plan_head_participation(head, 11ull * gib, 3ull * gib);
+        CHECK(reserve_excluded.budget == 1ull * gib);
+        CHECK(!reserve_excluded.participates);
     }
 
     return 0;

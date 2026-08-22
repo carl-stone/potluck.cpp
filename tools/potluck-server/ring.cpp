@@ -739,6 +739,7 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         std::vector<device_probe> candidates;
         device_probe head;
         bool head_participates = false;
+        head_participation_plan head_plan;
         uint64_t head_budget = 0;
         uint64_t head_reserve = 4ull * 1024ull * 1024ull * 1024ull;
         double head_load = 0.0;
@@ -780,8 +781,9 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                     head.host = "head";
                     head_load = host_cpu_load();
                     head_reserve = adaptive_head_reserve(head.profile, head_load);
-                    head_budget = head.profile.host_free_bytes > head_reserve
-                        ? head.profile.host_free_bytes - head_reserve : 0;
+                    head_plan = plan_head_participation(head, head_reserve, layer_cost);
+                    head_budget = head_plan.budget;
+                    head.placement_usable_limit = head_budget;
                 }
             }
         }
@@ -812,10 +814,8 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             std::move(candidates), n_layer, model_bytes, n_head_kv, head_dim, n_ctx,
             allow_remote_shortfall);
         if (has_remote && head_share == "auto" && head.ok) {
-            head.placement_usable_limit = head_budget;
-            head_participates =
-                head_budget >= 2ull * 1024ull * 1024ull * 1024ull &&
-                head.usable_bytes() >= layer_cost;
+            head.placement_usable_limit = head_plan.budget;
+            head_participates = head_plan.participates;
             if (head_participates) {
                 head.bootstrap = {};
                 head.ok = true;
@@ -1139,16 +1139,15 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
         } else {
             const double load = host_cpu_load();
             const uint64_t reserve = adaptive_head_reserve(head.profile, load);
-            head.placement_usable_limit = head.profile.host_free_bytes > reserve
-                ? head.profile.host_free_bytes - reserve : 0;
-            const uint64_t budget = head.placement_usable_limit;
             const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
             const uint64_t layer_cost = route_layer_cost(
                 options.n_layer, model_bytes, options.n_head_kv,
                 options.head_dim, options.n_ctx);
-            const bool participating =
-                budget >= 2ull * 1024ull * 1024ull * 1024ull &&
-                head.usable_bytes() >= layer_cost;
+            const head_participation_plan head_plan =
+                plan_head_participation(head, reserve, layer_cost);
+            head.placement_usable_limit = head_plan.budget;
+            const uint64_t budget = head_plan.budget;
+            const bool participating = head_plan.participates;
             if (participating) {
                 replacement_devices.push_back(head);
             }

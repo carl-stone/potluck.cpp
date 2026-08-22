@@ -52,7 +52,7 @@ struct device_probe {
     std::string error;
     uint64_t placement_usable_limit = std::numeric_limits<uint64_t>::max();
 
-    uint64_t usable_bytes() const {
+    uint64_t usable_bytes(uint64_t limit) const {
         constexpr uint64_t mib = 1024ull * 1024ull;
         const uint64_t accel_reserve = std::max<uint64_t>(512ull * mib, profile.total_bytes / 8);
         const uint64_t host_reserve = std::max<uint64_t>(2ull * 1024ull * mib,
@@ -61,9 +61,30 @@ struct device_probe {
             ? profile.free_bytes - accel_reserve : 0;
         const uint64_t host = profile.host_free_bytes > host_reserve
             ? profile.host_free_bytes - host_reserve : 0;
-        return std::min(std::max(accel, host), placement_usable_limit);
+        return std::min(std::max(accel, host), limit);
+    }
+
+    uint64_t usable_bytes() const {
+        return usable_bytes(placement_usable_limit);
     }
 };
+
+struct head_participation_plan {
+    uint64_t budget = 0;
+    bool participates = false;
+};
+
+inline head_participation_plan plan_head_participation(const device_probe & head,
+                                                       uint64_t reserve,
+                                                       uint64_t layer_cost) {
+    const uint64_t budget = head.profile.host_free_bytes > reserve
+        ? head.profile.host_free_bytes - reserve : 0;
+    constexpr uint64_t min_budget = 2ull * 1024ull * 1024ull * 1024ull;
+    return {
+        budget,
+        budget >= min_budget && head.usable_bytes(budget) >= layer_cost,
+    };
+}
 
 enum class worker_kind {
     local,
