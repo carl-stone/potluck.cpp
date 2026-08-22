@@ -26,14 +26,70 @@ fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/potluck-server.XXXXXX")
 SRV=""
+SHUTDOWN_CURL_PID=""
+SHUTDOWN_READER_PID=""
+
+wait_pid_bounded() {
+    local pid="$1"
+    local timeout="$2"
+    local deadline=$((SECONDS + timeout))
+    while kill -0 "${pid}" 2>/dev/null; do
+        if (( SECONDS >= deadline )); then
+            return 124
+        fi
+        sleep 0.1
+    done
+    wait "${pid}" 2>/dev/null
+}
+wait_pid_exit_bounded() {
+    local rc=0
+    wait_pid_bounded "$1" "$2" || rc=$?
+    [[ "${rc}" -ne 124 ]]
+}
+terminate_pid_bounded() {
+    local pid="$1"
+    local timeout="$2"
+    kill "${pid}" 2>/dev/null || true
+    if wait_pid_exit_bounded "${pid}" "${timeout}"; then
+        return 0
+    fi
+    kill -KILL "${pid}" 2>/dev/null || true
+    wait_pid_exit_bounded "${pid}" 5
+}
 stop_server() {
-    if [[ -n "${SRV}" ]]; then
-        kill "${SRV}" 2>/dev/null || true
-        wait "${SRV}" 2>/dev/null || true
+    local server_pid="${SRV}"
+    local worker_pids=""
+    local status=0
+    if [[ -z "${server_pid}" ]]; then
+        return 0
+    fi
+    worker_pids="$(pgrep -P "${server_pid}" -f '[p]otluck-worker' 2>/dev/null || true)"
+    if ! terminate_pid_bounded "${server_pid}" 10; then
+        status=1
+    fi
+    for worker in ${worker_pids}; do
+        if ! wait_pid_exit_bounded "${worker}" 10; then
+            if ! terminate_pid_bounded "${worker}" 5; then
+                status=1
+            fi
+        fi
+    done
+    if (( status != 0 )); then
+        printf 'server or worker did not exit within the bounded shutdown wait\n' >&2
+    else
         SRV=""
     fi
-    pkill -f potluck-wor[k]er 2>/dev/null || true
-    sleep 1
+    return "${status}"
+}
+cleanup_background_requests() {
+    local pid=""
+    for pid in "${SHUTDOWN_CURL_PID}" "${SHUTDOWN_READER_PID}"; do
+        if [[ -n "${pid}" ]]; then
+            terminate_pid_bounded "${pid}" 5 || true
+        fi
+    done
+    SHUTDOWN_CURL_PID=""
+    SHUTDOWN_READER_PID=""
 }
 cleanup() {
     local rc=$?
@@ -41,13 +97,14 @@ cleanup() {
         printf '%s\n' '--- server.log ---' >&2
         cat "${WORK}/server.log" >&2
     fi
-    stop_server
+    cleanup_background_requests || true
+    stop_server || true
     rm -rf "${WORK}" 2>/dev/null || true
     return "${rc}"
 }
 trap cleanup EXIT
 
-"${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --port "${PORT}" \
+"${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 2 --ubatch 1 --port "${PORT}" \
     >"${WORK}/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 120); do
@@ -91,6 +148,29 @@ assert result["choices"][0]["message"]["content"]
 assert result["choices"][0]["finish_reason"] == "stop"
 usage = result["usage"]
 assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+PY
+
+curl -fsS "${auth_header[@]}" \
+    -d '{"messages":[{"role":"user","content":"A short fact about the Moon is"}],"max_tokens":4,"temperature":0,"seed":1,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-a.json" &
+CONCURRENT_A=$!
+curl -fsS "${auth_header[@]}" \
+    -d '{"messages":[{"role":"user","content":"A short fact about Mars is"}],"max_tokens":4,"temperature":1,"seed":2,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-b.json" &
+CONCURRENT_B=$!
+wait "${CONCURRENT_A}"
+wait "${CONCURRENT_B}"
+python3 - "${WORK}/concurrent-a.json" "${WORK}/concurrent-b.json" <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    result = json.load(open(path))
+    assert result["object"] == "chat.completion"
+    choice = result["choices"][0]
+    assert choice["message"]["role"] == "assistant"
+    assert choice["message"]["content"]
+    assert choice["finish_reason"] == "stop"
+    usage = result["usage"]
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 PY
 
 MISSING_STATUS=$(curl -sS -o "${WORK}/missing.json" -w '%{http_code}' \
@@ -144,7 +224,6 @@ python3 - "${WORK}/invalid-stream.json" <<'PY'
 import json, sys
 assert json.load(open(sys.argv[1]))["error"].startswith("invalid stream:")
 PY
-
 NOT_FOUND_STATUS=$(curl -sS -o "${WORK}/not-found.json" -w '%{http_code}' \
     "http://${HOST}:${PORT}/not-found")
 [[ "${NOT_FOUND_STATUS}" == 404 ]]
@@ -162,13 +241,15 @@ python3 - "${HEALTH}" "${N_WORKERS}" <<'PY'
 import json, sys
 health, expected = json.loads(sys.argv[1]), int(sys.argv[2])
 assert health["status"] == "ok"
-assert health["workers"] == expected
+actual = health["workers"]
+assert 1 <= actual <= expected
+assert len(health["slots"]) == 2
 windows = sorted(health["windows"], key=lambda w: w["start"])
 assert windows and windows[0]["start"] == 0
 for previous, current in zip(windows, windows[1:]):
     assert current["start"] == previous["end"]
 assert all(w["start"] < w["end"] for w in windows)
-assert all(0 <= w["owner"] < expected for w in windows)
+assert all(0 <= w["owner"] < actual for w in windows)
 assert [w["index"] for w in windows] == list(range(len(windows)))
 PY
 
@@ -204,7 +285,49 @@ assert chunks and "".join(c.get("content", "") for c in chunks)
 PY
 
 
-stop_server
+SHUTDOWN_PIPE="${WORK}/shutdown.pipe"
+SHUTDOWN_READY="${WORK}/shutdown.ready"
+SHUTDOWN_OUTPUT="${WORK}/shutdown.sse"
+mkfifo "${SHUTDOWN_PIPE}" "${SHUTDOWN_READY}"
+: >"${SHUTDOWN_OUTPUT}"
+(
+    first=1
+    while IFS= read -r line; do
+        printf '%s\n' "${line}" >>"${SHUTDOWN_OUTPUT}"
+        if (( first )); then
+            printf '%s\n' "${line}" >"${SHUTDOWN_READY}"
+            first=0
+        fi
+    done
+) <"${SHUTDOWN_PIPE}" &
+SHUTDOWN_READER_PID=$!
+curl -fsS -N "${auth_header[@]}" -d \
+    '{"messages":[{"role":"user","content":"Write a long sentence about the Moon"}],"max_tokens":64,"stream":true,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${SHUTDOWN_PIPE}" &
+SHUTDOWN_CURL_PID=$!
+SHUTDOWN_FIRST=""
+if ! IFS= read -r -t 30 SHUTDOWN_FIRST <"${SHUTDOWN_READY}"; then
+    printf 'shutdown regression request never became active\n' >&2
+    exit 1
+fi
+if [[ "${SHUTDOWN_FIRST}" != data:* ]]; then
+    printf 'shutdown regression did not receive an SSE event\n' >&2
+    exit 1
+fi
+if ! stop_server; then
+    exit 1
+fi
+if ! wait_pid_exit_bounded "${SHUTDOWN_CURL_PID}" 15; then
+    printf 'streaming request did not exit after server shutdown\n' >&2
+    exit 1
+fi
+SHUTDOWN_CURL_PID=""
+if ! wait_pid_exit_bounded "${SHUTDOWN_READER_PID}" 15; then
+    printf 'shutdown stream reader did not exit\n' >&2
+    exit 1
+fi
+SHUTDOWN_READER_PID=""
+rm -f "${SHUTDOWN_PIPE}" "${SHUTDOWN_READY}" "${SHUTDOWN_OUTPUT}"
 if [[ "${POTLUCK_SKIP_CLI_PARITY:-0}" == 1 ]]; then
     python3 - "${CHAT}" <<'PY'
 import json, sys
