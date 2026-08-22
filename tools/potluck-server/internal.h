@@ -832,6 +832,26 @@ private:
         return true;
     }
 
+    void fail_unfinished_slots(const std::string & error) {
+        std::vector<std::shared_ptr<scheduled_slot>> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending = slots_;
+        }
+        for (const auto & slot : pending) {
+            std::lock_guard<std::mutex> lock(slot->mutex);
+            if (slot->state == slot_state::free || slot->finished) {
+                continue;
+            }
+            slot->cancelled = false;
+            slot->state = slot_state::done;
+            slot->finished = true;
+            slot->error = error.empty() ? "ring recovery exhausted" : error;
+            slot->release_when_finished = false;
+            slot->cv.notify_all();
+        }
+    }
+
     void attempt_rebuild() {
         std::string detail;
         bool rebuilt = false;
@@ -843,6 +863,7 @@ private:
         std::chrono::milliseconds delay(0);
         bool retry = false;
         bool exhausted = false;
+        std::string terminal_error;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (rebuilt) {
@@ -856,6 +877,9 @@ private:
             } else {
                 retry = schedule_rebuild_retry_locked(detail, delay);
                 exhausted = recovery_exhausted_;
+                if (exhausted) {
+                    terminal_error = recovery_error_;
+                }
             }
         }
         if (rebuilt) {
@@ -863,8 +887,10 @@ private:
                         detail.empty() ? "ring is ready" : detail.c_str());
             std::fflush(stdout);
         } else if (exhausted) {
+            fail_unfinished_slots(terminal_error);
             std::fprintf(stderr, "potluck-server: ring rebuild terminal: %s\n",
-                         recovery_error().c_str());
+                         terminal_error.empty() ? "ring recovery exhausted" :
+                                                   terminal_error.c_str());
         } else if (retry) {
             std::fprintf(stderr, "potluck-server: ring rebuild failed; retrying in %lld ms: %s\n",
                          static_cast<long long>(delay.count()),
@@ -872,7 +898,6 @@ private:
         }
         work_cv_.notify_all();
     }
-
     void run() {
         for (;;) {
             std::vector<std::shared_ptr<scheduled_slot>> active;
@@ -899,7 +924,7 @@ private:
                         if (slot->state == slot_state::queued ||
                             slot->state == slot_state::prefill ||
                             slot->state == slot_state::decode ||
-                            slot->state == slot_state::cancelled) {
+                            (slot->state == slot_state::cancelled && !slot->finished)) {
                             return true;
                         }
                     }
@@ -915,7 +940,7 @@ private:
                     if (slot->state == slot_state::queued ||
                         slot->state == slot_state::prefill ||
                         slot->state == slot_state::decode ||
-                        slot->state == slot_state::cancelled) {
+                        (slot->state == slot_state::cancelled && !slot->finished)) {
                         slots_idle = false;
                         break;
                     }
@@ -943,10 +968,12 @@ private:
                             }
                         } else if (slot->state == slot_state::prefill ||
                                    slot->state == slot_state::decode ||
-                                   slot->state == slot_state::cancelled) {
+                                   (slot->state == slot_state::cancelled && !slot->finished)) {
                             active.push_back(slot);
                         }
                     }
+                } else if (recovery_exhausted_) {
+                    waiting_for_rebuild = false;
                 } else {
                     waiting_for_rebuild = true;
                 }
