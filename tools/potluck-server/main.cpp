@@ -324,7 +324,7 @@ int main(int argc, char ** argv) {
         const char * hf_token_env = std::getenv("HF_TOKEN");
         std::string hf_token = hf_token_env == nullptr ? std::string() : hf_token_env;
         bool hf_offline = false;
-        std::string host = "127.0.0.1";
+        std::string host = "0.0.0.0";
         std::string hosts_spec;
         std::string launch;
         std::string head_share = "auto";
