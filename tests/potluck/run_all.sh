@@ -3,6 +3,7 @@
 set -euo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}"
+source "${REPO}/scripts/potluck-safe.sh"
 BIN="${BIN:-${REPO}/build/bin}"
 if [[ -z "${MODEL:-}" ]]; then
     MODEL="$(bash "${REPO}/scripts/fetch-model.sh")"
@@ -20,6 +21,8 @@ for test_bin in test-potluck-discovery test-potluck-protocol test-potluck-transp
         exit 2
     fi
 done
+
+potluck_require_memory_for_model "${MODEL}"
 
 for test_bin in test-potluck-discovery test-potluck-protocol test-potluck-transport; do
     printf '== %s ==\n' "${test_bin}"

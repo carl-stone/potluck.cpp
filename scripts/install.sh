@@ -15,11 +15,12 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "${REPO}/scripts/potluck-safe.sh"
 # shellcheck source=potluck-model.sh
 source "${REPO}/scripts/potluck-model.sh"
 
 prefix="${HOME}/potluck"
-jobs="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+jobs="$(potluck_build_jobs)"
 build_dir="${POTLUCK_BUILD_DIR:-${REPO}/build}"
 build_server=1
 skip_build=0
@@ -62,6 +63,7 @@ if [[ "${skip_build}" != "1" ]]; then
     if [[ "${build_server}" != "1" ]]; then
         server_flag=OFF
     fi
+    potluck_require_disk "${build_dir}" "${POTLUCK_MIN_DISK_GIB:-10}"
     printf 'install: configuring release build in %s\n' "${build_dir}"
     cmake -S "${REPO}" -B "${build_dir}" \
         -DCMAKE_BUILD_TYPE=Release \
@@ -76,7 +78,7 @@ if [[ "${skip_build}" != "1" ]]; then
         targets+=(potluck-server)
     fi
     printf 'install: building %s with %s jobs\n' "${targets[*]}" "${jobs}"
-    cmake --build "${build_dir}" --config Release --parallel "${jobs}" \
+    POTLUCK_BUILD_JOBS="${jobs}" potluck_build "${build_dir}" --config Release \
         --target "${targets[@]}"
 fi
 

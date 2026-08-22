@@ -8,7 +8,7 @@
 # Env:
 #   REPO       checkout to build        (default: this repo)
 #   MODEL_DIR  fixture directory        (default: $REPO/models)
-#   NPROC      parallel build jobs      (default: nproc)
+#   NPROC      parallel build jobs      (default: potluck_build_jobs)
 #   SKIP_BUILD skip configure/build     (set 1 to only fetch model + run tests)
 #
 # Usage: bash setup_and_test_pc.sh [n_predict=32] [host=127.0.0.1]
@@ -17,9 +17,10 @@ set -euo pipefail
 N_PREDICT="${1:-32}"
 HOST="${2:-127.0.0.1}"
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+source "${REPO}/scripts/potluck-safe.sh"
 POTLUCK_MODEL_DIR="${POTLUCK_MODEL_DIR:-${MODEL_DIR:-}}"
 export POTLUCK_MODEL_DIR
-NPROC="${NPROC:-$(nproc 2>/dev/null || echo 4)}"
+NPROC="${NPROC:-$(potluck_build_jobs)}"
 
 for tool in git cmake g++ pkg-config curl; do
     command -v "${tool}" >/dev/null 2>&1 || { echo "missing build tool: ${tool}" >&2; exit 2; }
@@ -31,6 +32,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
         exit 2
     fi
     cd "${REPO}"
+    potluck_require_disk "${REPO}/build" "${POTLUCK_MIN_DISK_GIB:-10}"
 
     echo "== configuring =="
     cmake_opts=(-DCMAKE_BUILD_TYPE=Release -DGGML_CPU=ON -DLLAMA_BUILD_TESTS=ON)
@@ -48,7 +50,8 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     cmake -S . -B build "${cmake_opts[@]}" >/tmp/potluck_pc_cmake.log 2>&1 || {
         tail -20 /tmp/potluck_pc_cmake.log >&2; exit 2; }
     echo "== building (${NPROC} jobs) =="
-    cmake --build build --target potluck-node potluck-worker potluck-server potluck-shard llama-cli test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run -j "${NPROC}" \
+    POTLUCK_BUILD_JOBS="${NPROC}" potluck_build "${REPO}/build" \
+        --target potluck-node potluck-worker potluck-server potluck-shard llama-cli test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run \
         >/tmp/potluck_pc_build.log 2>&1 || {
         tail -20 /tmp/potluck_pc_build.log >&2; exit 2; }
     echo "build ok"
