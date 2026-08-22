@@ -380,6 +380,86 @@ Do not call the trusted-LAN assumption a security implementation; API keys,
 TLS, worker authentication, encryption, and privacy controls remain unfinished.
 
 
+## 7.1 Proposed security architecture (OPEN QUESTION)
+
+This is a proposed design for explicit user acceptance. It is not an accepted
+ADR, implementation authorization, or claim that security is present. Until
+accepted and implemented, the trusted-LAN warning above remains in force.
+
+### Threat boundary and default exposure
+
+- The boundary is a trusted LAN plus the existing SSH host and user trust. A
+  device admitted by discovery and SSH is trusted to run Potluck code. This
+  proposal does not protect a compromised head, worker, SSH account, or host OS.
+- The HTTP service binds to all interfaces by default (`0.0.0.0`) as the
+  accepted household-device usability default. `--host` can restrict it to
+  loopback or another explicit address. Startup must state the bound address
+  and that LAN clients can connect.
+- `--api-key` is optional. When set, require `Authorization: Bearer <value>`
+  for API requests, compare without timing leaks, and never write the value to
+  logs or persistent model or config files. Without it, trusted-LAN use stays
+  unauthenticated.
+- `--cors-origin` should accept an exact allowed origin. When omitted, send no
+  CORS allow-origin header; do not use `*` as a default. CORS is not
+  authentication.
+- Proposed endpoint policy: all routes, including `/health` and `/v1/models`,
+  require the key whenever one is configured.
+
+### Direct-ring credential proposal
+
+- Before launching workers, the head generates an ephemeral ZeroMQ CURVE
+  keypair for every selected ring peer in the session. The head keeps the
+  session credential set in memory only; it is not read from a model, config,
+  or key file.
+- The head passes each worker its own secret key and the public keys of its
+  adjacent peers through the existing authenticated SSH worker launch channel,
+  before that worker joins the ring. Secrets must not appear in shell
+  arguments, process listings, logs, readiness output, model files, or
+  persistent worker files.
+- Each direct adjacent-peer ZeroMQ connection uses CURVE peer authentication:
+  the receiver is configured with its own server keypair and the sender is
+  configured with its own client keypair plus the expected receiver public key.
+  The head configures credentials but does not relay ring data.
+- Missing or mismatched credentials fail closed. There is no unauthenticated
+  ZeroMQ fallback, alternate transport, or bypass for local workers.
+
+### Key lifecycle and failure behavior
+
+- A credential generation covers one ring topology. Startup and every topology
+  rebuild generate a fresh set, close sockets from the old generation, and
+  reject stale keys. Recovery obtains fresh credentials through SSH before
+  reconnecting a worker.
+- The head never persists private keys. Workers keep only their assigned
+  private key in process memory and erase it on clean shutdown; logs and error
+  paths must redact all key material.
+- An SSH bootstrap failure, peer authentication failure, or key-generation
+  failure excludes the affected peer and leaves the ring in a rebuilding or
+  security-bootstrap-failed health state. A non-streaming in-flight request
+  fails with a retryable error. A streaming request emits a terminal SSE error,
+  and the client must discard any partial output before retrying.
+- CURVE protects ring traffic from unauthenticated LAN peers, but it does not
+  make a compromised admitted host trustworthy. The HTTP API key is a bearer
+  credential and does not encrypt HTTP traffic; public-Internet exposure
+  remains prohibited.
+
+### Choices requiring explicit acceptance
+
+The following choices are still open; the proposed defaults above are not
+accepted decisions:
+
+1. **Endpoint coverage**: should `/health` stay available without a key for
+   remote orchestration, or should every route require it? Proposed default:
+   every route requires a configured key.
+2. **CORS shape**: one exact origin versus multiple origins, and whether
+   credentialed browser requests are needed. Proposed default: one exact
+   origin, no wildcard, and no credentialed CORS.
+3. **SSH bootstrap carrier**: one-shot SSH stdin versus another SSH-confidential
+   handoff. Proposed default: a one-shot bootstrap record before daemonization;
+   command-line and persistent-file handoff are prohibited.
+4. **HTTP encryption**: whether TLS belongs in this baseline or a later
+   accepted decision. Proposed default: trusted-LAN HTTP has no built-in TLS;
+   non-loopback deployment must not be treated as Internet-safe without TLS.
+
 ## 8. Model and backend scope
 
 The distributed graph currently targets the Qwen3.5 dense `qwen35` path.
