@@ -37,6 +37,8 @@ potluck_build_lock() {
         printf '%s\n' "${BASHPID:-$$}" > "${lock_dir}/pid"
         POTLUCK_ACTIVE_BUILD_LOCK="${lock_dir}"
         export POTLUCK_ACTIVE_BUILD_LOCK
+        POTLUCK_ACTIVE_BUILD_OWNER="${BASHPID:-$$}"
+        export POTLUCK_ACTIVE_BUILD_OWNER
         return
     fi
 
@@ -57,17 +59,15 @@ potluck_build_lock() {
     rm -rf "${stale_dir}"
     POTLUCK_ACTIVE_BUILD_LOCK="${lock_dir}"
     export POTLUCK_ACTIVE_BUILD_LOCK
+    POTLUCK_ACTIVE_BUILD_OWNER="${BASHPID:-$$}"
+    export POTLUCK_ACTIVE_BUILD_OWNER
 }
 
 potluck_build_unlock() {
     local lock_dir="${POTLUCK_ACTIVE_BUILD_LOCK:-}"
-    local owner
     [[ -n "${lock_dir}" ]] || return 0
-    owner="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
-    if [[ "${owner}" == "${BASHPID:-$$}" ]]; then
-        rm -rf "${lock_dir}"
-    fi
-    unset POTLUCK_ACTIVE_BUILD_LOCK
+    rm -rf "${lock_dir}"
+    unset POTLUCK_ACTIVE_BUILD_LOCK POTLUCK_ACTIVE_BUILD_OWNER
 }
 
 potluck_require_disk() {
@@ -127,11 +127,13 @@ potluck_require_memory_for_model() {
 potluck_build() (
     local build_dir="$1"
     shift
-    local jobs
+    local jobs status=0
     jobs="$(potluck_build_jobs)" || exit
     potluck_require_disk "${build_dir}" "${POTLUCK_MIN_DISK_GIB:-10}" || exit
     potluck_build_lock || exit
     trap potluck_build_unlock EXIT
     trap 'exit 1' HUP INT TERM
-    cmake --build "${build_dir}" --parallel "${jobs}" "$@"
+    cmake --build "${build_dir}" --parallel "${jobs}" "$@" || status=$?
+    potluck_build_unlock
+    exit "${status}"
 )
