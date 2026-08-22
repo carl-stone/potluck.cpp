@@ -21,6 +21,7 @@ enum class message_type : uint16_t {
     // One ring pass decodes many sequence positions.
     batch_decode = 9,
     batch_result = 10,
+    slot_config = 11,
     error = 255,
 };
 
@@ -94,30 +95,49 @@ struct accel_profile {
     accel_kind kind = accel_kind::none;
     uint64_t free_bytes = 0;
     uint64_t total_bytes = 0;
+    uint64_t host_free_bytes = 0;
+    uint64_t host_total_bytes = 0;
 };
 
 bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & out);
 bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & profile,
                           std::string & error);
 
+struct slot_config {
+    int32_t seq = 0;
+    float temp = 0.0f;
+    float top_p = 0.0f;
+    uint32_t top_k = 0;
+    uint32_t seed = 0;
+};
+
+bool encode_slot_config(const slot_config & config, std::vector<uint8_t> & out);
+bool decode_slot_config(const uint8_t * data, size_t size, slot_config & config,
+                        std::string & error);
+
 
 // Serialize a node schedule into a message payload.
 bool encode_config(const node_config & config, std::vector<uint8_t> & out);
 bool decode_config(const uint8_t * data, size_t size, node_config & config, std::string & error);
 
+
 // A batch carries positions and sequence ids plus tokens or hidden states.
-// clear resets KV, trim_to truncates it, and n_logits selects trailing output rows.
+// clear_seq clears one sequence (-2 clears all, -1 clears none); trim_to
+// truncates trim_seq when non-negative, and n_logits selects trailing rows.
+// A non-empty clear_seq batch may have zero entries for clear-only cleanup.
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
                           const std::vector<int32_t> & tokens,
                           const float * hidden, size_t n_embd,
-                          int32_t clear, int32_t trim_to, uint32_t n_logits,
+                          int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
+                          uint32_t n_logits,
                           std::vector<uint8_t> & out);
 
 // Decode a batch payload into tokens (n_embd == 0) or hidden states
 // (n_embd == this stage's embedding width). Returns false on any mismatch.
 bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
-                          int32_t & clear, int32_t & trim_to, uint32_t & n_logits,
+                          int32_t & clear_seq, int32_t & trim_seq, int32_t & trim_to,
+                          uint32_t & n_logits,
                           std::vector<int32_t> & pos,
                           std::vector<int32_t> & seq,
                           std::vector<int32_t> & tokens,

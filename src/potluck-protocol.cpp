@@ -21,7 +21,7 @@ void append_u64(std::vector<uint8_t> & out, uint64_t value) {
 
 
 bool read_u32(const uint8_t * data, size_t size, size_t & offset, uint32_t & value, std::string & error) {
-    if (offset > size || size - offset < 4) {
+    if (data == nullptr || offset > size || size - offset < 4) {
         error = "truncated u32";
         return false;
     }
@@ -34,7 +34,7 @@ bool read_u32(const uint8_t * data, size_t size, size_t & offset, uint32_t & val
 }
 
 bool read_u64(const uint8_t * data, size_t size, size_t & offset, uint64_t & value, std::string & error) {
-    if (offset > size || size - offset < 8) {
+    if (data == nullptr || offset > size || size - offset < 8) {
         error = "truncated u64";
         return false;
     }
@@ -230,7 +230,7 @@ bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
 }
 
 bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & out) {
-    constexpr uint32_t profile_magic = 0x31504145; // "EAP1"
+    constexpr uint32_t profile_magic = 0x32504145; // "EAP2"
     if (static_cast<uint32_t>(profile.kind) > static_cast<uint32_t>(accel_kind::other)) {
         return false;
     }
@@ -240,23 +240,28 @@ bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & 
     out.push_back(static_cast<uint8_t>(profile.kind));
     append_u64(out, profile.free_bytes);
     append_u64(out, profile.total_bytes);
+    append_u64(out, profile.host_free_bytes);
+    append_u64(out, profile.host_total_bytes);
     return true;
 }
 
 bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & profile,
                           std::string & error) {
-    constexpr uint32_t profile_magic = 0x31504145; // "EAP1"
-    constexpr size_t profile_bytes = 25;
+    constexpr uint32_t profile_magic = 0x32504145; // "EAP2"
+    constexpr size_t profile_bytes = 41;
     profile = accel_profile{};
+    error.clear();
+    if (size != profile_bytes) {
+        error = "accelerator profile size mismatch";
+        return false;
+    }
     size_t offset = 0;
     uint32_t magic = 0;
     uint32_t rank = 0;
     uint64_t free_bytes = 0;
     uint64_t total_bytes = 0;
-    if (size != profile_bytes) {
-        error = "accelerator profile size mismatch";
-        return false;
-    }
+    uint64_t host_free_bytes = 0;
+    uint64_t host_total_bytes = 0;
     if (!read_u32(data, size, offset, magic, error)) {
         return false;
     }
@@ -267,19 +272,85 @@ bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & pro
     if (!read_u32(data, size, offset, rank, error)) {
         return false;
     }
+    if (data == nullptr || offset >= size) {
+        error = "truncated accelerator profile kind";
+        return false;
+    }
     const uint8_t kind = data[offset++];
     if (kind > static_cast<uint8_t>(accel_kind::other)) {
         error = "unknown accelerator kind";
         return false;
     }
     if (!read_u64(data, size, offset, free_bytes, error) ||
-        !read_u64(data, size, offset, total_bytes, error)) {
+        !read_u64(data, size, offset, total_bytes, error) ||
+        !read_u64(data, size, offset, host_free_bytes, error) ||
+        !read_u64(data, size, offset, host_total_bytes, error)) {
+        return false;
+    }
+    if (offset != size) {
+        error = "accelerator profile size mismatch";
         return false;
     }
     profile.rank = rank;
     profile.kind = static_cast<accel_kind>(kind);
     profile.free_bytes = free_bytes;
     profile.total_bytes = total_bytes;
+    profile.host_free_bytes = host_free_bytes;
+    profile.host_total_bytes = host_total_bytes;
+    return true;
+}
+bool encode_slot_config(const slot_config & config, std::vector<uint8_t> & out) {
+    constexpr uint32_t slot_magic = 0x31544c53; // "SLT1"
+    if (config.seq < 0) {
+        return false;
+    }
+    out.clear();
+    out.reserve(24);
+    append_u32(out, slot_magic);
+    append_u32(out, static_cast<uint32_t>(config.seq));
+    append_f32(out, config.temp);
+    append_f32(out, config.top_p);
+    append_u32(out, config.top_k);
+    append_u32(out, config.seed);
+    return true;
+}
+
+bool decode_slot_config(const uint8_t * data, size_t size, slot_config & config,
+                        std::string & error) {
+    constexpr uint32_t slot_magic = 0x31544c53; // "SLT1"
+    constexpr size_t slot_bytes = 24;
+    config = slot_config{};
+    error.clear();
+    if (size != slot_bytes) {
+        error = "slot config size mismatch";
+        return false;
+    }
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint32_t raw_seq = 0;
+    if (!read_u32(data, size, offset, magic, error) ||
+        !read_u32(data, size, offset, raw_seq, error)) {
+        return false;
+    }
+    if (magic != slot_magic) {
+        error = "invalid slot config magic";
+        return false;
+    }
+    config.seq = static_cast<int32_t>(raw_seq);
+    if (config.seq < 0 ||
+        !read_f32(data, size, offset, config.temp, error) ||
+        !read_f32(data, size, offset, config.top_p, error) ||
+        !read_u32(data, size, offset, config.top_k, error) ||
+        !read_u32(data, size, offset, config.seed, error)) {
+        if (config.seq < 0) {
+            error = "invalid slot config sequence";
+        }
+        return false;
+    }
+    if (offset != size) {
+        error = "slot config size mismatch";
+        return false;
+    }
     return true;
 }
 
@@ -288,25 +359,47 @@ bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
                           const std::vector<int32_t> & tokens,
                           const float * hidden, size_t n_embd,
-                          int32_t clear, int32_t trim_to, uint32_t n_logits,
+                          int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
+                          uint32_t n_logits,
                           std::vector<uint8_t> & out) {
     const bool has_tokens = !tokens.empty();
     const bool has_hidden = hidden != nullptr && n_embd > 0;
-    if (has_tokens == has_hidden) {
-        return false; // exactly one data array must be provided
-    }
-    const size_t n = pos.size();
-    if (n == 0 || seq.size() != n || n_logits > n) {
+    const bool clear_only = pos.empty() && seq.empty() && tokens.empty() &&
+        !has_hidden && clear_seq != -1 && trim_seq == -1 && trim_to == -1 &&
+        n_logits == 0;
+    if ((!clear_only && has_tokens == has_hidden) ||
+        (!clear_only && (pos.empty() || seq.size() != pos.size() ||
+                         n_logits > pos.size() ||
+                         (has_tokens && tokens.size() != pos.size()))) ||
+        (clear_only && (clear_seq < -2 || clear_seq == -1)) ||
+        clear_seq < -2 || trim_seq < -1 || trim_to < -1 ||
+        (trim_to >= 0 && trim_seq < 0)) {
         return false;
     }
-    const size_t n_data = has_tokens ? n : n * n_embd;
-    if (n_data > (max_payload_bytes / 4)) {
+    const size_t n = pos.size();
+    if (n > (max_payload_bytes - 20) / 8) {
+        return false;
+    }
+    size_t n_data = 0;
+    if (clear_only) {
+        n_data = 0;
+    } else if (has_tokens) {
+        n_data = n;
+    } else {
+        if (n_embd > max_payload_bytes / sizeof(float) ||
+            n > max_payload_bytes / (sizeof(float) * n_embd)) {
+            return false;
+        }
+        n_data = n * n_embd;
+    }
+    if (n_data > (max_payload_bytes - 20 - 8 * n) / sizeof(float)) {
         return false;
     }
     out.clear();
-    out.reserve(16 + 8 * n + 4 * n_data);
+    out.reserve(20 + 8 * n + sizeof(float) * n_data);
     append_u32(out, static_cast<uint32_t>(n));
-    append_u32(out, static_cast<uint32_t>(clear));
+    append_u32(out, static_cast<uint32_t>(clear_seq));
+    append_u32(out, static_cast<uint32_t>(trim_seq));
     append_u32(out, static_cast<uint32_t>(trim_to));
     append_u32(out, n_logits);
     for (int32_t v : pos) {
@@ -327,7 +420,8 @@ bool encode_batch_payload(const std::vector<int32_t> & pos,
 }
 
 bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
-                          int32_t & clear, int32_t & trim_to, uint32_t & n_logits,
+                          int32_t & clear_seq, int32_t & trim_seq, int32_t & trim_to,
+                          uint32_t & n_logits,
                           std::vector<int32_t> & pos,
                           std::vector<int32_t> & seq,
                           std::vector<int32_t> & tokens,
@@ -337,28 +431,55 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
     seq.clear();
     tokens.clear();
     hidden.clear();
-    clear = 0;
+    clear_seq = -1;
+    trim_seq = -1;
     trim_to = -1;
     n_logits = 0;
-    size_t offset = 0;
-    uint32_t n = 0;
-    if (!read_u32(data, size, offset, n, error) || n == 0) {
+    error.clear();
+    if (data == nullptr || size > max_payload_bytes || size < 20) {
+        error = "batch payload size mismatch";
         return false;
     }
-    const size_t n_entries = n;
-    uint32_t raw_clear = 0;
-    uint32_t raw_trim = 0;
-    if (!read_u32(data, size, offset, raw_clear, error) ||
-        !read_u32(data, size, offset, raw_trim, error) ||
+    size_t offset = 0;
+    uint32_t n = 0;
+    uint32_t raw_clear_seq = 0;
+    uint32_t raw_trim_seq = 0;
+    uint32_t raw_trim_to = 0;
+    if (!read_u32(data, size, offset, n, error)) {
+        return false;
+    }
+    if (!read_u32(data, size, offset, raw_clear_seq, error) ||
+        !read_u32(data, size, offset, raw_trim_seq, error) ||
+        !read_u32(data, size, offset, raw_trim_to, error) ||
         !read_u32(data, size, offset, n_logits, error)) {
         return false;
     }
-    if (n_logits > n_entries) {
-        error = "batch n_logits exceeds entry count";
+    const size_t n_entries = n;
+    clear_seq = static_cast<int32_t>(raw_clear_seq);
+    trim_seq = static_cast<int32_t>(raw_trim_seq);
+    trim_to = static_cast<int32_t>(raw_trim_to);
+    if (clear_seq < -2 || trim_seq < -1 || trim_to < -1 ||
+        (trim_to >= 0 && trim_seq < 0)) {
+        error = "invalid batch clear or trim controls";
         return false;
     }
-    clear = static_cast<int32_t>(raw_clear);
-    trim_to = static_cast<int32_t>(raw_trim);
+    if (n == 0) {
+        if (clear_seq == -1 || trim_seq != -1 || trim_to != -1 || n_logits != 0 ||
+            offset != size) {
+            error = "invalid clear-only batch";
+            return false;
+        }
+        return true;
+    }
+    if (n_logits > n_entries || n_entries > (max_payload_bytes - 20) / 8) {
+        error = "invalid batch entry count";
+        return false;
+    }
+    const size_t fixed_bytes = 20 + 8 * n_entries;
+    if (size < fixed_bytes) {
+        error = "truncated batch entries";
+        return false;
+    }
     pos.resize(n_entries);
     seq.resize(n_entries);
     for (size_t i = 0; i < n_entries; ++i) {
@@ -376,8 +497,14 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
         seq[i] = static_cast<int32_t>(v);
     }
     const size_t data_bytes = size - offset;
+    size_t expected_bytes = 0;
     if (n_embd == 0) {
-        if (data_bytes != n_entries * sizeof(int32_t)) {
+        if (n_entries > max_payload_bytes / sizeof(int32_t)) {
+            error = "batch token payload size mismatch";
+            return false;
+        }
+        expected_bytes = n_entries * sizeof(int32_t);
+        if (data_bytes != expected_bytes) {
             error = "batch token payload size mismatch";
             return false;
         }
@@ -390,14 +517,21 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
             tokens[i] = static_cast<int32_t>(v);
         }
     } else {
-        if (data_bytes != n_entries * n_embd * sizeof(float)) {
+        if (n_embd > max_payload_bytes / sizeof(float) ||
+            n_entries > max_payload_bytes / (sizeof(float) * n_embd)) {
+            error = "batch hidden payload size mismatch";
+            return false;
+        }
+        expected_bytes = n_entries * n_embd * sizeof(float);
+        if (data_bytes != expected_bytes) {
             error = "batch hidden payload size mismatch";
             return false;
         }
         hidden.resize(n_entries * n_embd);
         std::memcpy(hidden.data(), data + offset, data_bytes);
+        offset += data_bytes;
     }
-    return true;
+    return offset == size;
 }
 
 } // namespace potluck

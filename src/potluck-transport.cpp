@@ -2,9 +2,9 @@
 
 #include <zmq.h>
 
-#include <array>
 #include <cerrno>
 #include <cstring>
+#include <array>
 #include <utility>
 #include <vector>
 
@@ -147,6 +147,7 @@ bool valid_message_type(uint16_t type) {
         case message_type::profile_result:
         case message_type::batch_decode:
         case message_type::batch_result:
+        case message_type::slot_config:
         case message_type::error:
             return true;
     }
@@ -554,7 +555,6 @@ bool ring_sender::send(const message & input, std::string & error) {
     const void * payload = input.payload.empty() ? nullptr : input.payload.data();
     return send_frame(socket_, payload, input.payload.size(), 0, "send payload frame", error);
 }
-
 ring_peer ring_peer::bind(const std::string & local_endpoint, std::string & error) {
     error.clear();
     ring_peer result;

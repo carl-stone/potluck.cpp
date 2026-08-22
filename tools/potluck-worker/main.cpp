@@ -415,32 +415,47 @@ int main(int argc, char ** argv) {
                 std::vector<int32_t> sequences;
                 std::vector<int32_t> tokens;
                 std::vector<float> hidden;
-                int32_t clear = 0;
+                int32_t clear_seq = -1;
+                int32_t trim_seq = -1;
                 int32_t trim_to = -1;
                 uint32_t n_logits = 0;
                 const size_t n_embd_hint = from_head ? 0 : stage.n_embd;
                 if (!potluck::decode_batch_payload(message.payload.data(), message.payload.size(),
-                                                   n_embd_hint, clear, trim_to, n_logits,
-                                                   positions, sequences, tokens, hidden, error)) {
+                                                   n_embd_hint, clear_seq, trim_seq, trim_to,
+                                                   n_logits, positions, sequences, tokens, hidden, error)) {
                     fail("invalid batch payload at window " + std::to_string(window_index) +
                          ": " + error);
                 }
-                if (positions.empty() || sequences.size() != positions.size() ||
-                    (from_head ? tokens.size() != positions.size()
-                               : hidden.size() != positions.size() * stage.n_embd)) {
+                if ((!positions.empty() &&
+                     (sequences.size() != positions.size() ||
+                      (from_head ? tokens.size() != positions.size()
+                                 : hidden.size() != positions.size() * stage.n_embd))) ||
+                    (positions.empty() && clear_seq == -1)) {
                     fail("invalid batch entry count at window " + std::to_string(window_index));
                 }
                 if (n_logits > positions.size()) {
                     fail("batch logits count exceeds entries at window " +
                          std::to_string(window_index));
                 }
-                if (clear != 0) {
-                    clear_stage(stage);
-                } else if (trim_to >= 0) {
-                    (void) llama_memory_seq_rm(llama_get_memory(stage.ctx), 0, trim_to, -1);
+                llama_memory_t memory = llama_get_memory(stage.ctx);
+                if (clear_seq == -2) {
+                    llama_memory_clear(memory, true);
+                } else if (clear_seq >= 0) {
+                    (void) llama_memory_seq_rm(memory, clear_seq, -1, -1);
+                }
+                if (trim_to >= 0) {
+                    (void) llama_memory_seq_rm(memory, trim_seq, trim_to, -1);
                 }
 
-                const uint32_t n_entries = static_cast<uint32_t>(positions.size());
+                if (positions.empty()) {
+                    output.type = potluck::message_type::batch_result;
+                    output.dtype = potluck::data_type::i32;
+                    if (!potluck::encode_batch_payload({}, {}, {}, nullptr, 0,
+                                                       clear_seq, trim_seq, trim_to, 0, output.payload)) {
+                        fail("cannot encode control batch at window " + std::to_string(window_index));
+                    }
+                } else {
+                    const uint32_t n_entries = static_cast<uint32_t>(positions.size());
                 int decode_rc;
                 if (from_head) {
                     decode_rc = potluck::stage_decode_tokens_batch(
@@ -470,7 +485,7 @@ int main(int argc, char ** argv) {
                     }
                     output.dtype = potluck::data_type::i32;
                     if (!potluck::encode_batch_payload(positions, sequences, results, nullptr, 0,
-                                                       clear, trim_to, n_logits, output.payload)) {
+                                                       clear_seq, trim_seq, trim_to, n_logits, output.payload)) {
                         fail("cannot encode token batch at window " + std::to_string(window_index));
                     }
                 } else {
@@ -487,9 +502,10 @@ int main(int argc, char ** argv) {
                     output.dtype = potluck::data_type::f32;
                     if (!potluck::encode_batch_payload(positions, sequences, std::vector<int32_t>{},
                                                        output_hidden.data(), stage.n_embd,
-                                                       clear, trim_to, n_logits, output.payload)) {
+                                                       clear_seq, trim_seq, trim_to, n_logits, output.payload)) {
                         fail("cannot encode hidden batch at window " + std::to_string(window_index));
                     }
+                }
                 }
             } else {
                 if (first_window && message.type != potluck::message_type::token) {

@@ -540,7 +540,8 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
                                  const std::vector<int32_t> & positions,
                                  const std::vector<int32_t> & sequences,
                                  const std::vector<int32_t> & tokens,
-                                 int32_t clear, int32_t trim_to, uint32_t n_logits,
+                                 int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
+                                 uint32_t n_logits,
                                  serve_stats * stats = nullptr) {
     if (positions.empty() || positions.size() != sequences.size() || positions.size() != tokens.size()) {
         throw std::runtime_error("invalid batch dimensions");
@@ -551,7 +552,7 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
     input.rank = 0;
     input.sequence = static_cast<uint64_t>(positions.back());
     if (!potluck::encode_batch_payload(positions, sequences, tokens, nullptr, 0,
-                                       clear, trim_to, n_logits, input.payload)) {
+                                       clear_seq, trim_seq, trim_to, n_logits, input.payload)) {
         throw std::runtime_error("cannot encode ring batch");
     }
     if (stats != nullptr) {
@@ -575,10 +576,10 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
     }
     std::vector<int32_t> result_positions, result_sequences, result_tokens;
     std::vector<float> result_hidden;
-    int32_t ignored_clear = 0, ignored_trim = -1;
+    int32_t ignored_clear = -1, ignored_trim_seq = -1, ignored_trim = -1;
     uint32_t ignored_logits = 0;
     if (!potluck::decode_batch_payload(output.payload.data(), output.payload.size(), 0,
-                                       ignored_clear, ignored_trim, ignored_logits,
+                                       ignored_clear, ignored_trim_seq, ignored_trim, ignored_logits,
                                        result_positions, result_sequences, result_tokens,
                                        result_hidden, ring.error)) {
         throw std::runtime_error("cannot decode ring result: " + ring.error);
@@ -635,7 +636,7 @@ std::vector<llama_token> serve(ServerRing & ring, const llama_vocab * vocab,
         tokens[i] = static_cast<int32_t>(prompt[i]);
     }
     const auto prefill_start = std::chrono::steady_clock::now();
-    (void) drive_batch(ring, positions, sequences, tokens, 1, -1, 1, stats);
+    (void) drive_batch(ring, positions, sequences, tokens, -2, -1, -1, 1, stats);
     if (stats != nullptr) {
         stats->prefill_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - prefill_start).count();
@@ -648,7 +649,7 @@ std::vector<llama_token> serve(ServerRing & ring, const llama_vocab * vocab,
     for (uint32_t i = 0; i < n_predict; ++i) {
         const auto decode_start = std::chrono::steady_clock::now();
         const std::vector<int32_t> result = drive_batch(ring,
-            { static_cast<int32_t>(position) }, { 0 }, { static_cast<int32_t>(previous) }, 0, -1, 1, stats);
+            { static_cast<int32_t>(position) }, { 0 }, { static_cast<int32_t>(previous) }, -1, -1, -1, 1, stats);
         if (stats != nullptr) {
             stats->decode_seconds += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - decode_start).count();
