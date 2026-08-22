@@ -434,38 +434,115 @@ expert, diagnostic, compatibility, or fallback modes.
 
 ## 10. Product release gate
 
-Potluck can ship only when named end-to-end checks prove all of the following
-through one server process:
+Potluck can ship only when all ten named end-to-end checks below have their
+pass conditions observed through one server process. No release result is
+claimed here: each check is marked UNPROVEN until its complete scenario is
+observed. Resource costs are planning estimates for supervised acceptance.
 
-1. The head discovers and profiles the available computers without manual
-   workers, ranks, bounds, or weights.
-2. The scheduler selects devices and assigns repeated ring windows from
-   measured heterogeneous capability and current resource pressure.
-3. Head computation preserves an explicit user reserve and adapts when the
-   user's CPU, memory, or accelerator use changes.
-4. Every request uses direct peer-to-peer piped-ring execution over ZeroMQ; the
-   head does not relay unowned windows, and no static or alternate distributed
-   execution or transport path exists in the product.
-5. Workers load only their assigned layer windows from a full GGUF. The
-   controller may distribute the complete source file without loading it as
-   the worker model.
-6. Per-window prefetch and per-device CPU/CUDA/Metal placement operate in the
-   ring scheduler.
-7. Multiple conversation slots retain isolated state and cache affinity.
-8. Continuous batching serves concurrent streaming requests without global
-   429 serialization.
-9. Ordinary OpenAI-compatible clients can use the head endpoint with the
-   documented fields, errors, usage, streaming, and cancellation behavior.
-10. A restart reuses valid model files and placement data, while device or
-    resource changes cause a clear automatic re-profile and topology result.
+1. **RG-01 - Automatic discovery and admission**
+   - Scenario: Start one `potluck-server` with no worker, rank, bound, or
+     weight configuration and at least two discoverable candidates, including
+     one candidate that is unreachable or lacks required capacity. Submit a
+     client request through the head.
+   - Pass condition: The server probes and profiles candidates, excludes the
+     unsuitable candidate, forms an admitted topology, and completes the
+     request without manual topology input.
+   - Resource cost: Medium - multiple discovered devices and one inference run.
+   - Evidence status: UNPROVEN.
+
+2. **RG-02 - Heterogeneous window placement**
+   - Scenario: Run the same server with admitted peers that have deliberately
+     different measured compute, memory, accelerator, and network capacity.
+     Submit a request that traverses more than one ring window.
+   - Pass condition: The observed route assigns repeated disjoint windows from
+     those measurements and current pressure, with no equal split or manual
+     weights, and the request completes through the route.
+   - Resource cost: Large - heterogeneous peers and a multi-window model run.
+   - Evidence status: UNPROVEN.
+
+3. **RG-03 - Adaptive head reserve**
+   - Scenario: While the head owns ring work and serves a request, apply and
+     remove controlled CPU, memory, or accelerator load on the head.
+   - Pass condition: Live topology or placement evidence shows head-owned work
+     shrinking or being removed under load and returning only when the explicit
+     user reserve is safe, without an unsafe or hung request.
+   - Resource cost: Large - sustained inference plus supervised host load.
+   - Evidence status: UNPROVEN.
+
+4. **RG-04 - Direct ZeroMQ ring**
+   - Scenario: Start a three-peer server and submit a request that crosses
+     windows while observing the server topology and peer connection records.
+   - Pass condition: Adjacent peers exchange request state directly over
+     ZeroMQ, the head handles ingress and the final result but does not relay
+     unowned windows, and no static or alternate transport path is used.
+   - Resource cost: Large - three peers and a captured multi-window request.
+   - Evidence status: UNPROVEN.
+
+5. **RG-05 - Assigned-window shard loading**
+   - Scenario: Make a full GGUF available for controller distribution, start
+     the multi-peer server, and submit a request through the head.
+   - Pass condition: Each worker reports loading only tensors for its assigned
+     layer windows and completes the request; no worker loads the complete
+     model, even if the controller distributes the source file.
+   - Resource cost: Large - model distribution, disk space, and memory checks.
+   - Evidence status: UNPROVEN.
+
+6. **RG-06 - Window prefetch and accelerator placement**
+   - Scenario: Run a multi-window request across peers with CPU, CUDA, and
+     Metal capabilities for at least two ring cycles.
+   - Pass condition: The integrated route records an independent backend choice
+     for each device and window, and each worker records prefetch of its next
+     assigned window before that window's compute, without whole-file prefetch.
+   - Resource cost: Large - heterogeneous accelerators and a repeated ring run.
+   - Evidence status: UNPROVEN.
+
+7. **RG-07 - Conversation slot affinity**
+   - Scenario: Interleave multi-turn requests for two independent
+     conversations through one head endpoint while both conversations remain
+     active.
+   - Pass condition: Each follow-up retains only its own prior context, keeps
+     affinity to its assigned slot and cache, and completes without state
+     leakage or cross-conversation output.
+   - Resource cost: Medium - two active conversations and several turns.
+   - Evidence status: UNPROVEN.
+
+8. **RG-08 - Concurrent streaming batch**
+   - Scenario: Open two concurrent streaming requests with different prompt
+     lengths and overlapping decode work through one head endpoint.
+   - Pass condition: Both streams produce interleaved progress through the same
+     ring batch and finish normally, with no global 429 serialization or one
+     stream blocking the other.
+   - Resource cost: Large - two concurrent streams and a multi-window run.
+   - Evidence status: UNPROVEN.
+
+9. **RG-09 - OpenAI client contract**
+   - Scenario: Use an ordinary OpenAI-compatible client against the head for
+     non-streaming and streaming chat/completion requests, documented sampling
+     and stop fields, an invalid request, and a cancelled request.
+   - Pass condition: Responses, usage, streaming termination, cancellation,
+     and error status/body match the documented contract; unsupported fields
+     are rejected rather than silently ignored.
+   - Resource cost: Medium - stock client session and one server run.
+   - Evidence status: UNPROVEN.
+
+10. **RG-10 - Restart and topology recovery**
+    - Scenario: Complete a request, restart the server with valid model files
+      and placement data still present, then remove or add a peer or change
+      its available resources and submit another request.
+    - Pass condition: Restart reuses valid files and placement data, the server
+      automatically re-profiles the changed topology, records the new result,
+      and serves the next request without manual configuration or a hang.
+    - Resource cost: Large - restart plus supervised device or resource change.
+    - Evidence status: UNPROVEN.
 
 Component checks, a standalone ring CLI, a static server, or a manual cluster
 cannot satisfy this gate.
 
 ## 11. Definition of "regular local inference server"
 
-Potluck is a regular local inference server only when the complete release gate
-above passes. In particular, named checks must cover:
+Potluck is a regular local inference server only when all ten named checks
+above have observed their pass conditions. This is not a claim that any check
+currently passes. In particular, named checks must cover:
 
 1. two isolated multi-turn conversations with cache affinity;
 2. concurrent streaming through continuous ring batching;
