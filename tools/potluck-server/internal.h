@@ -248,7 +248,8 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
                                  serve_stats * stats = nullptr,
                                  std::function<bool()> should_cancel = {},
                                  bool * batch_started = nullptr,
-                                 std::function<bool(std::string &)> heartbeat = {});
+                                 std::function<bool(std::string &)> heartbeat = {},
+                                 potluck::batch_logprobs * result_logprobs = nullptr);
 
 std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab, const std::string & text);
 std::string token_piece(const llama_vocab * vocab, llama_token token);
@@ -303,7 +304,9 @@ struct scheduled_slot {
     std::string id;
     uint64_t created = 0;
     std::deque<std::string> pieces;
+    std::deque<std::vector<potluck::token_logprob>> piece_logprobs;
     std::vector<llama_token> generated;
+    std::vector<std::vector<potluck::token_logprob>> generated_logprobs;
     std::string error;
     bool finished = false;
     bool cancelled = false;
@@ -423,6 +426,8 @@ public:
             slot->id = id;
             slot->created = created;
             slot->pieces.clear();
+            slot->piece_logprobs.clear();
+            slot->generated_logprobs.clear();
             slot->error.clear();
             slot->finished = false;
             slot->cancelled = false;
@@ -459,7 +464,8 @@ public:
         });
     }
 
-    bool take_piece(const std::shared_ptr<scheduled_slot> & slot, std::string & piece) {
+    bool take_piece(const std::shared_ptr<scheduled_slot> & slot, std::string & piece,
+                    std::vector<potluck::token_logprob> * logprobs = nullptr) {
         std::unique_lock<std::mutex> lock(slot->mutex);
         slot->cv.wait(lock, [&] {
             return slot->cancelled || !slot->pieces.empty() || slot->finished;
@@ -467,6 +473,16 @@ public:
         if (!slot->pieces.empty()) {
             piece = std::move(slot->pieces.front());
             slot->pieces.pop_front();
+            if (logprobs != nullptr) {
+                if (!slot->piece_logprobs.empty()) {
+                    *logprobs = std::move(slot->piece_logprobs.front());
+                    slot->piece_logprobs.pop_front();
+                } else {
+                    logprobs->clear();
+                }
+            } else if (!slot->piece_logprobs.empty()) {
+                slot->piece_logprobs.pop_front();
+            }
             return true;
         }
         return false;
@@ -490,6 +506,8 @@ public:
             std::lock_guard<std::mutex> lock(slot->mutex);
             slot->prompt.clear();
             slot->pieces.clear();
+            slot->piece_logprobs.clear();
+            slot->generated_logprobs.clear();
             slot->generated.clear();
             slot->n_decoded = 0;
             slot->cancelled = false;
@@ -511,6 +529,10 @@ public:
             });
         }
         return output;
+    }
+    size_t slot_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return slots_.size();
     }
 
     bool is_stopping() const {
@@ -545,14 +567,17 @@ private:
     }
 
     void emit(const std::shared_ptr<scheduled_slot> & slot, llama_token token,
-              uint32_t position) {
+              uint32_t position,
+              const std::vector<potluck::token_logprob> & logprobs = {}) {
         std::lock_guard<std::mutex> lock(slot->mutex);
         if (slot->cancelled) {
             return;
         }
         if (!llama_vocab_is_eog(vocab_, token)) {
             slot->generated.push_back(token);
+            slot->generated_logprobs.push_back(logprobs);
             slot->pieces.push_back(token_piece(vocab_, token));
+            slot->piece_logprobs.push_back(logprobs);
             ++slot->n_decoded;
         }
         slot->last = token;
@@ -732,10 +757,11 @@ private:
             work_cv_.notify_all();
         };
         std::vector<int32_t> result;
+        potluck::batch_logprobs result_logprobs;
         try {
             result = drive_batch(
                 ring_, positions, sequences, tokens, clear_seq, -1, -1, n_logits,
-                nullptr, batch_cancelled, &batch_started, heartbeat_);
+                nullptr, batch_cancelled, &batch_started, heartbeat_, &result_logprobs);
         } catch (const request_cancelled &) {
             if (batch_started) {
                 fail_selected();
@@ -783,14 +809,20 @@ private:
             }
         }
         const size_t result_start = items.size() - n_logits;
+        const auto logprobs_at = [&](size_t index)
+            -> const std::vector<potluck::token_logprob> & {
+            static const std::vector<potluck::token_logprob> empty;
+            return result_logprobs.size() == n_logits ? result_logprobs[index] : empty;
+        };
         for (size_t i = 0; i < decode.size(); ++i) {
             emit(decode[i].slot, static_cast<llama_token>(result[result_start + i]),
-                 static_cast<uint32_t>(decode[i].position));
+                 static_cast<uint32_t>(decode[i].position), logprobs_at(i));
         }
         for (size_t i = 0; i < prefill_logits.size(); ++i) {
             emit(prefill_logits[i].slot,
                  static_cast<llama_token>(result[result_start + decode.size() + i]),
-                 static_cast<uint32_t>(prefill_logits[i].position));
+                 static_cast<uint32_t>(prefill_logits[i].position),
+                 logprobs_at(decode.size() + i));
         }
         for (const auto & slot : cancelled) {
             std::lock_guard<std::mutex> lock(slot->mutex);

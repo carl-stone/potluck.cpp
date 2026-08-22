@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -231,12 +232,23 @@ int main() {
         CHECK(!potluck::decode_accel_profile(nullptr, payload.size(), actual, error));
         CHECK(error == "truncated u32");
     }
-
     {
-        const potluck::slot_config expected = {2, 1.25f, 0.85f, 40, 17};
+        potluck::slot_config expected;
+        expected.seq = 2;
+        expected.temp = 1.25f;
+        expected.top_p = 0.85f;
+        expected.top_k = 40;
+        expected.seed = 17;
+        expected.min_p = 0.1f;
+        expected.presence_penalty = 0.2f;
+        expected.frequency_penalty = 0.3f;
+        expected.repeat_penalty = 1.1f;
+        expected.penalty_last_n = 32;
+        expected.logprobs = true;
+        expected.top_logprobs = 5;
         std::vector<uint8_t> payload;
         CHECK(potluck::encode_slot_config(expected, payload));
-        CHECK(payload.size() == 24);
+        CHECK(payload.size() == 52);
         potluck::slot_config actual;
         CHECK(potluck::decode_slot_config(payload.data(), payload.size(), actual, error));
         CHECK(actual.seq == expected.seq);
@@ -244,6 +256,15 @@ int main() {
         CHECK(actual.top_p == expected.top_p);
         CHECK(actual.top_k == expected.top_k);
         CHECK(actual.seed == expected.seed);
+        CHECK(actual.min_p == expected.min_p);
+        CHECK(actual.presence_penalty == expected.presence_penalty);
+        CHECK(actual.frequency_penalty == expected.frequency_penalty);
+        CHECK(actual.repeat_penalty == expected.repeat_penalty);
+        CHECK(actual.penalty_last_n == expected.penalty_last_n);
+        CHECK(actual.logprobs == expected.logprobs);
+        CHECK(actual.top_logprobs == expected.top_logprobs);
+
+
         payload.push_back(0);
         CHECK(!potluck::decode_slot_config(payload.data(), payload.size(), actual, error));
         CHECK(error == "slot config size mismatch");
@@ -252,6 +273,9 @@ int main() {
         CHECK(!potluck::decode_slot_config(payload.data(), payload.size(), actual, error));
         CHECK(error == "invalid slot config magic");
         CHECK(!potluck::encode_slot_config({-1, 1.0f, 1.0f, 0, 0}, payload));
+        CHECK(!potluck::encode_slot_config(
+            potluck::slot_config{0, 1.0f, 1.0f, 0, 0, 1.1f, 0.0f, 0.0f, 1.0f, 64, false, 0},
+            payload));
         CHECK(potluck::encode_slot_config(expected, payload));
         payload[4] = 0xff;
         payload[5] = 0xff;
@@ -259,6 +283,28 @@ int main() {
         payload[7] = 0xff;
         CHECK(!potluck::decode_slot_config(payload.data(), payload.size(), actual, error));
         CHECK(error == "invalid slot config sequence");
+    }
+
+    {
+        const potluck::batch_logprobs expected = {
+            {{1, -0.5f}, {2, -1.25f}},
+            {}
+        };
+        std::vector<uint8_t> payload;
+        CHECK(potluck::encode_batch_logprobs(expected, payload));
+        potluck::batch_logprobs actual;
+        CHECK(potluck::decode_batch_logprobs(payload.data(), payload.size(), actual, error));
+        CHECK(actual.size() == expected.size());
+        CHECK(actual[0].size() == 2);
+        CHECK(actual[0][0].token == 1);
+        CHECK(actual[0][0].logprob == -0.5f);
+        CHECK(actual[0][1].token == 2);
+        CHECK(actual[1].empty());
+        payload.push_back(0);
+        CHECK(!potluck::decode_batch_logprobs(payload.data(), payload.size(), actual, error));
+        CHECK(error == "batch logprobs size mismatch");
+        const potluck::batch_logprobs invalid = {{{1, std::numeric_limits<float>::quiet_NaN()}}};
+        CHECK(!potluck::encode_batch_logprobs(invalid, payload));
     }
 
     {

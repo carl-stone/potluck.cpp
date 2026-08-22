@@ -94,6 +94,14 @@ int main() {
     potluck::message received_ack;
     CHECK(moved.receive(received_ack, error));
     check_equal(received_ack, heartbeat_ack);
+    potluck::message logprob_result = sent;
+    logprob_result.type = potluck::message_type::batch_result_logprobs;
+    logprob_result.dtype = potluck::data_type::i32;
+    logprob_result.shape = { logprob_result.payload.size() };
+    CHECK(moved.send(logprob_result, error));
+    potluck::message received_logprob_result;
+    CHECK(right.receive(received_logprob_result, error));
+    check_equal(received_logprob_result, logprob_result);
 
     potluck::message oversized_metadata = sent;
     oversized_metadata.shape.assign(potluck::ring_max_shape_dims + 1, 1);

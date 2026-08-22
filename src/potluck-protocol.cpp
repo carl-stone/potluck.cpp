@@ -1,7 +1,9 @@
 #include "potluck-protocol.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
-
+#include <utility>
 namespace potluck {
 namespace {
 
@@ -301,24 +303,38 @@ bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & pro
 }
 bool encode_slot_config(const slot_config & config, std::vector<uint8_t> & out) {
     constexpr uint32_t slot_magic = 0x31544c53; // "SLT1"
-    if (config.seq < 0) {
+    if (config.seq < 0 || !std::isfinite(config.temp) || config.temp < 0.0f ||
+        !std::isfinite(config.top_p) || config.top_p < 0.0f || config.top_p > 1.0f ||
+        !std::isfinite(config.min_p) || config.min_p < 0.0f || config.min_p > 1.0f ||
+        !std::isfinite(config.presence_penalty) ||
+        !std::isfinite(config.frequency_penalty) ||
+        !std::isfinite(config.repeat_penalty) || config.repeat_penalty <= 0.0f ||
+        config.penalty_last_n < -1 ||
+        (config.top_logprobs != 0 && !config.logprobs)) {
         return false;
     }
     out.clear();
-    out.reserve(24);
+    out.reserve(52);
     append_u32(out, slot_magic);
     append_u32(out, static_cast<uint32_t>(config.seq));
     append_f32(out, config.temp);
     append_f32(out, config.top_p);
     append_u32(out, config.top_k);
     append_u32(out, config.seed);
+    append_f32(out, config.min_p);
+    append_f32(out, config.presence_penalty);
+    append_f32(out, config.frequency_penalty);
+    append_f32(out, config.repeat_penalty);
+    append_u32(out, static_cast<uint32_t>(config.penalty_last_n));
+    append_u32(out, config.logprobs ? 1u : 0u);
+    append_u32(out, config.top_logprobs);
     return true;
 }
 
 bool decode_slot_config(const uint8_t * data, size_t size, slot_config & config,
                         std::string & error) {
     constexpr uint32_t slot_magic = 0x31544c53; // "SLT1"
-    constexpr size_t slot_bytes = 24;
+    constexpr size_t slot_bytes = 52;
     config = slot_config{};
     error.clear();
     if (size != slot_bytes) {
@@ -337,23 +353,124 @@ bool decode_slot_config(const uint8_t * data, size_t size, slot_config & config,
         return false;
     }
     config.seq = static_cast<int32_t>(raw_seq);
+    uint32_t raw_penalty_last_n = 0;
+    uint32_t raw_logprobs = 0;
     if (config.seq < 0 ||
         !read_f32(data, size, offset, config.temp, error) ||
         !read_f32(data, size, offset, config.top_p, error) ||
         !read_u32(data, size, offset, config.top_k, error) ||
-        !read_u32(data, size, offset, config.seed, error)) {
+        !read_u32(data, size, offset, config.seed, error) ||
+        !read_f32(data, size, offset, config.min_p, error) ||
+        !read_f32(data, size, offset, config.presence_penalty, error) ||
+        !read_f32(data, size, offset, config.frequency_penalty, error) ||
+        !read_f32(data, size, offset, config.repeat_penalty, error) ||
+        !read_u32(data, size, offset, raw_penalty_last_n, error) ||
+        !read_u32(data, size, offset, raw_logprobs, error) ||
+        !read_u32(data, size, offset, config.top_logprobs, error)) {
         if (config.seq < 0) {
             error = "invalid slot config sequence";
         }
         return false;
     }
+    config.penalty_last_n = static_cast<int32_t>(raw_penalty_last_n);
+    if (raw_logprobs > 1 ||
+        !std::isfinite(config.temp) || config.temp < 0.0f ||
+        !std::isfinite(config.top_p) || config.top_p < 0.0f || config.top_p > 1.0f ||
+        !std::isfinite(config.min_p) || config.min_p < 0.0f || config.min_p > 1.0f ||
+        !std::isfinite(config.presence_penalty) ||
+        !std::isfinite(config.frequency_penalty) ||
+        !std::isfinite(config.repeat_penalty) || config.repeat_penalty <= 0.0f ||
+        config.penalty_last_n < -1 ||
+        (raw_logprobs == 0 && config.top_logprobs != 0)) {
+        error = "invalid slot sampler parameters";
+        return false;
+    }
+    config.logprobs = raw_logprobs != 0;
     if (offset != size) {
         error = "slot config size mismatch";
         return false;
     }
     return true;
 }
+bool encode_batch_logprobs(const batch_logprobs & values, std::vector<uint8_t> & out) {
+    constexpr uint32_t logprob_magic = 0x3142504c; // "LPB1"
+    if (values.size() > UINT32_MAX) {
+        return false;
+    }
+    size_t bytes = 8;
+    for (const auto & entry : values) {
+        if (entry.size() > (max_payload_bytes - bytes - 4) / 8) {
+            return false;
+        }
+        bytes += 4 + entry.size() * 8;
+        for (const token_logprob & value : entry) {
+            if (!std::isfinite(value.logprob)) {
+                return false;
+            }
+        }
+    }
+    out.clear();
+    out.reserve(bytes);
+    append_u32(out, logprob_magic);
+    append_u32(out, static_cast<uint32_t>(values.size()));
+    for (const auto & entry : values) {
+        append_u32(out, static_cast<uint32_t>(entry.size()));
+        for (const token_logprob & value : entry) {
+            append_u32(out, static_cast<uint32_t>(value.token));
+            append_f32(out, value.logprob);
+        }
+    }
+    return true;
+}
 
+bool decode_batch_logprobs(const uint8_t * data, size_t size, batch_logprobs & values,
+                           std::string & error) {
+    constexpr uint32_t logprob_magic = 0x3142504c; // "LPB1"
+    values.clear();
+    error.clear();
+    size_t offset = 0;
+    uint32_t magic = 0;
+    uint32_t count = 0;
+    if (!read_u32(data, size, offset, magic, error) ||
+        !read_u32(data, size, offset, count, error)) {
+        return false;
+    }
+    if (magic != logprob_magic || count > max_payload_bytes / 8) {
+        error = "invalid batch logprobs header";
+        return false;
+    }
+    values.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t n = 0;
+        if (!read_u32(data, size, offset, n, error) ||
+            offset > size || n > (size - offset) / 8) {
+            error = "invalid batch logprobs count";
+            return false;
+        }
+        std::vector<token_logprob> entry;
+        entry.reserve(n);
+        for (uint32_t j = 0; j < n; ++j) {
+            uint32_t raw_token = 0;
+            token_logprob value;
+            if (!read_u32(data, size, offset, raw_token, error) ||
+                !read_f32(data, size, offset, value.logprob, error)) {
+                return false;
+            }
+            if (!std::isfinite(value.logprob)) {
+                error = "invalid batch logprob value";
+                return false;
+            }
+            value.token = static_cast<int32_t>(raw_token);
+            entry.push_back(value);
+        }
+        values.push_back(std::move(entry));
+    }
+    if (offset != size) {
+        error = "batch logprobs size mismatch";
+        return false;
+    }
+    return true;
+}
 
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
@@ -445,10 +562,8 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
     uint32_t raw_clear_seq = 0;
     uint32_t raw_trim_seq = 0;
     uint32_t raw_trim_to = 0;
-    if (!read_u32(data, size, offset, n, error)) {
-        return false;
-    }
-    if (!read_u32(data, size, offset, raw_clear_seq, error) ||
+    if (!read_u32(data, size, offset, n, error) ||
+        !read_u32(data, size, offset, raw_clear_seq, error) ||
         !read_u32(data, size, offset, raw_trim_seq, error) ||
         !read_u32(data, size, offset, raw_trim_to, error) ||
         !read_u32(data, size, offset, n_logits, error)) {

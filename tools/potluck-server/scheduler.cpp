@@ -26,7 +26,11 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
                                  serve_stats * stats,
                                  std::function<bool()> should_cancel,
                                  bool * batch_started,
-                                 std::function<bool(std::string &)> heartbeat) {
+                                 std::function<bool(std::string &)> heartbeat,
+                                 potluck::batch_logprobs * result_logprobs) {
+    if (result_logprobs != nullptr) {
+        result_logprobs->clear();
+    }
     if (batch_started != nullptr) {
         *batch_started = false;
     }
@@ -131,23 +135,45 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
     if (stats != nullptr) {
         stats->head_payload_bytes += output.payload.size();
     }
-    if (output.type != potluck::message_type::batch_result) {
+    const bool has_logprobs =
+        output.type == potluck::message_type::batch_result_logprobs;
+    if (!has_logprobs && output.type != potluck::message_type::batch_result) {
         throw std::runtime_error("unexpected ring result message");
     }
     if (output.flags != ring.windows.size()) {
         throw std::runtime_error("ring result stopped before completing its route");
     }
+    size_t base_payload_size = output.payload.size();
+    if (has_logprobs) {
+        if (output.shape.size() != 1 || output.shape[0] > output.payload.size()) {
+            throw std::runtime_error("ring result has invalid logprob metadata");
+        }
+        base_payload_size = static_cast<size_t>(output.shape[0]);
+    }
     std::vector<int32_t> result_positions, result_sequences, result_tokens;
     std::vector<float> result_hidden;
     int32_t ignored_clear = -1, ignored_trim_seq = -1, ignored_trim = -1;
     uint32_t ignored_logits = 0;
-    if (!potluck::decode_batch_payload(output.payload.data(), output.payload.size(), 0,
+    if (!potluck::decode_batch_payload(output.payload.data(), base_payload_size, 0,
                                        ignored_clear, ignored_trim_seq, ignored_trim, ignored_logits,
                                        result_positions, result_sequences, result_tokens,
                                        result_hidden, ring.error)) {
         throw std::runtime_error("cannot decode ring result: " + ring.error);
     }
-    if (result_positions != positions || result_sequences != sequences || result_tokens.size() != positions.size()) {
+    if (has_logprobs) {
+        potluck::batch_logprobs decoded;
+        if (!potluck::decode_batch_logprobs(
+                output.payload.data() + base_payload_size,
+                output.payload.size() - base_payload_size, decoded, ring.error) ||
+            decoded.size() != ignored_logits) {
+            throw std::runtime_error("cannot decode ring result logprobs: " + ring.error);
+        }
+        if (result_logprobs != nullptr) {
+            *result_logprobs = std::move(decoded);
+        }
+    }
+    if (result_positions != positions || result_sequences != sequences ||
+        result_tokens.size() != positions.size()) {
         throw std::runtime_error("ring result entries do not match the request");
     }
     return result_tokens;

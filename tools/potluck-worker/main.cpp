@@ -6,6 +6,7 @@
 #include "llama-model.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -22,6 +23,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -111,18 +113,32 @@ bool probe_local_accel(potluck::accel_profile & out, std::string & error) {
     }
     return true;
 }
-llama_sampler * make_sampler(const potluck::slot_config & config, std::string & error) {
+llama_sampler * make_sampler(const potluck::slot_config & config, uint32_t n_vocab,
+                             std::string & error) {
     if (!std::isfinite(config.temp) || config.temp < 0.0f ||
         !std::isfinite(config.top_p) || config.top_p < 0.0f ||
-        config.top_p > 1.0f) {
-        error = "slot sampler has invalid temperature or top_p";
+        config.top_p > 1.0f || !std::isfinite(config.min_p) ||
+        config.min_p < 0.0f || config.min_p > 1.0f ||
+        !std::isfinite(config.presence_penalty) ||
+        !std::isfinite(config.frequency_penalty) ||
+        !std::isfinite(config.repeat_penalty) || config.repeat_penalty <= 0.0f ||
+        config.penalty_last_n < -1 ||
+        (config.top_logprobs != 0 && !config.logprobs)) {
+        error = "slot sampler has invalid sampling parameters";
         return nullptr;
     }
-    if (config.temp == 0.0f) {
+    if (config.top_k > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+        n_vocab > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        error = "slot sampler top_k or vocabulary is too large";
         return nullptr;
     }
-    if (config.top_k > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
-        error = "slot sampler top_k is too large";
+    const bool has_penalties =
+        config.presence_penalty != 0.0f || config.frequency_penalty != 0.0f ||
+        config.repeat_penalty != 1.0f;
+    const bool has_filters =
+        config.top_k > 0 || (config.top_p > 0.0f && config.top_p < 1.0f) ||
+        config.min_p > 0.0f || has_penalties;
+    if (config.temp == 0.0f && !has_filters) {
         return nullptr;
     }
     llama_sampler_chain_params params = llama_sampler_chain_default_params();
@@ -140,6 +156,14 @@ llama_sampler * make_sampler(const potluck::slot_config & config, std::string & 
         llama_sampler_chain_add(chain, sampler);
         return true;
     };
+    if (has_penalties &&
+        !add(llama_sampler_init_penalties(static_cast<int32_t>(n_vocab),
+                                          config.penalty_last_n,
+                                          config.repeat_penalty,
+                                          config.frequency_penalty,
+                                          config.presence_penalty))) {
+        return nullptr;
+    }
     if (config.top_k > 0 && !add(llama_sampler_init_top_k(static_cast<int32_t>(config.top_k)))) {
         return nullptr;
     }
@@ -147,13 +171,110 @@ llama_sampler * make_sampler(const potluck::slot_config & config, std::string & 
         !add(llama_sampler_init_top_p(config.top_p, 1))) {
         return nullptr;
     }
-    if (!add(llama_sampler_init_temp(config.temp))) {
+    if (config.min_p > 0.0f && !add(llama_sampler_init_min_p(config.min_p, 1))) {
         return nullptr;
     }
-    if (!add(llama_sampler_init_dist(config.seed))) {
+    if (config.temp > 0.0f) {
+        if (!add(llama_sampler_init_temp(config.temp)) ||
+            !add(llama_sampler_init_dist(config.seed))) {
+            return nullptr;
+        }
+    } else if (!add(llama_sampler_init_greedy())) {
         return nullptr;
     }
     return chain;
+}
+
+std::vector<potluck::token_logprob> make_logprobs(
+        llama_context * context, int32_t index, const float * logits,
+        uint32_t n_vocab, const potluck::slot_config & config, llama_token sampled) {
+    if (!config.logprobs || logits == nullptr || n_vocab == 0) {
+        return {};
+    }
+    const float * sampled_probs = llama_get_sampled_probs_ith(context, index);
+    llama_token * sampled_tokens = llama_get_sampled_candidates_ith(context, index);
+    const uint32_t sampled_count = std::min(
+        llama_get_sampled_probs_count_ith(context, index),
+        llama_get_sampled_candidates_count_ith(context, index));
+    if (sampled_probs != nullptr && sampled_tokens != nullptr && sampled_count != 0) {
+        std::vector<potluck::token_logprob> result;
+        const size_t keep = std::max<size_t>(1, config.top_logprobs);
+        result.reserve(std::min<size_t>(sampled_count, keep) + 1);
+        for (uint32_t i = 0; i < sampled_count && result.size() < keep; ++i) {
+            const float probability = sampled_probs[i];
+            if (probability > 0.0f && std::isfinite(probability)) {
+                result.push_back({ static_cast<int32_t>(sampled_tokens[i]),
+                                   std::log(probability) });
+            }
+        }
+        if (result.empty()) {
+            return {};
+        }
+        bool selected_present = false;
+        for (const auto & item : result) {
+            selected_present = selected_present || item.token == sampled;
+        }
+        if (!selected_present) {
+            for (uint32_t i = 0; i < sampled_count; ++i) {
+                if (sampled_tokens[i] == sampled && sampled_probs[i] > 0.0f &&
+                    std::isfinite(sampled_probs[i])) {
+                    result.push_back({ static_cast<int32_t>(sampled),
+                                       std::log(sampled_probs[i]) });
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    struct candidate {
+        llama_token token;
+        float logprob;
+    };
+    std::vector<candidate> candidates;
+    candidates.reserve(n_vocab);
+    float max_logit = -std::numeric_limits<float>::infinity();
+    for (uint32_t token = 0; token < n_vocab; ++token) {
+        max_logit = std::max(max_logit, logits[token]);
+    }
+    double normalizer = 0.0;
+    for (uint32_t token = 0; token < n_vocab; ++token) {
+        if (!std::isfinite(logits[token])) {
+            continue;
+        }
+        const double weight = std::exp(static_cast<double>(logits[token] - max_logit));
+        normalizer += weight;
+        candidates.push_back({ static_cast<llama_token>(token), static_cast<float>(weight) });
+    }
+    if (normalizer <= 0.0 || candidates.empty()) {
+        return {};
+    }
+    for (auto & item : candidates) {
+        item.logprob = static_cast<float>(std::log(static_cast<double>(item.logprob) / normalizer));
+    }
+    const size_t keep = std::max<size_t>(1, config.top_logprobs);
+    const size_t limit = std::min(keep, candidates.size());
+    std::partial_sort(candidates.begin(), candidates.begin() + limit, candidates.end(),
+                      [](const candidate & lhs, const candidate & rhs) {
+                          return lhs.logprob > rhs.logprob;
+                      });
+    std::vector<potluck::token_logprob> result;
+    result.reserve(limit + 1);
+    bool selected_present = false;
+    for (size_t i = 0; i < limit; ++i) {
+        result.push_back({ static_cast<int32_t>(candidates[i].token), candidates[i].logprob });
+        selected_present = selected_present || candidates[i].token == sampled;
+    }
+    if (!selected_present) {
+        const auto found = std::find_if(candidates.begin() + limit, candidates.end(),
+                                         [sampled](const candidate & item) {
+                                             return item.token == sampled;
+                                         });
+        if (found != candidates.end()) {
+            result.push_back({ static_cast<int32_t>(found->token), found->logprob });
+        }
+    }
+    return result;
 }
 
 
@@ -181,6 +302,7 @@ void append_error_payload(potluck::message & message, const std::string & text) 
 int main(int argc, char ** argv) {
     std::vector<potluck::stage_model> stages;
     std::unordered_map<int32_t, llama_sampler *> samplers;
+    std::unordered_map<int32_t, potluck::slot_config> sampler_configs;
     bool backend_initialized = false;
     uint32_t launch_rank = 0;
     potluck::ring_peer peer;
@@ -203,6 +325,7 @@ int main(int argc, char ** argv) {
             }
         }
         samplers.clear();
+        sampler_configs.clear();
         for (potluck::stage_model & stage : stages) {
             potluck::stage_free(stage);
         }
@@ -523,7 +646,8 @@ int main(int argc, char ** argv) {
                 if (static_cast<uint32_t>(slot.seq) >= n_seq_max) {
                     fail("slot config sequence exceeds configured slots");
                 }
-                llama_sampler * replacement = make_sampler(slot, error);
+                llama_sampler * replacement =
+                    make_sampler(slot, stages[window_index].n_vocab, error);
                 if (!error.empty()) {
                     fail(error);
                 }
@@ -532,6 +656,7 @@ int main(int argc, char ** argv) {
                     llama_sampler_free(existing->second);
                     samplers.erase(existing);
                 }
+                sampler_configs[slot.seq] = slot;
                 if (replacement != nullptr) {
                     samplers.emplace(slot.seq, replacement);
                 }
@@ -654,9 +779,10 @@ int main(int argc, char ** argv) {
                     fail("batch decode failed at window " + std::to_string(window_index));
                 }
 
-                output.type = potluck::message_type::batch_result;
                 if (tail) {
                     std::vector<int32_t> results(n_entries, 0);
+                    potluck::batch_logprobs output_logprobs(n_logits);
+                    bool want_logprobs = false;
                     for (uint32_t i = n_entries - n_logits; i < n_entries; ++i) {
                         const float * logits = llama_get_logits_ith(stage.ctx, static_cast<int32_t>(i));
                         if (logits == nullptr) {
@@ -664,17 +790,43 @@ int main(int argc, char ** argv) {
                                  std::to_string(window_index));
                         }
                         const auto sampler = samplers.find(sequences[i]);
-                        results[i] = sampler == samplers.end()
-                            ? potluck::argmax_token(logits, stage.n_vocab)
-                            : static_cast<int32_t>(
-                                  llama_sampler_sample(sampler->second, stage.ctx,
-                                                       static_cast<int32_t>(i)));
+                        const auto config_it = sampler_configs.find(sequences[i]);
+                        const potluck::slot_config sampling =
+                            config_it == sampler_configs.end()
+                                ? potluck::slot_config{}
+                                : config_it->second;
+                        const llama_token sampled = sampler == samplers.end()
+                            ? static_cast<llama_token>(potluck::argmax_token(logits, stage.n_vocab))
+                            : llama_sampler_sample(sampler->second, stage.ctx,
+                                                   static_cast<int32_t>(i));
+                        results[i] = static_cast<int32_t>(sampled);
+                        if (sampling.logprobs) {
+                            want_logprobs = true;
+                            output_logprobs[i - (n_entries - n_logits)] =
+                                make_logprobs(stage.ctx, static_cast<int32_t>(i), logits,
+                                              stage.n_vocab, sampling, sampled);
+                        }
+                        if (sampler != samplers.end()) {
+                            llama_sampler_accept(sampler->second, sampled);
+                        }
                     }
+                    output.type = want_logprobs
+                        ? potluck::message_type::batch_result_logprobs
+                        : potluck::message_type::batch_result;
                     output.dtype = potluck::data_type::i32;
                     if (!potluck::encode_batch_payload(positions, sequences, results, nullptr, 0,
                                                        clear_seq, trim_seq, trim_to, n_logits,
                                                        output.payload)) {
                         fail("cannot encode token batch at window " + std::to_string(window_index));
+                    }
+                    if (want_logprobs) {
+                        std::vector<uint8_t> metadata;
+                        if (!potluck::encode_batch_logprobs(output_logprobs, metadata)) {
+                            fail("cannot encode token logprobs at window " +
+                                 std::to_string(window_index));
+                        }
+                        output.shape = { output.payload.size() };
+                        output.payload.insert(output.payload.end(), metadata.begin(), metadata.end());
                     }
                 } else {
                     const size_t hidden_width = static_cast<size_t>(stage.n_embd);

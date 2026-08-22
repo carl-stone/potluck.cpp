@@ -25,14 +25,15 @@ enum class message_type : uint16_t {
     // Control liveness uses the sequence as a nonce and never enters the data path.
     heartbeat = 12,
     heartbeat_ack = 13,
-    error = 255,
+    batch_result_logprobs = 14,
+    error = 255
 };
 
 enum class data_type : uint16_t {
     none = 0,
     f32 = 1,
     f16 = 2,
-    i32 = 3,
+    i32 = 3
 };
 
 struct message {
@@ -69,6 +70,15 @@ struct node_config {
     float top_p = 0.0f;
     std::vector<ring_window> windows;
 };
+
+// A sampled token and the log probability reported for it.
+struct token_logprob {
+    int32_t token = 0;
+    float logprob = 0.0f;
+};
+
+using batch_logprobs = std::vector<std::vector<token_logprob>>;
+
 // Metrics returned by a live worker benchmark.
 struct worker_bench_metrics {
     uint32_t index = 0;
@@ -112,11 +122,22 @@ struct slot_config {
     float top_p = 0.0f;
     uint32_t top_k = 0;
     uint32_t seed = 0;
+    float min_p = 0.0f;
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
+    float repeat_penalty = 1.0f;
+    int32_t penalty_last_n = 64;
+    bool logprobs = false;
+    uint32_t top_logprobs = 0;
 };
 
 bool encode_slot_config(const slot_config & config, std::vector<uint8_t> & out);
 bool decode_slot_config(const uint8_t * data, size_t size, slot_config & config,
                         std::string & error);
+
+bool encode_batch_logprobs(const batch_logprobs & values, std::vector<uint8_t> & out);
+bool decode_batch_logprobs(const uint8_t * data, size_t size, batch_logprobs & values,
+                           std::string & error);
 
 
 // Serialize a node schedule into a message payload.
