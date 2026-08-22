@@ -66,14 +66,21 @@ namespace {
     std::fflush(nullptr);
     std::_Exit(1); // startup failures skip the known ggml-metal teardown assert
 }
-volatile sig_atomic_t signal_wakeup_fd = -1;
+std::atomic<int> signal_wakeup_fd{-1};
+std::atomic<unsigned> signal_wakeup_active{0};
+static_assert(std::atomic<int>::is_always_lock_free,
+              "signal wakeup fd atomic must be lock-free");
+static_assert(std::atomic<unsigned>::is_always_lock_free,
+              "signal wakeup state atomic must be lock-free");
 
 void signal_wakeup_handler(int) {
-    const int fd = static_cast<int>(signal_wakeup_fd);
+    signal_wakeup_active.fetch_add(1, std::memory_order_relaxed);
+    const int fd = signal_wakeup_fd.load(std::memory_order_relaxed);
     if (fd >= 0) {
         const char byte = 1;
         (void) ::write(fd, &byte, sizeof(byte));
     }
+    signal_wakeup_active.fetch_sub(1, std::memory_order_relaxed);
 }
 
 class server_signal_wakeup {
@@ -86,8 +93,7 @@ public:
         try {
             set_cloexec(pipe_[0]);
             set_cloexec(pipe_[1]);
-            set_nonblocking(pipe_[1]);
-            signal_wakeup_fd = pipe_[1];
+            signal_wakeup_fd.store(pipe_[1], std::memory_order_relaxed);
             install(SIGINT, old_int_, int_installed_);
             install(SIGTERM, old_term_, term_installed_);
             waiter_ = std::thread([this] { wait_for_signal(); });
@@ -162,21 +168,27 @@ private:
             (void) ::sigaction(SIGINT, &old_int_, nullptr);
             int_installed_ = false;
         }
-        signal_wakeup_fd = -1;
     }
 
     void close() noexcept {
+        signal_wakeup_fd.store(-1, std::memory_order_relaxed);
         restore_signals();
-        if (waiter_.joinable()) {
+        if (waiter_.joinable() && pipe_[1] >= 0) {
             const char byte = 0;
             (void) ::write(pipe_[1], &byte, sizeof(byte));
             waiter_.join();
+        }
+        while (signal_wakeup_active.load(std::memory_order_relaxed) != 0) {
+            std::this_thread::yield();
         }
         if (pipe_[0] >= 0) {
             (void) ::close(pipe_[0]);
             pipe_[0] = -1;
         }
-        pipe_[1] = -1;
+        if (pipe_[1] >= 0) {
+            (void) ::close(pipe_[1]);
+            pipe_[1] = -1;
+        }
     }
 
 
@@ -3413,6 +3425,13 @@ int main(int argc, char ** argv) {
             session.workers.clear();
             llama_model_free(meta);
         };
+        bool shutdown_done = false;
+        const auto shutdown_once = [&]() {
+            if (!shutdown_done) {
+                shutdown_done = true;
+                shutdown();
+            }
+        };
         bool listen_ok = false;
         try {
             if (server.bind_to_port(host.c_str(), http_port)) {
@@ -3420,13 +3439,20 @@ int main(int argc, char ** argv) {
                     scheduler.request_stop();
                     server.stop();
                 });
-                listen_ok = server.listen_after_bind();
+                try {
+                    listen_ok = server.listen_after_bind();
+                } catch (...) {
+                    shutdown_once();
+                    throw;
+                }
+                shutdown_once();
+            } else {
+                shutdown_once();
             }
         } catch (...) {
-            shutdown();
+            shutdown_once();
             throw;
         }
-        shutdown();
         if (!listen_ok) {
             fail("cannot bind HTTP port " + std::to_string(http_port));
         }
