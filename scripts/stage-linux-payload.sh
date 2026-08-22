@@ -198,7 +198,8 @@ done
 
 commit="$(git -C "${REPO}" rev-parse HEAD)" ||
     die 'cannot resolve the repository commit'
-printf 'commit %s\n' "${commit}" > "${staging_dir}/potluck-build-id"
+printf 'platform linux-%s\n' "${arch}" > "${staging_dir}/potluck-build-id"
+printf 'commit %s\n' "${commit}" >> "${staging_dir}/potluck-build-id"
 for file in "${shipped_files[@]}"; do
     checksum="$(sha256sum "${staging_dir}/${file}" | awk '{ print $1 }')"
     [[ "${checksum}" =~ ^[[:xdigit:]]{64}$ ]] ||

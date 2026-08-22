@@ -18,6 +18,15 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 source "${REPO}/scripts/potluck-safe.sh"
 # shellcheck source=potluck-model.sh
 source "${REPO}/scripts/potluck-model.sh"
+payload_for_platform() {
+    case "$1" in
+        'Darwin arm64'*|'Darwin aarch64'*) printf 'mac-arm64\n' ;;
+        'Linux x86_64'*|'Linux amd64'*) printf 'linux-x86_64\n' ;;
+        'Linux aarch64'*) printf 'linux-aarch64\n' ;;
+        'Linux arm64'*) printf 'linux-arm64\n' ;;
+        *) return 1 ;;
+    esac
+}
 
 prefix="${HOME}/potluck"
 jobs="$(potluck_build_jobs)"
@@ -51,7 +60,7 @@ done
 
 if [[ -z "${payload_dir}" && "${skip_build}" == "1" ]]; then
     case "$(uname -s) $(uname -m)" in
-        'Darwin arm64') candidate="${REPO}/dist/mac-arm64" ;;
+        'Darwin arm64'|'Darwin aarch64') candidate="${REPO}/dist/mac-arm64" ;;
         'Linux x86_64'|'Linux amd64') candidate="${REPO}/dist/linux-x86_64" ;;
         'Linux aarch64') candidate="${REPO}/dist/linux-aarch64" ;;
         'Linux arm64') candidate="${REPO}/dist/linux-arm64" ;;
@@ -88,12 +97,17 @@ if [[ -n "${missing}" ]]; then
 fi
 if [[ -n "${payload_dir}" ]]; then
     no_model=1
-    [[ -d "${payload_dir}" ]] || {
+    [[ -d "${payload_dir}" && ! -L "${payload_dir}" ]] || {
         printf 'install: payload directory does not exist: %s\n' "${payload_dir}" >&2
         exit 2
     }
-    [[ -f "${payload_dir}/potluck-build-id" ]] || {
+    [[ -f "${payload_dir}/potluck-build-id" &&
+       ! -L "${payload_dir}/potluck-build-id" ]] || {
         printf 'install: payload has no potluck-build-id: %s\n' "${payload_dir}" >&2
+        exit 2
+    }
+    expected_platform="$(payload_for_platform "$(uname -sm)")" || {
+        printf 'install: unsupported device platform: %s\n' "$(uname -sm)" >&2
         exit 2
     }
     if command -v sha256sum >/dev/null 2>&1; then
@@ -104,32 +118,85 @@ if [[ -n "${payload_dir}" ]]; then
         printf 'install: payload mode needs sha256sum or shasum\n' >&2
         exit 2
     fi
-    payload_files=(potluck-node potluck-worker)
-    while read -r checksum name extra; do
-        [[ -n "${checksum:-}" ]] || continue
-        [[ "${checksum}" == commit ]] && continue
-        [[ -z "${extra:-}" && "${checksum}" =~ ^[[:xdigit:]]{64}$ &&
-           "${name}" != */* && -f "${payload_dir}/${name}" ]] || {
-            printf 'install: invalid payload checksum record\n' >&2
-            exit 2
-        }
-        actual="$(sha256_file "${payload_dir}/${name}")"
-        [[ "${actual}" == "${checksum}" ]] || {
-            printf 'install: payload checksum mismatch: %s\n' "${name}" >&2
-            exit 2
-        }
+    payload_files=()
+    payload_platform=""
+    commit_seen=0
+    while read -r field value extra; do
+        [[ -n "${field:-}" ]] || continue
+        case "${field}" in
+            platform)
+                [[ -n "${value:-}" && -z "${extra:-}" &&
+                   -z "${payload_platform}" ]] || {
+                    printf 'install: invalid payload platform record\n' >&2
+                    exit 2
+                }
+                payload_platform="${value}"
+                ;;
+            commit)
+                [[ -n "${value:-}" && -z "${extra:-}" &&
+                   "${commit_seen}" -eq 0 ]] || {
+                    printf 'install: invalid payload commit record\n' >&2
+                    exit 2
+                }
+                commit_seen=1
+                ;;
+            *)
+                checksum="${field}"
+                name="${value:-}"
+                [[ -z "${extra:-}" &&
+                   "${checksum}" =~ ^[[:xdigit:]]{64}$ &&
+                   "${name}" =~ ^[A-Za-z0-9._+][A-Za-z0-9._+-]*$ &&
+                   "${name}" != potluck-build-id &&
+                   "${name}" != potluck-deploy.sha256 &&
+                   -f "${payload_dir}/${name}" &&
+                   ! -L "${payload_dir}/${name}" ]] || {
+                    printf 'install: invalid payload checksum record\n' >&2
+                    exit 2
+                }
+                actual="$(sha256_file "${payload_dir}/${name}")"
+                [[ "${actual}" == "${checksum}" ]] || {
+                    printf 'install: payload checksum mismatch: %s\n' "${name}" >&2
+                    exit 2
+                }
+                found=0
+                for known in "${payload_files[@]}"; do
+                    [[ "${known}" == "${name}" ]] && found=1
+                done
+                [[ "${found}" == 0 ]] || {
+                    printf 'install: duplicate payload checksum: %s\n' "${name}" >&2
+                    exit 2
+                }
+                payload_files+=("${name}")
+                ;;
+        esac
+    done < "${payload_dir}/potluck-build-id"
+    [[ "${commit_seen}" -eq 1 && -n "${payload_platform}" &&
+       "${payload_platform}" == "${expected_platform}" ]] || {
+        printf 'install: payload platform does not match %s: %s\n' \
+            "${expected_platform}" "${payload_platform:-missing}" >&2
+        exit 2
+    }
+    for required in potluck-node potluck-worker; do
         found=0
         for known in "${payload_files[@]}"; do
-            [[ "${known}" == "${name}" ]] && found=1
+            [[ "${known}" == "${required}" ]] && found=1
         done
-        [[ "${found}" == 1 ]] || payload_files+=("${name}")
-    done < "${payload_dir}/potluck-build-id"
+        [[ "${found}" == 1 ]] || {
+            printf 'install: payload manifest does not checksum %s\n' "${required}" >&2
+            exit 2
+        }
+    done
     for name in "${payload_files[@]}"; do
-        [[ -f "${payload_dir}/${name}" ]] || {
+        [[ -f "${payload_dir}/${name}" && ! -L "${payload_dir}/${name}" ]] || {
             printf 'install: payload missing %s\n' "${name}" >&2
             exit 2
         }
     done
+    [[ -x "${payload_dir}/potluck-node" &&
+       -x "${payload_dir}/potluck-worker" ]] || {
+        printf 'install: payload worker binaries are not executable\n' >&2
+        exit 2
+    }
 fi
 
 if [[ "${skip_build}" != "1" ]]; then
@@ -165,6 +232,7 @@ if [[ -n "${payload_dir}" ]]; then
     for name in "${payload_files[@]}"; do
         cp -f "${payload_dir}/${name}" "${prefix}/${name}"
     done
+    cp -f "${payload_dir}/potluck-build-id" "${prefix}/potluck-build-id"
     chmod +x "${prefix}/potluck-node" "${prefix}/potluck-worker"
 else
     bin_dir="${build_dir}/bin"
