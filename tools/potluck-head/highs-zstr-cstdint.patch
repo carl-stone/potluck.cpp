@@ -1,8 +1,0 @@
---- a/extern/zstr/zstr.hpp
-+++ b/extern/zstr/zstr.hpp
-@@ -13,3 +13,5 @@
- #include <cassert>
-+#include <cstdint>
-+#include <cstring>
- #include <fstream>
- #include <iostream>
