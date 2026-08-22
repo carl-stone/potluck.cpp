@@ -219,7 +219,7 @@ ssh_cmd() {
     ssh "${ssh_args[@]}" "${target}" "$1"
 }
 
-ssh_cmd "set -eu; mkdir -p ${remote_tmp_q}; rm -rf ${remote_tmp_q}/*"
+ssh_cmd "set -eu; rm -rf ${remote_tmp_q}; mkdir -p ${remote_tmp_q}"
 scp "${scp_args[@]}" "${local_stage}"/* "${target}:${remote_tmp}/"
 
 verify_cmd="set -eu; cd ${remote_tmp_q}; if command -v sha256sum >/dev/null 2>&1; then sha256sum -c potluck-deploy.sha256; elif command -v shasum >/dev/null 2>&1; then while read -r sum name extra; do test -n \"\${sum}\"; test -z \"\${extra:-}\"; test \"\${sum}\" = \"\$(shasum -a 256 \"\${name}\" | cut -d' ' -f1)\"; done < potluck-deploy.sha256; else exit 127; fi"
