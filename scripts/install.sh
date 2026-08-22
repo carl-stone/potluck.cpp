@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# One-command device setup for Potluck engineering use.
-#
-# Builds the runtime binaries, fetches the pinned fixture model, and installs
-# everything flat into one prefix directory (default: ~/potluck). The default
-# prefix matches what potluck-server expects on remote worker devices, so
-# worker machines should keep it.
+# One-command device setup for Potluck. A source checkout builds the runtime;
+# a staged portable payload installs workers without a compiler or model copy.
 #
 # Usage: bash scripts/install.sh [--prefix DIR] [--jobs N] [--no-server]
-#                                [--skip-build] [--start]
+#                                [--skip-build] [--payload DIR] [--no-model]
+#                                [--start]
 #
 # After it finishes:
 #   worker device:  ~/potluck/potluck-node
 #   head device:    ~/potluck/potluck-server -m ~/potluck/<model file>
+#
+# A payload install copies only the staged binaries and libraries. The head
+# downloads the pinned model on demand; worker payload installs use --no-model.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,6 +24,8 @@ jobs="$(potluck_build_jobs)"
 build_dir="${POTLUCK_BUILD_DIR:-${REPO}/build}"
 build_server=1
 skip_build=0
+payload_dir="${POTLUCK_PAYLOAD_DIR:-}"
+no_model=0
 start=0
 
 while [[ $# -gt 0 ]]; do
@@ -32,26 +34,102 @@ while [[ $# -gt 0 ]]; do
         --jobs)   [[ $# -ge 2 ]] || { echo "install: --jobs needs a value" >&2; exit 2; }; jobs="$2"; shift 2 ;;
         --no-server) build_server=0; shift ;;
         --skip-build) skip_build=1; shift ;;
+        --payload)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "install: --payload needs a directory" >&2; exit 2; }
+            payload_dir="$2"
+            skip_build=1
+            build_server=0
+            no_model=1
+            shift 2
+            ;;
+        --no-model) no_model=1; shift ;;
         --start) start=1; shift ;;
         -h|--help) grep '^#' "$0" | cut -c3-; exit 0 ;;
         *) echo "install: unknown option: $1" >&2; exit 2 ;;
     esac
 done
 
-missing=""
-for tool in cmake curl pkg-config; do
-    command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
-done
-if ! command -v c++ >/dev/null 2>&1 && ! command -v g++ >/dev/null 2>&1; then
-    missing="${missing} c++"
+if [[ -z "${payload_dir}" && "${skip_build}" == "1" ]]; then
+    case "$(uname -s) $(uname -m)" in
+        'Darwin arm64') candidate="${REPO}/dist/mac-arm64" ;;
+        'Linux x86_64'|'Linux amd64') candidate="${REPO}/dist/linux-x86_64" ;;
+        'Linux aarch64') candidate="${REPO}/dist/linux-aarch64" ;;
+        'Linux arm64') candidate="${REPO}/dist/linux-arm64" ;;
+        *) candidate="" ;;
+    esac
+    if [[ -n "${candidate}" && -f "${candidate}/potluck-build-id" ]]; then
+        payload_dir="${candidate}"
+        no_model=1
+    fi
 fi
-if ! pkg-config --exists libzmq 2>/dev/null; then
-    missing="${missing} libzmq(zeromq)"
+if [[ -n "${payload_dir}" ]]; then
+    no_model=1
+fi
+
+missing=""
+if [[ -z "${payload_dir}" && "${skip_build}" != "1" ]]; then
+    for tool in cmake pkg-config; do
+        command -v "${tool}" >/dev/null 2>&1 || missing="${missing} ${tool}"
+    done
+    if ! command -v c++ >/dev/null 2>&1 && ! command -v g++ >/dev/null 2>&1; then
+        missing="${missing} c++"
+    fi
+    if ! pkg-config --exists libzmq 2>/dev/null; then
+        missing="${missing} libzmq(zeromq)"
+    fi
+fi
+if [[ "${no_model}" != "1" ]] && ! command -v curl >/dev/null 2>&1; then
+    missing="${missing} curl"
 fi
 if [[ -n "${missing}" ]]; then
     printf 'install: missing required tools:%s\n' "${missing}" >&2
     printf 'install: install them and run this script again\n' >&2
     exit 2
+fi
+if [[ -n "${payload_dir}" ]]; then
+    no_model=1
+    [[ -d "${payload_dir}" ]] || {
+        printf 'install: payload directory does not exist: %s\n' "${payload_dir}" >&2
+        exit 2
+    }
+    [[ -f "${payload_dir}/potluck-build-id" ]] || {
+        printf 'install: payload has no potluck-build-id: %s\n' "${payload_dir}" >&2
+        exit 2
+    }
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256_file() { sha256sum "$1" | cut -d' ' -f1; }
+    elif command -v shasum >/dev/null 2>&1; then
+        sha256_file() { shasum -a 256 "$1" | cut -d' ' -f1; }
+    else
+        printf 'install: payload mode needs sha256sum or shasum\n' >&2
+        exit 2
+    fi
+    payload_files=(potluck-node potluck-worker)
+    while read -r checksum name extra; do
+        [[ -n "${checksum:-}" ]] || continue
+        [[ "${checksum}" == commit ]] && continue
+        [[ -z "${extra:-}" && "${checksum}" =~ ^[[:xdigit:]]{64}$ &&
+           "${name}" != */* && -f "${payload_dir}/${name}" ]] || {
+            printf 'install: invalid payload checksum record\n' >&2
+            exit 2
+        }
+        actual="$(sha256_file "${payload_dir}/${name}")"
+        [[ "${actual}" == "${checksum}" ]] || {
+            printf 'install: payload checksum mismatch: %s\n' "${name}" >&2
+            exit 2
+        }
+        found=0
+        for known in "${payload_files[@]}"; do
+            [[ "${known}" == "${name}" ]] && found=1
+        done
+        [[ "${found}" == 1 ]] || payload_files+=("${name}")
+    done < "${payload_dir}/potluck-build-id"
+    for name in "${payload_files[@]}"; do
+        [[ -f "${payload_dir}/${name}" ]] || {
+            printf 'install: payload missing %s\n' "${name}" >&2
+            exit 2
+        }
+    done
 fi
 
 if [[ "${skip_build}" != "1" ]]; then
@@ -82,23 +160,45 @@ if [[ "${skip_build}" != "1" ]]; then
         --target "${targets[@]}"
 fi
 
-printf 'install: fetching pinned model %s\n' "${POTLUCK_MODEL_FILE}"
-model_path="$(bash "${REPO}/scripts/fetch-model.sh" --dest "${prefix}")"
-
 mkdir -p "${prefix}"
-bin_dir="${build_dir}/bin"
-for name in potluck-node potluck-worker; do
-    cp -f "${bin_dir}/${name}" "${prefix}/${name}"
-done
-if [[ "${build_server}" == "1" ]]; then
-    cp -f "${bin_dir}/potluck-server" "${prefix}/potluck-server"
+if [[ -n "${payload_dir}" ]]; then
+    for name in "${payload_files[@]}"; do
+        cp -f "${payload_dir}/${name}" "${prefix}/${name}"
+    done
+    chmod +x "${prefix}/potluck-node" "${prefix}/potluck-worker"
+else
+    bin_dir="${build_dir}/bin"
+    for name in potluck-node potluck-worker; do
+        [[ -x "${bin_dir}/${name}" ]] || {
+            printf 'install: missing built binary: %s\n' "${bin_dir}/${name}" >&2
+            exit 2
+        }
+        cp -f "${bin_dir}/${name}" "${prefix}/${name}"
+    done
+    if [[ "${build_server}" == "1" ]]; then
+        [[ -x "${bin_dir}/potluck-server" ]] || {
+            printf 'install: missing built binary: %s\n' "${bin_dir}/potluck-server" >&2
+            exit 2
+        }
+        cp -f "${bin_dir}/potluck-server" "${prefix}/potluck-server"
+    fi
 fi
-model_file="$(basename "${model_path}")"
+
+model_path=""
+if [[ "${no_model}" != "1" ]]; then
+    printf 'install: fetching pinned model %s\n' "${POTLUCK_MODEL_FILE}"
+    model_path="$(bash "${REPO}/scripts/fetch-model.sh" --dest "${prefix}")"
+fi
+
 printf '\ninstalled to %s:\n' "${prefix}"
 ls -lh "${prefix}" | sed -n '2,$p'
 printf '\nnext steps:\n'
 printf '  worker device: %s/potluck-node\n' "${prefix}"
-printf '  head device:   %s/potluck-server -m %s/%s\n' "${prefix}" "${prefix}" "${model_file}"
+if [[ -n "${model_path}" && -x "${prefix}/potluck-server" ]]; then
+    model_file="$(basename "${model_path}")"
+    printf '  head device:   %s/potluck-server -m %s/%s\n' \
+        "${prefix}" "${prefix}" "${model_file}"
+fi
 
 if [[ "${start}" == "1" ]]; then
     exec "${prefix}/potluck-node"

@@ -81,13 +81,23 @@ mode or fallback.
 
 ## Quick start
 
-One command prepares any macOS or Linux device. It checks build tools, builds
-the runtime, fetches the pinned fixture model, and installs everything flat
-into `~/potluck`:
+One command prepares a macOS or Linux device. A source checkout builds the
+runtime, fetches the pinned fixture model on the head, and installs everything
+flat into `~/potluck`:
 
 ```sh
 bash scripts/install.sh
 ```
+
+When a staged portable payload is available, a worker needs no compiler or
+model copy:
+
+```sh
+bash scripts/install.sh --payload dist/mac-arm64
+```
+
+The payload must match the device platform. It includes the worker binaries,
+the matching libzmq runtime, and checksums, but never a GGUF model.
 
 Then:
 
@@ -96,8 +106,9 @@ Then:
   workers there.
 - Head device: run
   `~/potluck/potluck-server -m ~/potluck/Qwen3.5-0.8B-Q4_0.gguf`. The head
-  discovers advertised nodes, launches their workers over SSH, and serves the
-  OpenAI-like HTTP surface.
+  discovers advertised nodes, probes and admits them, stages the platform
+  payload, creates the route shards, and sends each worker only its assigned
+  windows over SSH.
 
 First contact accepts a new SSH host key into
 `$XDG_CONFIG_HOME/potluck/known_hosts` or `~/.config/potluck/known_hosts`.
@@ -107,8 +118,7 @@ The model is not stored in this repository. The engineering fixture is pinned
 to `ggml-org/Qwen3.5-0.8B-GGUF` (`Qwen3.5-0.8B-Q4_0.gguf`, SHA256 checked), and
 `scripts/fetch-model.sh` downloads and verifies it on demand. Override the pin
 with `POTLUCK_MODEL_HF_REPO`, `POTLUCK_MODEL_FILE`, or point at a local file
-with `POTLUCK_TEST_MODEL`. This remains an engineering smoke path, not a
-supported deployment.
+with `POTLUCK_TEST_MODEL`.
 
 ## Measured results
 These observations are functional smoke evidence for the unfinished direct
