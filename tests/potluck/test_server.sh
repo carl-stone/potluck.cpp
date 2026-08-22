@@ -104,7 +104,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 2 --ubatch 1 --port "${PORT}" \
+POTLUCK_TRACE_PREFETCH=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 2 --ubatch 1 --port "${PORT}" \
     >"${WORK}/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 120); do
@@ -260,6 +260,56 @@ models, model = json.loads(sys.argv[1]), sys.argv[2]
 assert models["object"] == "list"
 assert models["data"] and models["data"][0]["id"] == model
 PY
+python3 - "${WORK}/server.log" <<'PY'
+import re, sys
+prefetched = {}
+computed = []
+for line_number, line in enumerate(open(sys.argv[1])):
+    match = re.search(r"WORKER rank (\d+) prefetched window (\d+) \((\d+) bytes\)", line)
+    if match:
+        rank, window, byte_count = match.groups()
+        assert int(byte_count) > 0, f"window {(rank, window)} reported zero prefetch bytes"
+        prefetched.setdefault((rank, window), line_number)
+    match = re.search(r"WORKER rank (\d+) computing window (\d+)", line)
+    if match:
+        computed.append((match.groups(), line_number))
+assert computed, "no worker compute trace"
+for window, line_number in computed:
+    assert window in prefetched, f"window {window} computed without prefetch"
+    assert prefetched[window] < line_number, f"window {window} prefetch followed compute"
+PY
+
+
+if [[ "${POTLUCK_TEST_WORKER_LOSS:-0}" == 1 ]]; then
+    WORKER_PID="$(pgrep -P "${SRV}" -f '[p]otluck-worker' | sed -n '1p')"
+    [[ -n "${WORKER_PID}" ]] || {
+        printf 'worker-loss gate could not find a child worker\n' >&2
+        exit 1
+    }
+    kill -STOP "${WORKER_PID}"
+    RECOVERY_BODY="${WORK}/recovery.json"
+    RECOVERY_STATUS=$(curl -sS -o "${RECOVERY_BODY}" -w '%{http_code}' \
+        "${auth_header[@]}" -d '{"prompt":"recovery probe","n_predict":8}' \
+        "http://${HOST}:${PORT}/completion")
+    [[ "${RECOVERY_STATUS}" == 503 ]]
+    python3 - "${RECOVERY_BODY}" <<'PY'
+import json, sys
+error = json.load(open(sys.argv[1]))["error"]
+assert "retry" in error.lower(), error
+PY
+    for _ in $(seq 1 60); do
+        grep -q 'ring rebuild succeeded' "${WORK}/server.log" && break
+        sleep 0.5
+    done
+    grep -q 'ring rebuild succeeded' "${WORK}/server.log"
+    RECOVERY_HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
+    python3 - "${RECOVERY_HEALTH}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+assert health["status"] == "ok", health
+assert health["workers"] >= 1, health
+PY
+fi
 
 SSE=$(curl -fsS -N "${auth_header[@]}" -d \
     '{"messages":[{"role":"user","content":"Say hi"}],"max_tokens":3,"stream":true,"reasoning_effort":"none"}' \

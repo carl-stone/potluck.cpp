@@ -460,10 +460,7 @@ struct llama_mmap::impl {
         }
 
         if (prefetch > 0) {
-            if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
-                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
-                        strerror(errno));
-            }
+            advise(addr, std::min(file->size(), prefetch));
         }
         if (numa) {
             if (posix_madvise(addr, file->size(), POSIX_MADV_RANDOM)) {
@@ -556,24 +553,7 @@ struct llama_mmap::impl {
         }
 
         if (prefetch > 0) {
-#if _WIN32_WINNT >= 0x602
-            BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-            HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-
-            pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
-
-            if (pPrefetchVirtualMemory) {
-                WIN32_MEMORY_RANGE_ENTRY range;
-                range.VirtualAddress = addr;
-                range.NumberOfBytes = (SIZE_T) std::min(size, prefetch);
-                if (!pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0)) {
-                    LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
-                            llama_format_win_err(GetLastError()).c_str());
-                }
-            }
-#else
-            LLAMA_LOG_DEBUG("skipping PrefetchVirtualMemory because _WIN32_WINNT < 0x602\n");
-#endif
+            advise(addr, std::min(size, prefetch));
         }
     }
 
@@ -612,6 +592,53 @@ struct llama_mmap::impl {
         throw std::runtime_error("mmap not supported");
     }
 #endif
+    size_t advise(const void * data, size_t length) const {
+        if (data == nullptr || length == 0 || addr == nullptr || size == 0) {
+            return 0;
+        }
+        const uintptr_t base = reinterpret_cast<uintptr_t>(addr);
+        const uintptr_t first = reinterpret_cast<uintptr_t>(data);
+        if (first < base || first - base >= size) {
+            return 0;
+        }
+        const size_t offset = first - base;
+        const size_t clamped = std::min(length, size - offset);
+#ifdef _POSIX_MAPPED_FILES
+        const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        const size_t aligned_offset = offset & ~(page_size - 1);
+        const size_t aligned_length = std::min(size - aligned_offset,
+                                               offset - aligned_offset + clamped);
+        const int result = posix_madvise(static_cast<uint8_t *>(addr) + aligned_offset,
+                                         aligned_length, POSIX_MADV_WILLNEED);
+        if (result != 0) {
+            LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
+                           strerror(result));
+            return 0;
+        }
+#elif defined(_WIN32) && _WIN32_WINNT >= 0x602
+        BOOL (WINAPI * prefetch_virtual_memory)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        prefetch_virtual_memory = (decltype(prefetch_virtual_memory))(void *)
+            GetProcAddress(kernel32, "PrefetchVirtualMemory");
+        if (prefetch_virtual_memory) {
+            WIN32_MEMORY_RANGE_ENTRY range;
+            range.VirtualAddress = const_cast<void *>(data);
+            range.NumberOfBytes = static_cast<SIZE_T>(clamped);
+            if (!prefetch_virtual_memory(GetCurrentProcess(), 1, &range, 0)) {
+                LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
+                               llama_format_win_err(GetLastError()).c_str());
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+#else
+        GGML_UNUSED(clamped);
+        return 0;
+#endif
+        return clamped;
+    }
+
 
     void * addr;
     size_t size;
@@ -622,6 +649,7 @@ llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
+size_t llama_mmap::advise(const void * data, size_t length) const { return pimpl->advise(data, length); }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

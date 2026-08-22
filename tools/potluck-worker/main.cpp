@@ -3,6 +3,7 @@
 #include "potluck_runtime.h"
 
 #include "llama.h"
+#include "llama-model.h"
 #include "ggml-backend.h"
 
 #include <cmath>
@@ -361,6 +362,22 @@ int main(int argc, char ** argv) {
                      std::to_string(window.end) + ") load failed: " + error);
             }
         }
+        const bool trace_prefetch = std::getenv("POTLUCK_TRACE_PREFETCH") != nullptr;
+        std::vector<bool> traced_compute(config.windows.size(), false);
+        const auto prefetch_next_owned = [&](size_t current_window) {
+            for (size_t offset = 1; offset <= config.windows.size(); ++offset) {
+                const size_t next = (current_window + offset) % config.windows.size();
+                if (config.windows[next].owner != config.index || stages[next].model == nullptr) {
+                    continue;
+                }
+                const size_t bytes = stages[next].model->prefetch();
+                std::printf("WORKER rank %u prefetched window %zu (%zu bytes)\n",
+                            config.index, next, bytes);
+                std::fflush(stdout);
+                return;
+            }
+        };
+        prefetch_next_owned(config.windows.size() - 1);
 
 
         std::printf("WORKER rank %u/%u loaded %zu owned windows\n",
@@ -544,6 +561,11 @@ int main(int argc, char ** argv) {
                     continue;
                 }
 
+                if (trace_prefetch && !traced_compute[window_index]) {
+                    std::printf("WORKER rank %u computing window %u\n", config.index, window_index);
+                    std::fflush(stdout);
+                    traced_compute[window_index] = true;
+                }
                 const uint32_t n_entries = static_cast<uint32_t>(positions.size());
                 int decode_rc;
                 if (from_head) {
@@ -670,6 +692,9 @@ int main(int argc, char ** argv) {
                                           reinterpret_cast<const uint8_t *>(hidden) +
                                           sizeof(float) * stage.n_embd);
                 }
+            }
+            if (owned_windows > 1) {
+                prefetch_next_owned(window_index);
             }
 
             if (tail) {

@@ -193,6 +193,7 @@ struct llama_model_loader {
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+    std::vector<std::pair<size_t, size_t>> get_mapping_ranges(int idx, ggml_context * ctx) const;
 
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;

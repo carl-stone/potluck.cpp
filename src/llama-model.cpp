@@ -1600,7 +1600,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!potluck_window, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1808,6 +1808,27 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
+size_t llama_model::prefetch() const {
+    size_t advised = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        GGML_UNUSED(bufs);
+        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get());
+             tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+            if (tensor->data == nullptr) {
+                continue;
+            }
+            for (const auto & mapping : pimpl->mappings) {
+                const size_t bytes = mapping->advise(tensor->data, ggml_nbytes(tensor));
+                advised += bytes;
+                if (bytes != 0) {
+                    break;
+                }
+            }
+        }
+    }
+    return advised;
+}
+
 
 void llama_model::print_info() const {
     const std::string rope_scaling_type = llama_rope_scaling_type_name(hparams.rope_scaling_type_train);

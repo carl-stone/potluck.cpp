@@ -13,6 +13,7 @@
 // Usage: test-potluck-run <model.gguf> [split] [n_predict]
 
 #include "llama.h"
+#include "../src/llama-model.h"
 #include "potluck_runtime.h"
 
 #include <algorithm>
@@ -118,6 +119,12 @@ std::vector<llama_token> run_split(const std::string & model_path,
     potluck::stage_model remote;
     CHECK(potluck::stage_load(remote, model_path, split, 0, /*embeddings=*/false, /*n_ctx=*/2048,
                               /*n_seq_max=*/1, /*n_ubatch=*/1, error, /*tail=*/true));
+    const uint64_t model_bytes = potluck::model_file_bytes(model_path);
+    const size_t head_prefetch_bytes = head.model->prefetch();
+    const size_t remote_prefetch_bytes = remote.model->prefetch();
+    CHECK(model_bytes > 0);
+    CHECK(head_prefetch_bytes > 0 && head_prefetch_bytes < model_bytes);
+    CHECK(remote_prefetch_bytes > 0 && remote_prefetch_bytes < model_bytes);
 
     const llama_vocab * vocab = llama_model_get_vocab(head.model);
     const llama_token eos = llama_vocab_eos(vocab);
