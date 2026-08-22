@@ -1364,6 +1364,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
+    const bool potluck_window = params.potluck_layer_end != 0;
+    auto override_buft = [&](const std::string & tensor_name) -> ggml_backend_buffer_type_t {
+        if (!potluck_window || params.tensor_buft_overrides == nullptr) {
+            return nullptr;
+        }
+        for (const auto * override = params.tensor_buft_overrides;
+             override->pattern != nullptr; ++override) {
+            if (override->buft != nullptr &&
+                std::regex_search(tensor_name, std::regex(override->pattern))) {
+                return override->buft;
+            }
+        }
+        return nullptr;
+    };
+    auto override_layer_device = [&](const std::string & tensor_name,
+                                     llama_model::impl::layer_dev fallback) {
+        const ggml_backend_buffer_type_t buft = override_buft(tensor_name);
+        if (buft == nullptr) {
+            return fallback;
+        }
+        if (buft == ggml_backend_cpu_buffer_type()) {
+            return llama_model::impl::layer_dev{cpu_dev, &pimpl->cpu_buft_list};
+        }
+        auto * dev = ggml_backend_buft_get_device(buft);
+        auto it = pimpl->gpu_buft_list.find(dev);
+        if (dev == nullptr || it == pimpl->gpu_buft_list.end()) {
+            return fallback;
+        }
+        return llama_model::impl::layer_dev{dev, &it->second};
+    };
 
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
@@ -1373,10 +1403,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->dev_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+        if (potluck_window) {
+            pimpl->dev_layer[il] = override_layer_device(
+                "blk." + std::to_string(il) + ".", pimpl->dev_layer[il]);
+        }
     }
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = override_layer_device("output.", pimpl->dev_output);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 

@@ -1259,6 +1259,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             *cur_backend_id = tensor_backend_id(node->view_src);
             SET_CAUSE(node, "4.vsrc");
         }
+        if (node->op == GGML_OP_SET && node->view_src != NULL) {
+            const int view_backend_id = tensor_backend_id(node->view_src);
+            if (view_backend_id != -1 && *cur_backend_id != view_backend_id) {
+                if (!ggml_backend_supports_op(sched->backends[view_backend_id], node)) {
+                    GGML_ABORT("view tensor (%s) cannot run operation (%s) on backend (%s)",
+                        node->name, ggml_op_name(node->op), ggml_backend_name(sched->backends[view_backend_id]));
+                }
+                *cur_backend_id = view_backend_id;
+                SET_CAUSE(node, "4.vsrc");
+            }
+        }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
             if (src == NULL) {

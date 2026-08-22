@@ -1,12 +1,9 @@
 #pragma once
 
-// Shared stage-runtime helpers for legacy static and coordinator-routed
-// component checks.
+// Shared stage-runtime helpers for the integrated direct-peer ring.
 //
-// A stage owns one or more model-layer windows. The execution helpers can be
-// retained during the ADR 0007 cutover, but their current PTLK/raw-TCP
-// coordinator topology cannot. Product communication must use direct ZeroMQ
-// links between adjacent ring peers.
+// A stage owns one or more model-layer windows. Ring traffic is handled by
+// direct ZeroMQ links between adjacent peers.
 
 #include "llama.h"
 
@@ -84,14 +81,16 @@ inline llama_context_params stage_context_params(uint32_t start, uint32_t end, b
     // Legacy node_config carries these cluster-wide values. The integrated
     // direct-peer ZeroMQ server must select and distribute equivalent bounded
     // values automatically.
-    params.n_batch = 256;
-    params.n_ubatch = 1;
+    // n_ubatch = 1 preserves the numerics-parity setting used by tests.
+    params.n_ubatch = std::max<uint32_t>(1, n_ubatch);
+    params.n_batch = std::max<uint32_t>(256, params.n_ubatch);
     // Keep the configured number of sequences. llama.cpp treats n_ctx as the
     // total context across those sequences; forcing 64 slots silently reduced
     // the default server's per-request context to 1/64 (256 tokens at 4096).
     params.n_seq_max = std::max<uint32_t>(1, n_seq_max);
     params.n_outputs_max = embeddings ? params.n_batch : std::max<uint32_t>(1, n_seq_max);
     params.embeddings = embeddings;
+    params.swa_full = n_seq_max > 1;
     params.potluck_layer_start = start;
     params.potluck_layer_end = end;
     return params;
