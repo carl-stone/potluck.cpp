@@ -19,7 +19,7 @@ A finished Potluck deployment presents one OpenAI-compatible endpoint on the
 head machine. The controller automatically discovers and profiles the
 available devices, selects the useful devices, assigns repeated disjoint layer
 windows around the ring, starts the workers, and continuously serves isolated
-conversation slots. Users and client harnesses do not configure shards,
+conversation slots. Users and client harnesses do not configure model files,
 workers, ranks, ports, weights, bounds, or execution modes.
 
 ## Behavioral reference and usability north star
@@ -33,8 +33,8 @@ departure requires explicit user approval and another accepted ADR.
 
 This deference does not extend to prima.cpp's manual user flow. Potluck must be
 easy to use as one normal local server. The controller hides discovery,
-profiling, topology, windows, shards, placement, startup, and recovery. The
-person selects a model and connects a standard client or agent harness to the
+profiling, topology, windows, model distribution, placement, and startup. The
+user selects a model and connects a standard client or agent harness to the
 head; distributed configuration is not part of the normal interface.
 
 ## Product processes and data flow
@@ -47,11 +47,15 @@ head; distributed configuration is not part of the normal interface.
 3. The scheduler selects the devices and assigns several disjoint windows to
    each device. Assignment is heterogeneity-aware and minimizes the limiting
    stage subject to live resource constraints.
-4. The controller creates or locates the required GGUF shards and transfers or
-   reuses them on each selected device.
-5. Each worker loads only its assigned window shards. A complete GGUF may exist
-   on disk, but no worker or production head loads the complete model.
-6. Workers prefetch their next assigned window as part of ring execution.
+4. The controller ensures the complete GGUF is present on each selected
+   device, transferring it automatically and reusing a copy whose checksum
+   matches.
+5. Each worker opens that model file but loads only its assigned layer
+   windows. The full file may remain on disk; no worker or production head
+   loads the complete model into memory.
+6. Per-window prefetch is not implemented yet. Admission sizes assignments so
+   each device can hold all of its windows, so full-file presence is sufficient
+   for the current schedule.
 7. CPU, CUDA, and Metal placement is selected independently for each device and
    window from current usable capacity.
 8. Active conversation slots are continuously batched through the ring. Each
@@ -65,9 +69,11 @@ socket, connects directly to its cyclic next peer, and sends final results back
 to the head. Ingress goes to rank 0; the head does not relay intermediate
 windows it does not execute.
 
-DNS-SD candidate discovery and automatic SSH launch are implemented. Live
-profiling and admission, resource-aware selection and placement, shard
-automation, recovery, security, and full API parity remain unfinished.
+DNS-SD candidate discovery, bounded pre-launch probing and admission,
+resource-weighted selection and placement, automatic SSH launch, and
+full-model distribution with checksum validation are implemented. Adaptive
+load changes, per-window prefetch, recovery migration, security, and full API
+parity remain unfinished.
 
 ## Piped-ring execution
 
@@ -77,46 +83,35 @@ one model pass. Window sizes and ownership come from the automatic scheduler in
 the finished product; equal splits and user-supplied static bounds are not
 product behavior.
 
-The current server route implements two repeated disjoint windows per worker
-where the model layers permit. DNS-SD supplies candidate nodes and the server
-launches them through SSH. Each worker reports its accelerator kind and free
-memory before the schedule is sent, and the head budgets that memory across the
-worker's windows to fill per-window layer offload on Metal or CUDA. Device
-admission, heterogeneous window sizing, and selection are still not live.
+The current server route assigns repeated disjoint windows from pre-launch
+usable-capacity measurements. DNS-SD supplies candidate nodes and the server
+launches them through SSH after probing and admission. Each worker reports its
+accelerator kind and free memory before and after the schedule; the head uses
+those profiles for per-window CPU, Metal, or CUDA placement.
 
 Each selected device receives from its previous ring peer and sends directly to
 its next ring peer. Rank 0 is both a ring peer and the client-facing controller.
 Its control responsibility does not make it a relay for other peers' window
-transitions. Automatic setup must eventually configure these connections
-without exposing ranks, addresses, ports, or launch order to the user.
+transitions. Automatic setup configures these connections without exposing
+ranks, addresses, ports, or launch order to the user.
 
-The ring must support prompt prefill, continuous decode, multiple active
-sequences, slot lifecycle, per-window prefetch, and per-window accelerator
-placement through the same server runtime. A transport smoke does not satisfy
-the architecture.
+The ring supports prompt prefill, continuous decode, multiple active sequences,
+slot lifecycle, cancellation, and per-window accelerator placement through the
+same server runtime. Per-window prefetch is currently unimplemented because
+admission keeps every assigned window resident on its device; it remains a
+release-gate requirement. A transport smoke does not satisfy the architecture.
 
-## Shards and loading
+## Model distribution and window loading
 
-`potluck-shard` currently proves that independently loadable GGUF window files
-can preserve source metadata and global block indices. The product controller
-must integrate shard creation, selection, transfer, validation, and caching.
+`potluck-shard` remains an optional disk-saving and format-validation tool for
+offline workflows. Normal server startup does not require manually generated
+shards or a deployment script.
 
-The current server accepts explicit shard inputs and assigns workers only the
-windows described by that configuration. Shard creation, transfer, validation,
-selection, and caching are not yet automated.
-
-Shards are the unit of loading:
-
-- every shard carries the metadata required to load its windows;
-- block tensor names keep their global `blk.<index>` names;
-- boundary shards carry the required embedding, normalization, and output
-  tensors;
-- shard metadata identifies the source model and covered windows;
-- a worker rejects assignments outside its shard windows.
-
-A device may download or retain the complete source GGUF. This is a deployment
-choice, not a loading choice. Production execution must load only the assigned
-window tensors.
+The controller distributes the complete source GGUF to each admitted remote
+device, verifies its checksum, and reuses a valid copy on later starts. A
+worker opens that file with the layer bounds for its assigned windows and
+loads only those windows. A complete GGUF may exist on disk, but production
+execution must not load the complete model into memory.
 
 ## Scheduling and head resource protection
 
@@ -146,11 +141,10 @@ usage, sampling, stop, and cancellation behavior required by ordinary
 harnesses. Unsupported request fields must be rejected explicitly rather than
 ignored.
 
-Conversation slots and continuous batching are required product behavior.
-Slots own bounded sequence state, conversation identity, cache affinity,
-isolation, cancellation, and lifecycle. The server must admit and schedule
-concurrent work; global one-chain serialization and HTTP 429-on-busy behavior
-are unfinished implementation.
+Conversation slots and continuous batching are implemented in the integrated
+server path. Slots own bounded sequence state, cache affinity, isolation,
+cancellation, and lifecycle. The API surface and live failure migration remain
+smaller than the full llama.cpp server contract.
 
 ## Current implementation gap
 
@@ -169,16 +163,18 @@ The direct adjacent-peer ZeroMQ path now runs in `potluck-server`:
 
 The remaining product gaps are explicit:
 
-- DNS-SD candidate discovery and SSH launch are automatic, as is accelerator
-  profiling with per-window layer placement. Device admission, heterogeneous
-  selection, and heterogeneous window sizing are not.
-- Head resource reservation and adaptive head participation are not
-  implemented.
-- Shard creation, transfer, validation, selection, and caching remain manual.
-- The server does not yet provide continuous HTTP batching or isolated
-  conversation slots.
-- Worker failure handling lacks reconnect, ring rebuild, slot migration, and
-  safe retry behavior.
+- DNS-SD discovery, bounded pre-launch probing, capacity admission,
+  heterogeneous window sizing, automatic model distribution, and accelerator
+  placement are implemented in the startup lifecycle.
+- Per-window prefetch remains unimplemented. Admission keeps every assigned
+  window resident on its device, so whole-file presence covers the current
+  schedule.
+- Head resource reservation and automatic head participation are implemented
+  at startup. They do not yet adapt to changing user load.
+- The server provides continuous HTTP batching, isolated conversation slots,
+  per-request sampling, and a single rebuild attempt with 30-second backoff.
+- Worker failure migration and safe request retry are unfinished. A failed
+  request receives a rebuild error; completed token state is not migrated.
 - The OpenAI-compatible HTTP surface is a subset; full request, response,
   error, usage, streaming, and cancellation parity is unfinished.
 - Authentication, encryption, credential handling, and tenant or prompt
