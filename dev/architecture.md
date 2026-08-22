@@ -72,8 +72,9 @@ windows it does not execute.
 DNS-SD candidate discovery, bounded pre-launch probing and admission,
 resource-weighted selection and placement, automatic SSH launch, and
 full-model distribution with checksum validation are implemented. Adaptive
-load changes, per-window prefetch, recovery migration, security, and full API
-parity remain unfinished.
+load changes, per-window prefetch, recovery migration, security implementation,
+and full API parity remain unfinished. The accepted trusted-LAN security
+baseline is defined by [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md).
 
 ## Piped-ring execution
 
@@ -182,9 +183,10 @@ The remaining product gaps are explicit:
   an active request.
 - The OpenAI-compatible HTTP surface is a subset; full request, response,
   error, usage, streaming, and cancellation parity is unfinished.
-- Authentication, encryption, credential handling, and tenant or prompt
-  privacy controls are unfinished. The deployment boundary remains a trusted
-  LAN.
+- Authentication, encryption, credential handling, and tenant or prompt privacy
+  controls remain unfinished in code. The accepted trusted-LAN baseline is
+  documented in [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md);
+  the deployment boundary remains a trusted LAN.
 
 These gaps must be removed through a clean cutover. They are not supported
 product configurations, provisional releases, or alternate architectures.

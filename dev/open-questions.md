@@ -380,17 +380,19 @@ Do not call the trusted-LAN assumption a security implementation; API keys,
 TLS, worker authentication, encryption, and privacy controls remain unfinished.
 
 
-## 7.1 Proposed security architecture (OPEN QUESTION)
+## 7.1 Proposed security architecture (resolved by ADR 0009)
 
-This is a proposed design for explicit user acceptance. It is not an accepted
-ADR, implementation authorization, or claim that security is present. Until
-accepted and implemented, the trusted-LAN warning above remains in force.
+This section preserves the historical proposal and rationale. Carl Stone
+accepted the proposal and all four defaults on 2026-08-22. The binding decision
+is [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md). This section
+is not an unresolved question or a separate authorization surface.
 
 ### Threat boundary and default exposure
 
 - The boundary is a trusted LAN plus the existing SSH host and user trust. A
-  device admitted by discovery and SSH is trusted to run Potluck code. This
-  proposal does not protect a compromised head, worker, SSH account, or host OS.
+  device admitted by discovery and SSH is trusted to run Potluck code. The
+  accepted baseline does not protect a compromised head, worker, SSH account,
+  or host OS.
 - The HTTP service binds to all interfaces by default (`0.0.0.0`) as the
   accepted household-device usability default. `--host` can restrict it to
   loopback or another explicit address. Startup must state the bound address
@@ -399,23 +401,24 @@ accepted and implemented, the trusted-LAN warning above remains in force.
   for API requests, compare without timing leaks, and never write the value to
   logs or persistent model or config files. Without it, trusted-LAN use stays
   unauthenticated.
-- `--cors-origin` should accept an exact allowed origin. When omitted, send no
-  CORS allow-origin header; do not use `*` as a default. CORS is not
-  authentication.
-- Proposed endpoint policy: all routes, including `/health` and `/v1/models`,
-  require the key whenever one is configured.
+- `--cors-origin` accepts one exact allowed origin. When omitted, send no
+  CORS allow-origin header. Wildcard origins and credentialed CORS are not
+  allowed. CORS is not authentication.
+- Accepted endpoint policy: all routes, including `/health` and `/v1/models`,
+  require the key whenever one is configured. No route is exempt.
 
-### Direct-ring credential proposal
+### Direct-ring credentials
 
-- Before launching workers, the head generates an ephemeral ZeroMQ CURVE
-  keypair for every selected ring peer in the session. The head keeps the
-  session credential set in memory only; it is not read from a model, config,
-  or key file.
-- The head passes each worker its own secret key and the public keys of its
-  adjacent peers through the existing authenticated SSH worker launch channel,
-  before that worker joins the ring. Secrets must not appear in shell
-  arguments, process listings, logs, readiness output, model files, or
-  persistent worker files.
+- Before launching workers, the head generates an ephemeral in-memory Z85
+  ZeroMQ CURVE keypair for every selected ring peer. The head keeps the session
+  credential set in memory only; it is not read from a model, config, or key
+  file.
+- The head passes each worker its own public and secret key plus the expected
+  public key of its next peer through a one-shot bootstrap record on the
+  existing authenticated SSH stdin before that worker joins the ring. The
+  local peer uses an equivalent in-memory handoff. Secrets must not appear in
+  shell arguments, environment variables, process listings, logs, readiness
+  output, model files, persistent worker files, or build artifacts.
 - Each direct adjacent-peer ZeroMQ connection uses CURVE peer authentication:
   the receiver is configured with its own server keypair and the sender is
   configured with its own client keypair plus the expected receiver public key.
@@ -442,23 +445,28 @@ accepted and implemented, the trusted-LAN warning above remains in force.
   credential and does not encrypt HTTP traffic; public-Internet exposure
   remains prohibited.
 
-### Choices requiring explicit acceptance
+### Resolved choices
 
-The following choices are still open; the proposed defaults above are not
-accepted decisions:
+The following four choices were previously listed as requiring explicit
+acceptance. They are now resolved by Carl Stone's acceptance on 2026-08-22 and
+are binding through ADR 0009. The prior alternatives remain recorded here to
+preserve the historical context; the accepted defaults are:
 
-1. **Endpoint coverage**: should `/health` stay available without a key for
-   remote orchestration, or should every route require it? Proposed default:
-   every route requires a configured key.
-2. **CORS shape**: one exact origin versus multiple origins, and whether
-   credentialed browser requests are needed. Proposed default: one exact
-   origin, no wildcard, and no credentialed CORS.
-3. **SSH bootstrap carrier**: one-shot SSH stdin versus another SSH-confidential
-   handoff. Proposed default: a one-shot bootstrap record before daemonization;
-   command-line and persistent-file handoff are prohibited.
-4. **HTTP encryption**: whether TLS belongs in this baseline or a later
-   accepted decision. Proposed default: trusted-LAN HTTP has no built-in TLS;
-   non-loopback deployment must not be treated as Internet-safe without TLS.
+1. **Endpoint coverage**: The prior alternative considered leaving `/health`
+   available without a key for remote orchestration. The accepted policy is
+   that every route requires a configured key, including `/health` and
+   `/v1/models`.
+2. **CORS shape**: The prior alternatives considered multiple origins and
+   credentialed browser requests. The accepted shape is one exact allowed
+   origin, with no wildcard and no credentialed CORS.
+3. **SSH bootstrap carrier**: The prior alternative considered another
+   SSH-confidential handoff. The accepted carrier is a one-shot bootstrap
+   record on SSH stdin before daemonization; command-line and persistent-file
+   handoff are prohibited. A local peer uses the equivalent in-memory handoff.
+4. **HTTP encryption**: The prior alternative considered deferring TLS to a
+   later decision. The accepted baseline has no built-in TLS for trusted-LAN
+   HTTP; non-loopback deployment is not treated as Internet-safe without an
+   external TLS boundary.
 
 ## 8. Model and backend scope
 
