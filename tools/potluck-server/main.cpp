@@ -487,9 +487,8 @@ int main(int argc, char ** argv) {
         options.temp = temp;
         options.top_p = top_p;
 
-        ServerRing & ring = session.ring;
         httplib::Server server;
-        slot_scheduler scheduler(ring, vocab, n_seq_max, n_ubatch,
+        slot_scheduler scheduler(session.ring, vocab, n_seq_max, n_ubatch,
                                  [&](std::string & error) {
                                      return rebuild_ring(session, options, false, error);
                                  },
@@ -615,14 +614,14 @@ int main(int argc, char ** argv) {
 
             scheduler.start();
             std::printf("potluck-server: listening on http://%s:%u (%zu workers, %zu ring windows, model %s)\n",
-                        host.c_str(), http_port, ring.workers.size(), ring.windows.size(), model_path.c_str());
+                        host.c_str(), http_port, session.ring.workers.size(), session.ring.windows.size(), model_path.c_str());
             std::fflush(stdout);
             if (bench) {
                 const std::vector<llama_token> bench_prompt = tokenize_prompt(vocab, "The capital of France is");
                 serve_stats stats;
                 const auto start = std::chrono::steady_clock::now();
                 const std::vector<llama_token> bench_tokens =
-                    serve(ring, vocab, bench_prompt, 8, {}, &stats, 0, {}, n_ubatch);
+                    serve(session.ring, vocab, bench_prompt, 8, {}, &stats, 0, {}, n_ubatch);
                 const double wall = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - start).count();
                 const double prefill = stats.prefill_seconds > 0.0
@@ -633,9 +632,9 @@ int main(int argc, char ** argv) {
                 const double bytes_per_token = bench_tokens.empty()
                     ? 0.0 : static_cast<double>(stats.head_payload_bytes) / bench_tokens.size();
                 const uint64_t model_bytes = potluck::model_file_bytes(model_path);
-                std::printf("bench ring route windows=%zu\n", ring.windows.size());
-                for (size_t i = 0; i < ring.windows.size(); ++i) {
-                    const potluck::ring_window & window = ring.windows[i];
+                std::printf("bench ring route windows=%zu\n", session.ring.windows.size());
+                for (size_t i = 0; i < session.ring.windows.size(); ++i) {
+                    const potluck::ring_window & window = session.ring.windows[i];
                     const uint64_t bytes = model_bytes * (window.end - window.start) /
                         std::max<uint32_t>(1, n_layer);
                     std::printf("bench ring window %zu owner=%u [%u,%u) weight-bytes=%llu n_gpu_layers=%d\n",

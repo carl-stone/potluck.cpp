@@ -428,7 +428,8 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     "model", "messages", "prompt", "max_tokens", "max_completion_tokens", "n_predict",
                     "n", "stop", "stream", "stream_options", "reasoning_effort", "temperature", "top_p",
                     "top_k", "min_p", "seed", "presence_penalty", "frequency_penalty", "repeat_penalty",
-                    "repeat_last_n", "logprobs", "top_logprobs", "tools", "tool_choice", "parallel_tool_calls"
+                    "repeat_last_n", "logprobs", "top_logprobs", "tools", "tool_choice",
+                    "parallel_tool_calls", "preserve_thinking", "chat_template_kwargs"
                 };
                 for (auto it = req.begin(); it != req.end(); ++it) {
                     if (allowed.find(it.key()) == allowed.end()) {
@@ -453,8 +454,10 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     throw std::runtime_error("invalid messages: not supported for completions");
                 }
                 if (!chat && (req.contains("tools") || req.contains("tool_choice") ||
-                              req.contains("parallel_tool_calls"))) {
-                    throw std::runtime_error("invalid tools: tool calls require chat completions");
+                              req.contains("parallel_tool_calls") ||
+                              req.contains("preserve_thinking") ||
+                              req.contains("chat_template_kwargs"))) {
+                    throw std::runtime_error("invalid chat template fields: require chat completions");
                 }
                 const bool stream = json_bool(req, "stream", false);
                 bool include_usage = false;
@@ -495,6 +498,24 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                         throw std::runtime_error("invalid messages: expected a non-empty array");
                     }
                     common_chat_templates_inputs inputs;
+                    if (req.contains("preserve_thinking") &&
+                        !req["preserve_thinking"].is_boolean()) {
+                        throw std::runtime_error("invalid preserve_thinking: expected a boolean");
+                    }
+                    if (req.contains("chat_template_kwargs")) {
+                        if (!req["chat_template_kwargs"].is_object()) {
+                            throw std::runtime_error(
+                                "invalid chat_template_kwargs: expected an object");
+                        }
+                        for (auto it = req["chat_template_kwargs"].begin();
+                             it != req["chat_template_kwargs"].end(); ++it) {
+                            inputs.chat_template_kwargs[it.key()] = it.value().dump();
+                        }
+                    }
+                    if (req.contains("preserve_thinking")) {
+                        inputs.chat_template_kwargs["preserve_thinking"] =
+                            req["preserve_thinking"].dump();
+                    }
                     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
                     try {
                         inputs.messages = common_chat_msgs_parse_oaicompat(req["messages"]);
@@ -916,7 +937,8 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                     const std::string limited = stream_text(generated_text, stops);
                                     if (parse_stream_output && chat) {
                                         common_chat_msg message = parse_chat_output(limited, true);
-                                        if (!message.empty()) {
+                                        if (!message.empty() &&
+                                            message.tool_calls.size() >= stream_message.tool_calls.size()) {
                                             set_stream_tool_call_ids(message);
                                             const auto diffs = common_chat_msg_diff::compute_diffs(stream_message, message);
                                             stream_message = std::move(message);
@@ -989,7 +1011,8 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                 }
                                 common_chat_msg parsed = chat ? parse_chat_output(final_text, false) : common_chat_msg{};
                                 if (parse_stream_output && chat) {
-                                    if (!parsed.empty()) {
+                                    if (!parsed.empty() &&
+                                        parsed.tool_calls.size() >= stream_message.tool_calls.size()) {
                                         set_stream_tool_call_ids(parsed);
                                         const auto diffs = common_chat_msg_diff::compute_diffs(stream_message, parsed);
                                         stream_message = parsed;
@@ -1049,7 +1072,12 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                 sink.done();
                                 scheduler.release(slot);
                                 return true;
-                            } catch (const std::exception &) {
+                            } catch (const std::exception & exception) {
+                                std::fprintf(stderr, "potluck-server: streaming response failed: %s\n",
+                                             exception.what());
+                                return abort();
+                            } catch (...) {
+                                std::fprintf(stderr, "potluck-server: streaming response failed\n");
                                 return abort();
                             }
                         });

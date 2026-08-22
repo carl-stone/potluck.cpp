@@ -149,6 +149,15 @@ assert result["choices"][0]["finish_reason"] in {"stop", "length"}
 usage = result["usage"]
 assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 PY
+OMP_CHAT=$(curl -fsS "${auth_header[@]}" -d \
+    '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":2,"reasoning_effort":"none","preserve_thinking":true,"chat_template_kwargs":{"preserve_thinking":true}}' \
+    "http://${HOST}:${PORT}/v1/chat/completions")
+python3 - "${OMP_CHAT}" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["object"] == "chat.completion"
+assert result["choices"][0]["message"]["role"] == "assistant"
+PY
 V1_COMPLETION=$(curl -fsS "${auth_header[@]}" \
     -d "{\"model\":\"$(basename "${MODEL}")\",\"prompt\":\"A short fact:\",\"max_completion_tokens\":4,\"n\":2,\"stop\":[\"\\n\"],\"temperature\":0,\"top_p\":1,\"top_k\":1,\"min_p\":0,\"presence_penalty\":0,\"frequency_penalty\":0,\"repeat_penalty\":1,\"repeat_last_n\":64,\"logprobs\":1}" \
     "http://${HOST}:${PORT}/v1/completions")
@@ -301,6 +310,31 @@ for _, choice in tool_chunks:
 assert call_id and call_id.startswith("call_")
 assert name == "weather"
 assert json.loads(arguments)["city"] == "Paris"
+PY
+
+TOOL_TRUNCATED_STREAM=$(curl -fsS -N "${auth_header[@]}" -d \
+    '{"messages":[{"role":"user","content":"Call weather for Paris"}],"max_tokens":12,"temperature":0,"reasoning_effort":"none","stream":true,"tools":[{"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"required"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions")
+python3 - "${TOOL_TRUNCATED_STREAM}" <<'PY'
+import json, sys
+lines = [
+    line[6:]
+    for line in sys.argv[1].splitlines()
+    if line.startswith("data: ")
+]
+assert lines and lines[-1] == "[DONE]"
+events = [json.loads(line) for line in lines[:-1]]
+assert any(
+    call.get("function", {}).get("name") == "weather"
+    for event in events
+    for choice in event["choices"]
+    for call in choice["delta"].get("tool_calls", [])
+)
+assert any(
+    choice["finish_reason"] == "tool_calls"
+    for event in events
+    for choice in event["choices"]
+)
 PY
 TOOL_AUTO_STREAM=$(curl -fsS -N "${auth_header[@]}" -d \
     '{"messages":[{"role":"user","content":"Say hello without calling a tool."}],"max_tokens":8,"temperature":0,"reasoning_effort":"none","stream":true,"tools":[{"type":"function","function":{"name":"weather","description":"Get current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}],"tool_choice":"auto"}' \
