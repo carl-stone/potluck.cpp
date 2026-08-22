@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 namespace {
+std::atomic<uint64_t> topology_generation { 1 };
 
 bool worker_process_alive(pid_t pid, const std::string & label, std::string & error) {
     if (pid <= 0) {
@@ -101,6 +102,35 @@ std::set<std::string> probe_targets(const std::vector<device_probe> & probes) {
         }
     }
     return result;
+}
+bool write_bootstrap_record(int fd,
+                            const potluck::curve_bootstrap_credentials & credentials) {
+    std::vector<uint8_t> record;
+    std::string error;
+    if (!potluck::encode_curve_bootstrap(credentials, record, error)) {
+        return false;
+    }
+    size_t offset = 0;
+    while (offset < record.size()) {
+        const ssize_t count = write(fd, record.data() + offset, record.size() - offset);
+        if (count > 0) {
+            offset += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        volatile uint8_t * bytes = record.data();
+        for (size_t index = 0; index < record.size(); ++index) {
+            bytes[index] = 0;
+        }
+        return false;
+    }
+    volatile uint8_t * bytes = record.data();
+    for (size_t index = 0; index < record.size(); ++index) {
+        bytes[index] = 0;
+    }
+    return true;
 }
 
 } // namespace
@@ -230,7 +260,8 @@ void terminate_child_process(pid_t pid) {
 
 pid_t launch_remote_worker(const bootstrap_node & bootstrap, const std::string & model,
                            const ring_worker & worker, const std::string & result_endpoint,
-                           uint32_t index) {
+                           uint32_t index,
+                           const potluck::curve_bootstrap_credentials & credentials) {
     const std::string log = "worker-" + std::to_string(index) + ".log";
     const std::string pid_file = ".potluck-worker-" + std::to_string(index) + ".pid";
     const std::string remote = "cd ~/potluck || exit 1; nohup ./potluck-worker " +
@@ -239,13 +270,14 @@ pid_t launch_remote_worker(const bootstrap_node & bootstrap, const std::string &
                                " --next " + shell_quote(worker.next_endpoint) +
                                " --result " + shell_quote(result_endpoint) +
                                " --rank " + std::to_string(index) +
-                               " >" + shell_quote(log) + " 2>&1 < /dev/null & " +
+                               " --credentials-stdin <&0 >" + shell_quote(log) +
+                               " 2>&1 & " +
                                "pid=$!; echo \"$pid\" > " + shell_quote(pid_file) + "; " +
                                "attempt=0; while [ \"$attempt\" -lt 120 ]; do " +
                                "case \"$(cat " + shell_quote(log) +
-                               " 2>/dev/null)\" in *\"WORKER rank \"*) " +
+                               " 2>/dev/null)\" in *\"WORKER rank " +
+                               std::to_string(index) + " bound \"*) " +
                                "echo POTLUCK_WORKER_READY; wait \"$pid\"; exit $?;; esac; " +
-                               "kill -0 \"$pid\" 2>/dev/null || exit 1; " +
                                "attempt=$((attempt + 1)); sleep 1; done; exit 1";
     const std::string ssh = ssh_options(bootstrap);
     const std::string command = ssh + " " + shell_quote(bootstrap.ssh_target) + " " + shell_quote(remote);
@@ -253,33 +285,45 @@ pid_t launch_remote_worker(const bootstrap_node & bootstrap, const std::string &
     std::fflush(stdout);
 
     int output_pipe[2] = {-1, -1};
-    if (pipe(output_pipe) != 0) {
+    int input_pipe[2] = {-1, -1};
+    if (pipe(output_pipe) != 0 || pipe(input_pipe) != 0) {
+        if (output_pipe[0] >= 0) close(output_pipe[0]);
+        if (output_pipe[1] >= 0) close(output_pipe[1]);
+        if (input_pipe[0] >= 0) close(input_pipe[0]);
+        if (input_pipe[1] >= 0) close(input_pipe[1]);
         throw std::runtime_error("cannot create SSH launch pipe: " + std::string(std::strerror(errno)));
     }
     const pid_t ssh_pid = fork();
     if (ssh_pid < 0) {
         close(output_pipe[0]);
         close(output_pipe[1]);
+        close(input_pipe[0]);
+        close(input_pipe[1]);
         throw std::runtime_error("cannot fork SSH launcher: " + std::string(std::strerror(errno)));
     }
     if (ssh_pid == 0) {
         close(output_pipe[0]);
+        close(input_pipe[1]);
         (void) setpgid(0, 0);
-        const int input = open("/dev/null", O_RDONLY);
-        if (input >= 0) {
-            (void) dup2(input, STDIN_FILENO);
-            close(input);
-        }
-        if (dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
+        if (dup2(input_pipe[0], STDIN_FILENO) < 0 ||
+            dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
             dup2(output_pipe[1], STDERR_FILENO) < 0) {
             _exit(127);
         }
+        close(input_pipe[0]);
         close(output_pipe[1]);
         execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char *>(nullptr));
         _exit(127);
     }
     close(output_pipe[1]);
+    close(input_pipe[0]);
     (void) setpgid(ssh_pid, ssh_pid);
+    if (!write_bootstrap_record(input_pipe[1], credentials)) {
+        close(input_pipe[1]);
+        terminate_child_process(ssh_pid);
+        throw std::runtime_error("cannot send CURVE bootstrap credentials to SSH worker");
+    }
+    close(input_pipe[1]);
 
     std::string output;
     bool ready = false;
@@ -336,13 +380,15 @@ pid_t launch_remote_worker(const bootstrap_node & bootstrap, const std::string &
 
 pid_t launch_local_worker(const std::string & worker_path, const std::string & model,
                           const ring_worker & worker, const std::string & result_endpoint,
-                          uint32_t index) {
+                          uint32_t index,
+                          const potluck::curve_bootstrap_credentials & credentials) {
     std::vector<std::string> args = {
         worker_path, model,
         "--bind", worker.bind_endpoint,
         "--next", worker.next_endpoint,
         "--result", result_endpoint,
-        "--rank", std::to_string(index)
+        "--rank", std::to_string(index),
+        "--credentials-stdin"
     };
     std::vector<char *> argv;
     argv.reserve(args.size() + 1);
@@ -350,15 +396,34 @@ pid_t launch_local_worker(const std::string & worker_path, const std::string & m
         argv.push_back(arg.data());
     }
     argv.push_back(nullptr);
+    int input_pipe[2] = {-1, -1};
+    if (pipe(input_pipe) != 0) {
+        throw std::runtime_error("cannot create local worker credential pipe: " +
+                                 std::string(std::strerror(errno)));
+    }
     const pid_t pid = fork();
     if (pid < 0) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
         throw std::runtime_error("cannot fork potluck-worker");
     }
-    if (pid != 0) {
-        return pid;
+    if (pid == 0) {
+        close(input_pipe[1]);
+        if (dup2(input_pipe[0], STDIN_FILENO) < 0) {
+            _exit(127);
+        }
+        close(input_pipe[0]);
+        execv(worker_path.c_str(), argv.data());
+        std::_Exit(127);
     }
-    execv(worker_path.c_str(), argv.data());
-    std::_Exit(127);
+    close(input_pipe[0]);
+    if (!write_bootstrap_record(input_pipe[1], credentials)) {
+        close(input_pipe[1]);
+        terminate_child_process(pid);
+        throw std::runtime_error("cannot send CURVE bootstrap credentials to local worker");
+    }
+    close(input_pipe[1]);
+    return pid;
 }
 bool stop_remote_workers(const bootstrap_node & bootstrap) {
     const std::string command =
@@ -409,20 +474,12 @@ void stop_planned_workers(const std::vector<planned_worker> & planned) {
     }
 }
 
-void launch_local_workers(const std::string & worker_path,
-                          const std::vector<std::string> & models,
-                          const std::vector<ring_worker> & workers,
-                          const std::string & result_endpoint) {
-    if (models.size() != workers.size()) {
-        throw std::runtime_error("local worker model and endpoint counts differ");
-    }
-    for (uint32_t index = 0; index < models.size(); ++index) {
-        launch_local_worker(worker_path, models[index], workers[index],
-                            result_endpoint, index);
-    }
-}
 
-void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int timeout_ms) {
+void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int timeout_ms,
+                           const potluck::curve_client_credentials & controller_credentials) {
+    if (ring.worker_server_keys.size() != n_workers) {
+        throw std::runtime_error("ring CURVE server key count mismatch");
+    }
     if (!ring.controls.empty()) {
         if (ring.controls.size() != n_workers) {
             throw std::runtime_error("ring control sender count mismatch");
@@ -431,8 +488,12 @@ void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int timeout_ms
     }
     ring.controls.reserve(n_workers);
     for (uint32_t index = 0; index < n_workers; ++index) {
+        potluck::curve_client_credentials credentials = controller_credentials;
+        credentials.server_public_key = ring.worker_server_keys[index];
         potluck::ring_sender sender = potluck::ring_sender::connect(
-            ring.workers[index].connect_endpoint, ring.error);
+            ring.workers[index].connect_endpoint, credentials, ring.error);
+        potluck::scrub_curve_keypair(credentials.keypair);
+        credentials.server_public_key.clear();
         if (!sender.valid()) {
             throw std::runtime_error("cannot connect ring control sender for worker " +
                                      std::to_string(index) + ": " + ring.error);
@@ -446,7 +507,8 @@ void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int timeout_ms
 
 void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
                     uint32_t n_seq_max, uint32_t n_ubatch, uint32_t seed,
-                    float temp, float top_p) {
+                    float temp, float top_p,
+                    const potluck::curve_client_credentials & controller_credentials) {
     const uint32_t n_workers = static_cast<uint32_t>(ring.workers.size());
     if (n_workers == 0 || ring.windows.empty()) {
         throw std::runtime_error("cannot configure an empty ring");
@@ -454,7 +516,7 @@ void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
     constexpr int handshake_timeout_ms = 120000;
     constexpr int decode_timeout_ms = 600000;
 
-    prepare_ring_controls(ring, n_workers, handshake_timeout_ms);
+    prepare_ring_controls(ring, n_workers, handshake_timeout_ms, controller_credentials);
 
     for (uint32_t index = 0; index < n_workers; ++index) {
         potluck::node_config config;
@@ -496,7 +558,12 @@ void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
             throw std::runtime_error("ring worker sent unexpected readiness message");
         }
     }
-    ring.ingress = potluck::ring_sender::connect(ring.workers.front().connect_endpoint, ring.error);
+    potluck::curve_client_credentials ingress_credentials = controller_credentials;
+    ingress_credentials.server_public_key = ring.worker_server_keys.front();
+    ring.ingress = potluck::ring_sender::connect(
+        ring.workers.front().connect_endpoint, ingress_credentials, ring.error);
+    potluck::scrub_curve_keypair(ingress_credentials.keypair);
+    ingress_credentials.server_public_key.clear();
     if (!ring.ingress.valid()) {
         throw std::runtime_error("cannot connect ring ingress sender: " + ring.error);
     }
@@ -699,6 +766,9 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
     const float top_p = options.top_p;
     ServerRing ring;
     std::vector<planned_worker> planned;
+    std::vector<potluck::curve_bootstrap_credentials> credentials;
+    potluck::curve_keypair result_server_keypair;
+    potluck::curve_client_credentials controller_credentials;
     try {
                 if (!target.ring.controls.empty()) {
                     std::string reset_error;
@@ -871,6 +941,38 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                     ? tcp_endpoint("127.0.0.1", planned[index].ring.address.port)
                     : planned[(index + 1) % n_workers].ring.connect_endpoint;
         }
+        const uint64_t generation = topology_generation.fetch_add(1);
+        std::string curve_error;
+        if (!potluck::generate_curve_keypair(result_server_keypair, curve_error)) {
+            throw std::runtime_error("security bootstrap: cannot generate result CURVE keypair: " +
+                                     curve_error);
+        }
+        if (!potluck::generate_curve_keypair(controller_credentials.keypair, curve_error)) {
+            throw std::runtime_error("security bootstrap: cannot generate controller CURVE keypair: " +
+                                     curve_error);
+        }
+        credentials.resize(n_workers);
+        ring.worker_server_keys.resize(n_workers);
+        for (uint32_t index = 0; index < n_workers; ++index) {
+            credentials[index].rank = index;
+            credentials[index].peer_count = n_workers;
+            credentials[index].generation = generation;
+            if (!potluck::generate_curve_keypair(credentials[index].keypair, curve_error)) {
+                throw std::runtime_error("security bootstrap: cannot generate peer CURVE keypair: " +
+                                         curve_error);
+            }
+            ring.worker_server_keys[index] = credentials[index].keypair.public_key;
+        }
+        ring.result_server_public_key = result_server_keypair.public_key;
+        for (uint32_t index = 0; index < n_workers; ++index) {
+            credentials[index].previous_server_key =
+                credentials[(index + n_workers - 1) % n_workers].keypair.public_key;
+            credentials[index].next_server_key =
+                credentials[(index + 1) % n_workers].keypair.public_key;
+            credentials[index].result_server_key = ring.result_server_public_key;
+            credentials[index].controller_public_key = controller_credentials.keypair.public_key;
+        }
+
 
         ring.workers.reserve(planned.size());
         for (const planned_worker & plan : planned) {
@@ -892,7 +994,8 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         }
         std::fflush(stdout);
         std::string result_error;
-        ring.result = potluck::ring_receiver::bind("tcp://0.0.0.0:*", result_error);
+        ring.result = potluck::ring_receiver::bind(
+            "tcp://0.0.0.0:*", result_server_keypair, ring.worker_server_keys, result_error);
         if (!ring.result.valid()) {
             throw std::runtime_error("cannot bind ring result receiver: " + result_error);
         }
@@ -933,19 +1036,26 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             if (plan.kind == worker_kind::remote) {
                 plan.remote_ssh_pid = launch_remote_worker(plan.device.bootstrap, plan.model,
                                                            ring.workers[index],
-                                                           ring.result_endpoint, index);
+                                                           ring.result_endpoint, index,
+                                                           credentials[index]);
             } else {
                 plan.local_pid = launch_local_worker(worker_path, plan.model,
                                                      ring.workers[index],
-                                                     ring.result_endpoint, index);
+                                                     ring.result_endpoint, index,
+                                                     credentials[index]);
             }
+            potluck::scrub_curve_credentials(credentials[index]);
         }
         const std::vector<potluck::accel_profile> profiles =
             collect_accel_profiles(ring, n_workers);
         assign_gpu_layers(ring.windows, profiles, n_workers, model_bytes, n_layer,
                           n_head_kv, head_dim, n_ctx);
         std::fflush(stdout);
-        configure_ring(ring, n_layer, n_ctx, n_seq_max, n_ubatch, seed, temp, top_p);
+        configure_ring(ring, n_layer, n_ctx, n_seq_max, n_ubatch, seed, temp, top_p,
+                      controller_credentials);
+        potluck::scrub_curve_keypair(result_server_keypair);
+        potluck::scrub_curve_keypair(controller_credentials.keypair);
+        controller_credentials.server_public_key.clear();
         target.ring = std::move(ring);
         target.workers = std::move(planned);
         target.healthy = true;
@@ -961,6 +1071,12 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         error.clear();
         return true;
     } catch (const std::exception & exception) {
+        for (potluck::curve_bootstrap_credentials & credential : credentials) {
+            potluck::scrub_curve_credentials(credential);
+        }
+        potluck::scrub_curve_keypair(result_server_keypair);
+        potluck::scrub_curve_keypair(controller_credentials.keypair);
+        controller_credentials.server_public_key.clear();
         if (!ring.controls.empty()) {
             std::string reset_error;
             if (!reset_ring_workers(ring, reset_error) && !reset_error.empty()) {
@@ -977,23 +1093,23 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
 }
 bool rebuild_ring(ring_session & session, ring_startup_options & options,
                   bool restore_on_failure, std::string & error) {
+    ServerRing old_ring;
     std::vector<planned_worker> old_workers;
     {
         std::lock_guard<std::mutex> lock(session.mutex);
         session.healthy = false;
         session.health_reason = "ring rebuild in progress";
+        old_ring = std::move(session.ring);
+        old_workers = std::move(session.workers);
     }
-    if (!session.ring.controls.empty()) {
+    if (!old_ring.controls.empty()) {
         std::string reset_error;
-        if (!reset_ring_workers(session.ring, reset_error) && !reset_error.empty()) {
+        if (!reset_ring_workers(old_ring, reset_error) && !reset_error.empty()) {
             std::fprintf(stderr, "potluck-server: old ring reset: %s\n", reset_error.c_str());
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(session.mutex);
-        old_workers = std::move(session.workers);
-    }
     stop_planned_workers(old_workers);
+    old_ring = ServerRing {};
 
     const auto install = [&](ring_session & source) {
         std::lock_guard<std::mutex> lock(session.mutex);

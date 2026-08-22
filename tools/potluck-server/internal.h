@@ -105,6 +105,8 @@ struct ServerRing {
     std::vector<potluck::ring_window> windows;
     potluck::ring_receiver result;
     std::string result_endpoint;
+    std::string result_server_public_key;
+    std::vector<std::string> worker_server_keys;
     std::vector<potluck::ring_sender> controls;
     potluck::ring_sender ingress;
     std::deque<potluck::message> pending_results;
@@ -225,17 +227,20 @@ std::string endpoint_host(const std::string & endpoint, const std::string & host
 
 pid_t launch_remote_worker(const bootstrap_node & bootstrap, const std::string & model,
                            const ring_worker & worker, const std::string & result_endpoint,
-                           uint32_t index);
+                           uint32_t index,
+                           const potluck::curve_bootstrap_credentials & credentials);
 pid_t launch_local_worker(const std::string & worker_path, const std::string & model,
                           const ring_worker & worker, const std::string & result_endpoint,
-                          uint32_t index);
+                          uint32_t index,
+                          const potluck::curve_bootstrap_credentials & credentials);
 bool stop_remote_workers(const bootstrap_node & bootstrap);
 void terminate_child_process(pid_t pid);
 void stop_planned_workers(const std::vector<planned_worker> & planned);
 
 void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
                     uint32_t n_seq_max, uint32_t n_ubatch, uint32_t seed,
-                    float temp, float top_p);
+                    float temp, float top_p,
+                    const potluck::curve_client_credentials & controller_credentials);
 bool reset_ring_workers(ServerRing & ring, std::string & error);
 
 bool bring_up_ring(ring_session & target, ring_startup_options & options,

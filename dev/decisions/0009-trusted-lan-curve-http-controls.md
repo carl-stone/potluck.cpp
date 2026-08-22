@@ -48,9 +48,10 @@ connect.
    directly; the head configures credentials but never relays ring payloads.
 4. Secret material must not appear in command-line arguments, environment
    variables, process listings, logs, readiness output, model files, persistent
-   worker files, or build artifacts. The head keeps the credential set only in
-   memory. A worker keeps only its assigned secret key in process memory and
-   erases it on clean shutdown. Logs and errors redact all key material.
+   worker files, or build artifacts. The head never persists private keys and
+   keeps the credential set only in memory. A worker keeps only its assigned
+   secret key in process memory and erases it on clean shutdown. Logs and
+   errors redact all key material.
 
 ### Key lifecycle and fail-closed behavior
 

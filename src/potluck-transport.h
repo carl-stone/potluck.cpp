@@ -5,8 +5,49 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace potluck {
+
+constexpr size_t curve_z85_key_size = 40;
+constexpr size_t curve_bootstrap_record_size = 8 + 1 + 4 + 4 + 8 + 6 * curve_z85_key_size;
+
+struct curve_keypair {
+    std::string public_key;
+    std::string secret_key;
+
+    bool valid() const noexcept {
+        return public_key.size() == curve_z85_key_size &&
+               secret_key.size() == curve_z85_key_size;
+    }
+};
+
+struct curve_client_credentials {
+    curve_keypair keypair;
+    std::string server_public_key;
+};
+
+struct curve_bootstrap_credentials {
+    uint32_t rank = 0;
+    uint32_t peer_count = 0;
+    uint64_t generation = 0;
+    curve_keypair keypair;
+    std::string previous_server_key;
+    std::string next_server_key;
+    std::string result_server_key;
+    std::string controller_public_key;
+};
+
+using curve_public_key_list = std::vector<std::string>;
+
+bool generate_curve_keypair(curve_keypair & output, std::string & error);
+bool valid_curve_z85_key(const std::string & key);
+bool encode_curve_bootstrap(const curve_bootstrap_credentials & input,
+                            std::vector<uint8_t> & output, std::string & error);
+bool decode_curve_bootstrap(const uint8_t * data, size_t size,
+                            curve_bootstrap_credentials & output, std::string & error);
+void scrub_curve_keypair(curve_keypair & keypair) noexcept;
+void scrub_curve_credentials(curve_bootstrap_credentials & credentials) noexcept;
 
 // The metadata frame is intentionally small and independent of the payload
 // helpers used by the model protocol.
@@ -24,7 +65,10 @@ public:
     ring_receiver(ring_receiver && other) noexcept;
     ring_receiver & operator=(ring_receiver && other) noexcept;
 
-    static ring_receiver bind(const std::string & endpoint, std::string & error);
+    static ring_receiver bind(const std::string & endpoint,
+                              const curve_keypair & keypair,
+                              const curve_public_key_list & allowed_clients,
+                              std::string & error);
 
     bool valid() const noexcept;
     const std::string & endpoint() const noexcept;
@@ -32,10 +76,11 @@ public:
     bool receive(message & output, std::string & error);
 
 private:
-    ring_receiver(void * context, void * socket, std::string endpoint);
+    ring_receiver(void * context, void * socket, void * zap_state, std::string endpoint);
 
     void * context_ = nullptr;
     void * socket_ = nullptr;
+    void * zap_state_ = nullptr;
     std::string endpoint_;
 };
 
@@ -49,7 +94,9 @@ public:
     ring_sender(ring_sender && other) noexcept;
     ring_sender & operator=(ring_sender && other) noexcept;
 
-    static ring_sender connect(const std::string & endpoint, std::string & error);
+    static ring_sender connect(const std::string & endpoint,
+                               const curve_client_credentials & credentials,
+                               std::string & error);
 
     bool valid() const noexcept;
     const std::string & endpoint() const noexcept;
@@ -77,12 +124,21 @@ public:
     ring_peer(ring_peer && other) noexcept = default;
     ring_peer & operator=(ring_peer && other) noexcept = default;
 
-    static ring_peer bind(const std::string & local_endpoint, std::string & error);
     static ring_peer bind(const std::string & local_endpoint,
+                          const curve_keypair & keypair,
+                          const curve_public_key_list & allowed_clients,
+                          std::string & error);
+    static ring_peer bind(const std::string & local_endpoint,
+                          const curve_keypair & keypair,
                           const std::string & next_endpoint,
+                          const std::string & next_server_key,
+                          const curve_public_key_list & allowed_clients,
                           std::string & error);
 
-    bool connect_next(const std::string & next_endpoint, std::string & error);
+    bool connect_next(const std::string & next_endpoint,
+                      const curve_keypair & keypair,
+                      const std::string & next_server_key,
+                      std::string & error);
 
     bool valid() const noexcept;
     bool receive_valid() const noexcept;

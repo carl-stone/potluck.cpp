@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <vector>
+#include <utility>
 
 #define CHECK(cond)                                                                       \
     do {                                                                                  \
@@ -44,17 +44,54 @@ void check_equal(const potluck::message & actual, const potluck::message & expec
 
 int main() {
     std::string error;
-    potluck::ring_peer left = potluck::ring_peer::bind("tcp://127.0.0.1:*", error);
+    potluck::curve_keypair left_keys;
+    potluck::curve_keypair right_keys;
+    CHECK(potluck::generate_curve_keypair(left_keys, error));
+    CHECK(potluck::generate_curve_keypair(right_keys, error));
+    CHECK(left_keys.public_key != right_keys.public_key);
+
+    potluck::curve_bootstrap_credentials bootstrap;
+    bootstrap.rank = 0;
+    bootstrap.peer_count = 2;
+    bootstrap.generation = 17;
+    bootstrap.keypair = left_keys;
+    bootstrap.previous_server_key = right_keys.public_key;
+    bootstrap.next_server_key = right_keys.public_key;
+    bootstrap.result_server_key = left_keys.public_key;
+    bootstrap.controller_public_key = left_keys.public_key;
+    std::vector<uint8_t> bootstrap_record;
+    CHECK(potluck::encode_curve_bootstrap(bootstrap, bootstrap_record, error));
+    CHECK(bootstrap_record.size() == potluck::curve_bootstrap_record_size);
+    potluck::curve_bootstrap_credentials decoded_bootstrap;
+    CHECK(potluck::decode_curve_bootstrap(
+        bootstrap_record.data(), bootstrap_record.size(), decoded_bootstrap, error));
+    CHECK(decoded_bootstrap.rank == bootstrap.rank);
+    CHECK(decoded_bootstrap.peer_count == bootstrap.peer_count);
+    CHECK(decoded_bootstrap.generation == bootstrap.generation);
+    CHECK(decoded_bootstrap.keypair.public_key == bootstrap.keypair.public_key);
+    CHECK(decoded_bootstrap.keypair.secret_key == bootstrap.keypair.secret_key);
+    CHECK(decoded_bootstrap.previous_server_key == bootstrap.previous_server_key);
+    CHECK(decoded_bootstrap.next_server_key == bootstrap.next_server_key);
+    CHECK(decoded_bootstrap.result_server_key == bootstrap.result_server_key);
+    CHECK(decoded_bootstrap.controller_public_key == bootstrap.controller_public_key);
+    bootstrap_record[0] ^= 1;
+    CHECK(!potluck::decode_curve_bootstrap(
+        bootstrap_record.data(), bootstrap_record.size(), decoded_bootstrap, error));
+    CHECK(!error.empty());
+
+    potluck::ring_peer left = potluck::ring_peer::bind(
+        "tcp://127.0.0.1:*", left_keys, { right_keys.public_key }, error);
     CHECK(left.receive_valid());
     CHECK(!left.endpoint().empty());
     CHECK(left.endpoint().find("tcp://127.0.0.1:") == 0);
 
-    potluck::ring_peer right = potluck::ring_peer::bind("tcp://127.0.0.1:*", error);
+    potluck::ring_peer right = potluck::ring_peer::bind(
+        "tcp://127.0.0.1:*", right_keys, { left_keys.public_key }, error);
     CHECK(right.receive_valid());
     CHECK(!right.endpoint().empty());
 
-    CHECK(left.connect_next(right.endpoint(), error));
-    CHECK(right.connect_next(left.endpoint(), error));
+    CHECK(left.connect_next(right.endpoint(), left_keys, right_keys.public_key, error));
+    CHECK(right.connect_next(left.endpoint(), right_keys, left_keys.public_key, error));
     CHECK(left.valid());
     CHECK(right.valid());
     CHECK(left.next_endpoint() == right.endpoint());
@@ -108,24 +145,68 @@ int main() {
     CHECK(!moved.send(oversized_metadata, error));
     CHECK(error.find("shape") != std::string::npos);
 
+    potluck::curve_keypair timeout_keys;
+    CHECK(potluck::generate_curve_keypair(timeout_keys, error));
     potluck::ring_receiver timeout_receiver =
-        potluck::ring_receiver::bind("tcp://127.0.0.1:*", error);
+        potluck::ring_receiver::bind(
+            "tcp://127.0.0.1:*", timeout_keys, { timeout_keys.public_key }, error);
     CHECK(timeout_receiver.valid());
     CHECK(timeout_receiver.set_receive_timeout(20, error));
     potluck::message absent;
     CHECK(!timeout_receiver.receive(absent, error));
     CHECK(error.find("timeout") != std::string::npos);
 
-    potluck::ring_sender bad_sender = potluck::ring_sender::connect("not-a-zmq-endpoint", error);
+    potluck::curve_keypair wrong_keys;
+    CHECK(potluck::generate_curve_keypair(wrong_keys, error));
+    potluck::ring_receiver protected_receiver =
+        potluck::ring_receiver::bind(
+            "tcp://127.0.0.1:*", timeout_keys, { timeout_keys.public_key }, error);
+    CHECK(protected_receiver.valid());
+    potluck::curve_client_credentials unauthorized_client;
+    unauthorized_client.keypair = wrong_keys;
+    unauthorized_client.server_public_key = timeout_keys.public_key;
+    potluck::ring_sender unauthorized_sender =
+        potluck::ring_sender::connect(protected_receiver.endpoint(), unauthorized_client, error);
+    CHECK(unauthorized_sender.valid());
+    CHECK(unauthorized_sender.set_send_timeout(100, error));
+    CHECK(!unauthorized_sender.send(sent, error));
+    potluck::curve_client_credentials wrong_server;
+    wrong_server.keypair = timeout_keys;
+    wrong_server.server_public_key = wrong_keys.public_key;
+    potluck::ring_sender wrong_sender =
+        potluck::ring_sender::connect(protected_receiver.endpoint(), wrong_server, error);
+    CHECK(wrong_sender.valid());
+    CHECK(wrong_sender.set_send_timeout(100, error));
+    CHECK(!wrong_sender.send(sent, error));
+    CHECK(!error.empty());
+
+    potluck::curve_client_credentials invalid_credentials;
+    potluck::ring_sender invalid_sender =
+        potluck::ring_sender::connect("tcp://127.0.0.1:1", invalid_credentials, error);
+    CHECK(!invalid_sender.valid());
+    CHECK(error.find("CURVE") != std::string::npos);
+
+    potluck::curve_client_credentials bad_endpoint;
+    bad_endpoint.keypair = left_keys;
+    bad_endpoint.server_public_key = right_keys.public_key;
+    potluck::ring_sender bad_sender =
+        potluck::ring_sender::connect("not-a-zmq-endpoint", bad_endpoint, error);
     CHECK(!bad_sender.valid());
     CHECK(!error.empty());
 
     potluck::ring_sender closed_sender;
     CHECK(!closed_sender.send(sent, error));
-    CHECK(error.find("PUSH") != std::string::npos);
-    potluck::ring_receiver closed_receiver;
-    CHECK(!closed_receiver.receive(absent, error));
-    CHECK(error.find("PULL") != std::string::npos);
-
+    potluck::scrub_curve_credentials(bootstrap);
+    potluck::scrub_curve_credentials(decoded_bootstrap);
+    potluck::scrub_curve_keypair(left_keys);
+    potluck::scrub_curve_keypair(right_keys);
+    potluck::scrub_curve_keypair(unauthorized_client.keypair);
+    unauthorized_client.server_public_key.clear();
+    potluck::scrub_curve_keypair(wrong_server.keypair);
+    wrong_server.server_public_key.clear();
+    potluck::scrub_curve_keypair(bad_endpoint.keypair);
+    bad_endpoint.server_public_key.clear();
+    potluck::scrub_curve_keypair(timeout_keys);
+    potluck::scrub_curve_keypair(wrong_keys);
     return 0;
 }

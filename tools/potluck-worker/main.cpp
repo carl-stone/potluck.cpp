@@ -7,7 +7,9 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <condition_variable>
@@ -25,6 +27,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 namespace {
 
@@ -299,6 +303,38 @@ void append_error_payload(potluck::message & message, const std::string & text) 
         message.payload.resize(potluck::max_payload_bytes);
     }
 }
+bool read_curve_bootstrap(potluck::curve_bootstrap_credentials & credentials,
+                          std::string & error) {
+    std::array<uint8_t, potluck::curve_bootstrap_record_size> record = {};
+    const auto scrub_record = [&] {
+        volatile uint8_t * bytes = record.data();
+        for (size_t index = 0; index < record.size(); ++index) {
+            bytes[index] = 0;
+        }
+    };
+    size_t offset = 0;
+    while (offset < record.size()) {
+        const ssize_t count = read(STDIN_FILENO, record.data() + offset,
+                                   record.size() - offset);
+        if (count > 0) {
+            offset += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        error = count == 0
+            ? "CURVE bootstrap stdin ended before the complete record"
+            : "CURVE bootstrap stdin read failed";
+        scrub_record();
+        return false;
+    }
+    const bool decoded = potluck::decode_curve_bootstrap(
+        record.data(), record.size(), credentials, error);
+    scrub_record();
+    return decoded;
+}
+
 
 } // namespace
 
@@ -308,6 +344,8 @@ int main(int argc, char ** argv) {
     std::unordered_map<int32_t, potluck::slot_config> sampler_configs;
     bool backend_initialized = false;
     uint32_t launch_rank = 0;
+    potluck::curve_bootstrap_credentials curve_credentials;
+    bool have_curve_credentials = false;
     potluck::ring_peer peer;
     potluck::ring_sender result_sender;
     std::mutex inbox_mutex;
@@ -333,6 +371,10 @@ int main(int argc, char ** argv) {
             potluck::stage_free(stage);
         }
         stages.clear();
+        if (have_curve_credentials) {
+            potluck::scrub_curve_credentials(curve_credentials);
+            have_curve_credentials = false;
+        }
         if (backend_initialized) {
             llama_backend_free();
             backend_initialized = false;
@@ -358,23 +400,27 @@ int main(int argc, char ** argv) {
             return 0;
         }
         if (argc < 10) {
-            fail("usage: potluck-worker <model.gguf> --bind <endpoint> --next <endpoint> --result <endpoint> --rank N");
+            fail("usage: potluck-worker <model.gguf> --bind <endpoint> --next <endpoint> --result <endpoint> --rank N --credentials-stdin");
         }
 
         const std::string model_path = argv[1];
-        if (model_path.empty() || model_path[0] == '-') {
-            fail("first argument must be a model path");
-        }
-        std::string bind_endpoint;
-        std::string next_endpoint;
-        std::string result_endpoint;
         bool have_bind = false;
         bool have_next = false;
         bool have_result = false;
         bool have_rank = false;
-
+        bool have_credentials_stdin = false;
+        std::string bind_endpoint;
+        std::string next_endpoint;
+        std::string result_endpoint;
         for (int i = 2; i < argc; ++i) {
             const std::string arg = argv[i];
+            if (arg == "--credentials-stdin") {
+                if (have_credentials_stdin) {
+                    fail("duplicate --credentials-stdin");
+                }
+                have_credentials_stdin = true;
+                continue;
+            }
             if (i + 1 >= argc) {
                 fail("missing value for " + arg);
             }
@@ -398,11 +444,18 @@ int main(int argc, char ** argv) {
             }
         }
         if (!have_bind || bind_endpoint.empty() || !have_next || next_endpoint.empty() ||
-            !have_result || result_endpoint.empty() || !have_rank) {
-            fail("controller endpoints and rank are required");
+            !have_result || result_endpoint.empty() || !have_rank || !have_credentials_stdin) {
+            fail("controller endpoints, rank, and CURVE bootstrap are required");
         }
 
         std::string error;
+        if (!read_curve_bootstrap(curve_credentials, error)) {
+            fail("security bootstrap failed: " + error);
+        }
+        have_curve_credentials = true;
+        if (curve_credentials.rank != launch_rank) {
+            fail("security bootstrap rank mismatch");
+        }
         potluck::accel_profile profile;
         profile.rank = launch_rank;
         llama_backend_init();
@@ -411,11 +464,26 @@ int main(int argc, char ** argv) {
             fail("cannot probe accelerator: " + error);
         }
 
-        peer = potluck::ring_peer::bind(bind_endpoint, next_endpoint, error);
+        potluck::curve_public_key_list allowed_clients = {
+            curve_credentials.previous_server_key,
+            curve_credentials.controller_public_key
+        };
+        peer = potluck::ring_peer::bind(
+            bind_endpoint, curve_credentials.keypair, next_endpoint,
+            curve_credentials.next_server_key, allowed_clients, error);
         if (!peer.valid()) {
             fail("cannot bind ring receiver or connect next peer: " + error);
         }
-        result_sender = potluck::ring_sender::connect(result_endpoint, error);
+        std::printf("WORKER rank %u bound %s next %s\n", launch_rank,
+                    peer.endpoint().c_str(), peer.next_endpoint().c_str());
+        std::fflush(stdout);
+        potluck::curve_client_credentials result_credentials;
+        result_credentials.keypair = curve_credentials.keypair;
+        result_credentials.server_public_key = curve_credentials.result_server_key;
+        result_sender = potluck::ring_sender::connect(
+            result_endpoint, result_credentials, error);
+        potluck::scrub_curve_keypair(result_credentials.keypair);
+        result_credentials.server_public_key.clear();
         if (!result_sender.valid()) {
             fail("cannot connect result sender: " + error);
         }
@@ -427,6 +495,30 @@ int main(int argc, char ** argv) {
         }
         if (!result_sender.set_send_timeout(startup_timeout_ms, error)) {
             fail("cannot set result startup timeout: " + error);
+        }
+        if (curve_credentials.peer_count == 0 ||
+            launch_rank >= curve_credentials.peer_count ||
+            curve_credentials.generation == 0) {
+            fail("security bootstrap topology metadata is invalid");
+        }
+        potluck::message adjacency_hello;
+        adjacency_hello.type = potluck::message_type::hello;
+        adjacency_hello.rank = launch_rank;
+        adjacency_hello.sequence = curve_credentials.generation;
+        if (!peer.send(adjacency_hello, error)) {
+            fail("security adjacency handshake send failed: " + error);
+        }
+        potluck::message predecessor_hello;
+        if (!peer.receive(predecessor_hello, error)) {
+            fail("security adjacency handshake receive failed: " + error);
+        }
+        const uint32_t expected_predecessor =
+            (launch_rank + curve_credentials.peer_count - 1) %
+            curve_credentials.peer_count;
+        if (predecessor_hello.type != potluck::message_type::hello ||
+            predecessor_hello.rank != expected_predecessor ||
+            predecessor_hello.sequence != curve_credentials.generation) {
+            fail("security adjacency handshake predecessor mismatch");
         }
 
         std::vector<uint8_t> profile_payload;
@@ -444,10 +536,6 @@ int main(int argc, char ** argv) {
                     launch_rank, accel_kind_name(profile.kind),
                     static_cast<unsigned long long>(profile.free_bytes / (1024u * 1024u)),
                     static_cast<unsigned long long>(profile.total_bytes / (1024u * 1024u)));
-        std::fflush(stdout);
-
-        std::printf("WORKER rank %u bound %s next %s\n", launch_rank,
-                    peer.endpoint().c_str(), peer.next_endpoint().c_str());
         std::fflush(stdout);
 
         potluck::message config_message;
@@ -541,8 +629,14 @@ int main(int argc, char ** argv) {
         }
         receiver_thread = std::thread([&] {
             std::string heartbeat_error;
+            potluck::curve_client_credentials heartbeat_credentials;
+            heartbeat_credentials.keypair = curve_credentials.keypair;
+            heartbeat_credentials.server_public_key = curve_credentials.result_server_key;
             potluck::ring_sender heartbeat_sender =
-                potluck::ring_sender::connect(result_endpoint, heartbeat_error);
+                potluck::ring_sender::connect(result_endpoint, heartbeat_credentials,
+                                              heartbeat_error);
+            potluck::scrub_curve_keypair(heartbeat_credentials.keypair);
+            heartbeat_credentials.server_public_key.clear();
             if (!heartbeat_sender.valid() ||
                 !heartbeat_sender.set_send_timeout(peer_send_timeout_ms, heartbeat_error)) {
                 {

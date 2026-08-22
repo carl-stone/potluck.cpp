@@ -398,9 +398,9 @@ is not an unresolved question or a separate authorization surface.
   loopback or another explicit address. Startup must state the bound address
   and that LAN clients can connect.
 - `--api-key` is optional. When set, require `Authorization: Bearer <value>`
-  for API requests, compare without timing leaks, and never write the value to
-  logs or persistent model or config files. Without it, trusted-LAN use stays
-  unauthenticated.
+  for every HTTP route, compare without timing leaks, and never write the value
+  to logs or persistent model or config files. Without it, trusted-LAN use
+  stays unauthenticated.
 - `--cors-origin` accepts one exact allowed origin. When omitted, send no
   CORS allow-origin header. Wildcard origins and credentialed CORS are not
   allowed. CORS is not authentication.
