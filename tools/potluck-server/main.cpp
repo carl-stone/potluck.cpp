@@ -263,6 +263,48 @@ std::string ring_host(const std::string & bootstrap_host) {
     }
     return host;
 }
+void validate_api_key(const std::string & api_key) {
+    if (api_key.empty()) {
+        throw std::runtime_error("--api-key cannot be empty");
+    }
+    if (api_key.size() > 8185) {
+        throw std::runtime_error("--api-key is too long");
+    }
+    for (const unsigned char value : api_key) {
+        if (value == '\r' || value == '\n' || value == 0) {
+            throw std::runtime_error("--api-key contains an invalid control character");
+        }
+    }
+}
+
+void validate_cors_origin(const std::string & origin) {
+    if (origin.empty()) {
+        throw std::runtime_error("--cors-origin cannot be empty");
+    }
+    if (origin == "*") {
+        throw std::runtime_error("--cors-origin does not allow wildcard origins");
+    }
+    if (origin.find(',') != std::string::npos) {
+        throw std::runtime_error("--cors-origin accepts one exact origin");
+    }
+    for (const unsigned char value : origin) {
+        if (value <= 0x20 || value == 0x7f) {
+            throw std::runtime_error("--cors-origin contains whitespace or a control character");
+        }
+    }
+    const size_t scheme_separator = origin.find("://");
+    if (scheme_separator == std::string::npos || scheme_separator == 0 ||
+        scheme_separator + 3 >= origin.size()) {
+        throw std::runtime_error("--cors-origin must be an origin such as http://localhost:3000");
+    }
+    const std::string authority = origin.substr(scheme_separator + 3);
+    if (authority.find('/') != std::string::npos ||
+        authority.find('?') != std::string::npos ||
+        authority.find('#') != std::string::npos) {
+        throw std::runtime_error("--cors-origin must not include a path, query, or fragment");
+    }
+}
+
 std::string resolve_hf_model(const std::string & repo,
                              const std::string & file,
                              const std::string & token,
@@ -339,6 +381,10 @@ int main(int argc, char ** argv) {
         float top_p = 0.0f;
         bool bench = false;
         bool workers_option = false;
+        std::string api_key;
+        std::string cors_origin;
+        bool api_key_option = false;
+        bool cors_origin_option = false;
 
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
@@ -357,6 +403,14 @@ int main(int argc, char ** argv) {
             else if (arg == "--offline") hf_offline = true;
             else if (arg == "--host") host = take("--host");
             else if (arg == "--port") http_port = static_cast<uint16_t>(std::stoul(take("--port")));
+            else if (arg == "--api-key") {
+                api_key = take("--api-key");
+                api_key_option = true;
+            }
+            else if (arg == "--cors-origin") {
+                cors_origin = take("--cors-origin");
+                cors_origin_option = true;
+            }
             else if (arg == "--workers") {
                 worker_local = static_cast<uint32_t>(std::stoul(take("--workers")));
                 workers_option = true;
@@ -380,7 +434,14 @@ int main(int argc, char ** argv) {
                 "usage: potluck-server -m model.gguf | -hf owner/repo[:quant] "
                 "[--hf-file FILE] [--hf-token TOKEN] [--offline] "
                 "[--workers N] [--slots N] [--ubatch N] "
+                "[--api-key VALUE] [--cors-origin ORIGIN] "
                 "[--head-share auto|off] [--hosts a,b,c --launch ssh]");
+        }
+        if (api_key_option) {
+            validate_api_key(api_key);
+        }
+        if (cors_origin_option) {
+            validate_cors_origin(cors_origin);
         }
         if (model_path.empty() && hf_repo.empty()) {
             throw std::runtime_error("need -m model.gguf or -hf owner/repo[:quant]");
@@ -500,7 +561,8 @@ int main(int argc, char ** argv) {
                                  });
         session.health_reason = "ring startup in progress";
         setup_http_routes(server, session, scheduler, vocab, model_identity,
-                          chat_templates, n_predict_default, temp, top_p, seed);
+                          chat_templates, n_predict_default, temp, top_p, seed,
+                          api_key, cors_origin);
 
         std::thread listener_thread;
         std::mutex listener_mutex;

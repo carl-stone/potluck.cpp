@@ -97,6 +97,10 @@ cleanup() {
         printf '%s\n' '--- server.log ---' >&2
         cat "${WORK}/server.log" >&2
     fi
+    if (( rc != 0 )) && [[ -f "${WORK}/auth-server.log" ]]; then
+        printf '%s\n' '--- auth-server.log ---' >&2
+        cat "${WORK}/auth-server.log" >&2
+    fi
     cleanup_background_requests || true
     stop_server || true
     rm -rf "${WORK}" 2>/dev/null || true
@@ -116,6 +120,11 @@ for _ in $(seq 1 120); do
     fi
     sleep 1
 done
+grep -q "HTTP bound while loading ring at http://0.0.0.0:${PORT}" "${WORK}/server.log" || {
+    sed -n '$p' "${WORK}/server.log" >&2
+    printf 'server did not use the default LAN-visible bind address\n' >&2
+    exit 1
+}
 grep -q 'listening on http' "${WORK}/server.log" || {
     sed -n '$p' "${WORK}/server.log" >&2
     printf 'server never became ready\n' >&2
@@ -639,6 +648,122 @@ if ! wait_pid_exit_bounded "${SHUTDOWN_READER_PID}" 15; then
 fi
 SHUTDOWN_READER_PID=""
 rm -f "${SHUTDOWN_PIPE}" "${SHUTDOWN_READY}" "${SHUTDOWN_OUTPUT}"
+AUTH_PORT=$((PORT + 1))
+AUTH_HOST="${POTLUCK_TEST_AUTH_HOST:-127.0.0.1}"
+AUTH_KEY="${POTLUCK_TEST_API_KEY:-potluck-smoke-key}"
+AUTH_ORIGIN="${POTLUCK_TEST_CORS_ORIGIN:-https://potluck.test}"
+AUTH_BASE="http://${AUTH_HOST}:${AUTH_PORT}"
+POTLUCK_TRACE_PREFETCH=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" \
+    --slots 2 --ubatch 1 --host "${AUTH_HOST}" --port "${AUTH_PORT}" \
+    --api-key "${AUTH_KEY}" --cors-origin "${AUTH_ORIGIN}" \
+    >"${WORK}/auth-server.log" 2>&1 &
+SRV=$!
+for _ in $(seq 1 120); do
+    grep -q 'listening on http' "${WORK}/auth-server.log" 2>/dev/null && break
+    if ! kill -0 "${SRV}" 2>/dev/null; then
+        sed -n '$p' "${WORK}/auth-server.log" >&2
+        printf 'authenticated server exited during startup\n' >&2
+        exit 1
+    fi
+    sleep 1
+done
+grep -q "HTTP bound while loading ring at http://${AUTH_HOST}:${AUTH_PORT}" \
+    "${WORK}/auth-server.log" || {
+    sed -n '$p' "${WORK}/auth-server.log" >&2
+    printf 'authenticated server did not use its explicit bind address\n' >&2
+    exit 1
+}
+grep -q 'listening on http' "${WORK}/auth-server.log" || {
+    sed -n '$p' "${WORK}/auth-server.log" >&2
+    printf 'authenticated server never became ready\n' >&2
+    exit 1
+}
+
+AUTH_JSON_HEADERS=(-H 'Content-Type: application/json')
+for auth_case in missing wrong; do
+    if [[ "${auth_case}" == missing ]]; then
+        AUTH_CHECK_HEADERS=("${AUTH_JSON_HEADERS[@]}")
+    else
+        AUTH_CHECK_HEADERS=("${AUTH_JSON_HEADERS[@]}" -H 'Authorization: Bearer wrong-key')
+    fi
+    for endpoint in health models unknown; do
+        case "${endpoint}" in
+            health) path="/health" ;;
+            models) path="/v1/models" ;;
+            unknown) path="/not-found" ;;
+        esac
+        response_file="${WORK}/auth-${auth_case}-${endpoint}.json"
+        status=$(curl -sS -o "${response_file}" -w '%{http_code}' \
+            "${AUTH_CHECK_HEADERS[@]}" "${AUTH_BASE}${path}")
+        [[ "${status}" == 401 ]]
+        python3 - "${response_file}" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["error"]["type"] == "authentication_error", body
+assert body["error"]["param"] is None, body
+assert body["error"]["code"] is None, body
+PY
+    done
+    response_file="${WORK}/auth-${auth_case}-completion.json"
+    status=$(curl -sS -o "${response_file}" -w '%{http_code}' \
+        "${AUTH_CHECK_HEADERS[@]}" -X POST -d '{}' "${AUTH_BASE}/completion")
+    [[ "${status}" == 401 ]]
+    python3 - "${response_file}" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["error"]["type"] == "authentication_error", body
+PY
+    response_file="${WORK}/auth-${auth_case}-options.json"
+    status=$(curl -sS -o "${response_file}" -w '%{http_code}' \
+        "${AUTH_CHECK_HEADERS[@]}" -X OPTIONS "${AUTH_BASE}/completion")
+    [[ "${status}" == 401 ]]
+    python3 - "${response_file}" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["error"]["type"] == "authentication_error", body
+PY
+done
+ALT_STATUS=$(curl -sS -o "${WORK}/auth-alternate-header.json" -w '%{http_code}' \
+    "${AUTH_JSON_HEADERS[@]}" -H "X-Api-Key: ${AUTH_KEY}" "${AUTH_BASE}/health")
+[[ "${ALT_STATUS}" == 401 ]]
+
+AUTH_HEADERS=("${AUTH_JSON_HEADERS[@]}" -H "Authorization: Bearer ${AUTH_KEY}")
+AUTH_COMPLETION=$(curl -fsS "${AUTH_HEADERS[@]}" -d '{"prompt":"The capital of France is","n_predict":2}' \
+    "${AUTH_BASE}/completion")
+python3 - "${AUTH_COMPLETION}" <<'PY'
+import json, sys
+body = json.loads(sys.argv[1])
+assert isinstance(body["content"], str) and body["content"]
+assert body["finish_reason"] in {"stop", "length"}
+PY
+AUTH_NOT_FOUND_STATUS=$(curl -sS -o "${WORK}/auth-valid-not-found.json" -w '%{http_code}' \
+    "${AUTH_HEADERS[@]}" "${AUTH_BASE}/not-found")
+[[ "${AUTH_NOT_FOUND_STATUS}" == 404 ]]
+
+curl -sS -D "${WORK}/cors-absent.headers" -o /dev/null \
+    "${AUTH_HEADERS[@]}" "${AUTH_BASE}/health"
+! grep -qi '^Access-Control-Allow-Origin:' "${WORK}/cors-absent.headers"
+! grep -qi '^Access-Control-Allow-Credentials:' "${WORK}/cors-absent.headers"
+curl -sS -D "${WORK}/cors-wrong.headers" -o /dev/null \
+    "${AUTH_HEADERS[@]}" -H 'Origin: https://other-potluck.test' "${AUTH_BASE}/health"
+! grep -qi '^Access-Control-Allow-Origin:' "${WORK}/cors-wrong.headers"
+! grep -qi '^Access-Control-Allow-Credentials:' "${WORK}/cors-wrong.headers"
+curl -sS -D "${WORK}/cors-exact.headers" -o /dev/null \
+    "${AUTH_HEADERS[@]}" -H "Origin: ${AUTH_ORIGIN}" "${AUTH_BASE}/health"
+grep -Fqi "Access-Control-Allow-Origin: ${AUTH_ORIGIN}" "${WORK}/cors-exact.headers"
+! grep -qi '^Access-Control-Allow-Credentials:' "${WORK}/cors-exact.headers"
+AUTH_OPTIONS_STATUS=$(curl -sS -D "${WORK}/cors-options.headers" -o /dev/null \
+    -w '%{http_code}' -X OPTIONS -H "Origin: ${AUTH_ORIGIN}" \
+    "${AUTH_HEADERS[@]}" "${AUTH_BASE}/completion")
+[[ "${AUTH_OPTIONS_STATUS}" == 204 ]]
+grep -Fqi "Access-Control-Allow-Origin: ${AUTH_ORIGIN}" "${WORK}/cors-options.headers"
+grep -Fqi 'Access-Control-Allow-Headers: Content-Type, Authorization' \
+    "${WORK}/cors-options.headers"
+! grep -qi '^Access-Control-Allow-Credentials:' "${WORK}/cors-options.headers"
+if ! stop_server; then
+    exit 1
+fi
+
 if [[ "${POTLUCK_SKIP_CLI_PARITY:-0}" == 1 ]]; then
     python3 - "${CHAT}" <<'PY'
 import json, sys
@@ -668,4 +793,4 @@ assert chat_text == expected, (chat_text, expected)
 PY
 fi
 
-printf 'POTLUCK-SERVER TEST PASSED: %s workers, prompt/error/health/models/parity/SSE checks\n' "${N_WORKERS}"
+printf 'POTLUCK-SERVER TEST PASSED: %s workers, prompt/error/health/models/auth/CORS/parity/SSE checks\n' "${N_WORKERS}"

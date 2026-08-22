@@ -1166,4 +1166,5 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                        slot_scheduler & scheduler, const llama_vocab * vocab,
                        const std::string & model_name,
                        common_chat_templates_ptr & chat_templates,
-                       uint32_t n_predict_default, float temp, float top_p, uint32_t seed);
+                       uint32_t n_predict_default, float temp, float top_p, uint32_t seed,
+                       const std::string & api_key, const std::string & cors_origin);

@@ -110,6 +110,18 @@ Then:
   payload, creates the route shards, and sends each worker only its assigned
   windows over SSH.
 
+The server binds to `0.0.0.0` by default so trusted-LAN clients can connect.
+Use `--host 127.0.0.1` (or another explicit address) to restrict the HTTP
+listener. This is not a public-Internet security boundary; use an external
+TLS boundary for Internet exposure.
+
+For a bearer-protected HTTP endpoint, pass `--api-key VALUE`. Every method and
+route, including `/health`, `/v1/models`, unknown paths, and `OPTIONS`, then
+requires the exact `Authorization: Bearer VALUE` header. Pass
+`--cors-origin https://client.example` to allow that one exact browser origin;
+omitting it sends no CORS allow-origin header. Wildcard and credentialed CORS
+are not supported.
+
 First contact accepts a new SSH host key into
 `$XDG_CONFIG_HOME/potluck/known_hosts` or `~/.config/potluck/known_hosts`.
 Later key changes fail closed.

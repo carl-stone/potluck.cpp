@@ -226,6 +226,22 @@ json error_json(const std::string & message, const std::string & type = "invalid
     } } };
 }
 
+bool constant_time_equal(const std::string & actual, const std::string & expected) {
+    constexpr size_t comparison_limit = 8192;
+    volatile uint64_t mismatch = static_cast<uint64_t>(actual.size() ^ expected.size());
+    for (size_t i = 0; i < comparison_limit; ++i) {
+        const unsigned char actual_byte = i < actual.size()
+            ? static_cast<unsigned char>(actual[i]) : 0;
+        const unsigned char expected_byte = i < expected.size()
+            ? static_cast<unsigned char>(expected[i]) : 0;
+        mismatch |= static_cast<uint64_t>(actual_byte ^ expected_byte);
+    }
+    return actual.size() <= comparison_limit &&
+           expected.size() <= comparison_limit &&
+           mismatch == 0;
+}
+
+
 std::atomic<uint64_t> request_counter{0};
 
 std::string request_id(uint64_t & created) {
@@ -314,17 +330,44 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                        slot_scheduler & scheduler, const llama_vocab * vocab,
                        const std::string & model_name,
                        common_chat_templates_ptr & chat_templates,
-                       uint32_t n_predict_default, float temp, float top_p, uint32_t seed) {
+                       uint32_t n_predict_default, float temp, float top_p, uint32_t seed,
+                       const std::string & api_key, const std::string & cors_origin) {
         const auto set_common_headers = [](httplib::Response & response) {
-            response.set_header("Access-Control-Allow-Origin", "*");
             response.set_header("Cache-Control", "no-cache");
         };
-        server.Options(R"(/.*)", [set_common_headers](const httplib::Request &, httplib::Response & response) {
-            set_common_headers(response);
-            response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            response.set_header("Access-Control-Allow-Headers", "Content-Type");
-            response.status = 204;
-        });
+        const auto set_cors_header = [cors_origin](const httplib::Request & request,
+                                                   httplib::Response & response) {
+            if (!cors_origin.empty() &&
+                request.get_header_value("Origin") == cors_origin) {
+                response.set_header("Access-Control-Allow-Origin", cors_origin);
+            }
+        };
+        const std::string expected_authorization = "Bearer " + api_key;
+        server.set_pre_routing_handler(
+            [api_key, expected_authorization, set_common_headers, set_cors_header](
+                const httplib::Request & request, httplib::Response & response) {
+                set_common_headers(response);
+                set_cors_header(request, response);
+                if (!api_key.empty()) {
+                    const std::string authorization =
+                        request.get_header_value("Authorization");
+                    if (!constant_time_equal(authorization, expected_authorization)) {
+                        response.status = 401;
+                        response.set_content(
+                            error_json("Invalid API Key", "authentication_error").dump(),
+                            "application/json");
+                        return httplib::Server::HandlerResponse::Handled;
+                    }
+                }
+                if (request.method == "OPTIONS") {
+                    response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                    response.set_header("Access-Control-Allow-Headers",
+                                         "Content-Type, Authorization");
+                    response.status = 204;
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
         server.Get("/health", [&session, &scheduler, set_common_headers](const httplib::Request &, httplib::Response & response) {
             const bool recovery_exhausted = scheduler.recovery_exhausted();
             const bool ring_rebuilding = scheduler.rebuilding();
