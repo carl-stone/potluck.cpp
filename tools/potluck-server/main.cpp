@@ -422,6 +422,9 @@ int main(int argc, char ** argv) {
         if (meta == nullptr) {
             throw std::runtime_error("cannot load model metadata from " + model_path);
         }
+        std::unique_ptr<llama_model, decltype(&llama_model_free)> metadata(meta, llama_model_free);
+
+        try {
         const llama_vocab * vocab = llama_model_get_vocab(meta);
         const uint32_t n_layer = static_cast<uint32_t>(llama_model_n_layer(meta));
         if (n_layer == 0) {
@@ -483,62 +486,59 @@ int main(int argc, char ** argv) {
         options.seed = seed;
         options.temp = temp;
         options.top_p = top_p;
-        std::string startup_error;
-        if (!bring_up_ring(session, options, startup_error)) {
-            throw std::runtime_error(startup_error);
-        }
+
         ServerRing & ring = session.ring;
         httplib::Server server;
         slot_scheduler scheduler(ring, vocab, n_seq_max, n_ubatch,
-                                  [&](std::string & error) {
-                                      return rebuild_ring(session, options, false, error);
-                                  },
-                                  [&](std::string & error) {
-                                      return heartbeat_ring(session, error);
-                                  },
-                                  [&](std::string & error) {
-                                      return refresh_ring_if_needed(session, options, error);
-                                  });
+                                 [&](std::string & error) {
+                                     return rebuild_ring(session, options, false, error);
+                                 },
+                                 [&](std::string & error) {
+                                     return heartbeat_ring(session, error);
+                                 },
+                                 [&](std::string & error) {
+                                     return refresh_ring_if_needed(session, options, error);
+                                 });
+        session.health_reason = "ring startup in progress";
         setup_http_routes(server, session, scheduler, vocab, model_identity,
                           chat_templates, n_predict_default, temp, top_p, seed);
-        std::printf("potluck-server: listening on http://%s:%u (%zu workers, %zu ring windows, model %s)\n",
-                    host.c_str(), http_port, ring.workers.size(), ring.windows.size(), model_path.c_str());
-        std::fflush(stdout);
-        if (bench) {
-            const std::vector<llama_token> bench_prompt = tokenize_prompt(vocab, "The capital of France is");
-            serve_stats stats;
-            const auto start = std::chrono::steady_clock::now();
-            const std::vector<llama_token> bench_tokens =
-                serve(ring, vocab, bench_prompt, 8, {}, &stats, 0, {}, n_ubatch);
-            const double wall = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - start).count();
-            const double prefill = stats.prefill_seconds > 0.0
-                ? bench_prompt.size() / stats.prefill_seconds : 0.0;
-            const double decode = stats.decode_seconds > 0.0
-                ? bench_tokens.size() / stats.decode_seconds : 0.0;
-            const double aggregate = wall > 0.0 ? bench_tokens.size() / wall : 0.0;
-            const double bytes_per_token = bench_tokens.empty()
-                ? 0.0 : static_cast<double>(stats.head_payload_bytes) / bench_tokens.size();
-            const uint64_t model_bytes = potluck::model_file_bytes(model_path);
-            std::printf("bench ring route windows=%zu\n", ring.windows.size());
-            for (size_t i = 0; i < ring.windows.size(); ++i) {
-                const potluck::ring_window & window = ring.windows[i];
-                const uint64_t bytes = model_bytes * (window.end - window.start) /
-                    std::max<uint32_t>(1, n_layer);
-                std::printf("bench ring window %zu owner=%u [%u,%u) weight-bytes=%llu n_gpu_layers=%d\n",
-                            i, window.owner, window.start, window.end,
-                            static_cast<unsigned long long>(bytes), window.n_gpu_layers);
+
+        std::thread listener_thread;
+        std::mutex listener_mutex;
+        std::string listener_error;
+        std::atomic<bool> listener_failed_state{false};
+        std::atomic<bool> listen_ok{false};
+        std::atomic<bool> signal_requested{false};
+        std::unique_ptr<server_signal_wakeup> signal_wakeup;
+        bool shutdown_done = false;
+
+        const auto listener_failure = [&](const char * message) {
+            try {
+                std::lock_guard<std::mutex> lock(listener_mutex);
+                listener_error = message == nullptr ? "HTTP listener failed" : message;
+            } catch (...) {
             }
-            std::printf("bench ring prefill-tok/s %.2f decode-tok/s %.2f aggregate-tok/s %.2f "
-                        "ms/token %.2f wire-bytes/token %.1f head-peak-rss-mb %.1f\n",
-                        prefill, decode, aggregate, aggregate > 0.0 ? 1000.0 / aggregate : 0.0,
-                        bytes_per_token, peak_rss_mb());
-            std::fflush(stdout);
-        }
-        scheduler.start();
+            listener_failed_state.store(true, std::memory_order_release);
+            session.stopping.store(true, std::memory_order_release);
+            scheduler.request_stop();
+            server.stop();
+            server.decommission();
+        };
+        const auto listener_failure_message = [&]() {
+            std::lock_guard<std::mutex> lock(listener_mutex);
+            return listener_error.empty() ? std::string("HTTP listener stopped unexpectedly")
+                                          : listener_error;
+        };
+
         const auto shutdown = [&]() {
-            session.stopping.store(true);
+            session.stopping.store(true, std::memory_order_release);
+            server.stop();
+            scheduler.request_stop();
+            if (listener_thread.joinable()) {
+                listener_thread.join();
+            }
             scheduler.stop();
+            signal_wakeup.reset();
             if (!session.ring.controls.empty()) {
                 std::string reset_error;
                 if (!reset_ring_workers(session.ring, reset_error) &&
@@ -549,39 +549,120 @@ int main(int argc, char ** argv) {
             }
             stop_planned_workers(session.workers);
             session.workers.clear();
-            llama_model_free(meta);
+            metadata.reset();
         };
-        bool shutdown_done = false;
         const auto shutdown_once = [&]() {
             if (!shutdown_done) {
                 shutdown_done = true;
                 shutdown();
             }
         };
-        bool listen_ok = false;
+
         try {
-            if (server.bind_to_port(host.c_str(), http_port)) {
-                server_signal_wakeup signal_wakeup([&] {
-                    session.stopping.store(true);
-                    scheduler.request_stop();
-                    server.stop();
-                });
-                try {
-                    listen_ok = server.listen_after_bind();
-                } catch (...) {
+            signal_wakeup = std::make_unique<server_signal_wakeup>([&] {
+                signal_requested.store(true, std::memory_order_release);
+                session.stopping.store(true, std::memory_order_release);
+                scheduler.request_stop();
+                server.stop();
+            });
+            if (!server.bind_to_port(host.c_str(), http_port)) {
+                if (signal_requested.load(std::memory_order_acquire)) {
                     shutdown_once();
-                    throw;
+                    return 0;
                 }
-                shutdown_once();
-            } else {
-                shutdown_once();
+                throw std::runtime_error("cannot bind HTTP port " + std::to_string(http_port));
             }
+            listener_thread = std::thread([&] {
+                try {
+                    const bool ok = server.listen_after_bind();
+                    listen_ok.store(ok, std::memory_order_release);
+                    if (!ok) {
+                        listener_failure("HTTP listener stopped unexpectedly");
+                    }
+                } catch (const std::exception & exception) {
+                    listener_failure(exception.what());
+                } catch (...) {
+                    listener_failure("HTTP listener failed with an unknown exception");
+                }
+            });
+            server.wait_until_ready();
+            if (!server.is_running()) {
+                if (signal_requested.load(std::memory_order_acquire)) {
+                    shutdown_once();
+                    return 0;
+                }
+                throw std::runtime_error(listener_failure_message());
+            }
+            std::printf("potluck-server: HTTP bound while loading ring at http://%s:%u (model %s)\n",
+                        host.c_str(), http_port, model_path.c_str());
+            std::fflush(stdout);
+
+            std::string startup_error;
+            if (!bring_up_ring(session, options, startup_error)) {
+                if (signal_requested.load(std::memory_order_acquire)) {
+                    shutdown_once();
+                    return 0;
+                }
+                throw std::runtime_error(startup_error);
+            }
+            if (session.stopping.load(std::memory_order_acquire)) {
+                if (signal_requested.load(std::memory_order_acquire)) {
+                    shutdown_once();
+                    return 0;
+                }
+                throw std::runtime_error(listener_failure_message());
+            }
+
+            scheduler.start();
+            std::printf("potluck-server: listening on http://%s:%u (%zu workers, %zu ring windows, model %s)\n",
+                        host.c_str(), http_port, ring.workers.size(), ring.windows.size(), model_path.c_str());
+            std::fflush(stdout);
+            if (bench) {
+                const std::vector<llama_token> bench_prompt = tokenize_prompt(vocab, "The capital of France is");
+                serve_stats stats;
+                const auto start = std::chrono::steady_clock::now();
+                const std::vector<llama_token> bench_tokens =
+                    serve(ring, vocab, bench_prompt, 8, {}, &stats, 0, {}, n_ubatch);
+                const double wall = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                const double prefill = stats.prefill_seconds > 0.0
+                    ? bench_prompt.size() / stats.prefill_seconds : 0.0;
+                const double decode = stats.decode_seconds > 0.0
+                    ? bench_tokens.size() / stats.decode_seconds : 0.0;
+                const double aggregate = wall > 0.0 ? bench_tokens.size() / wall : 0.0;
+                const double bytes_per_token = bench_tokens.empty()
+                    ? 0.0 : static_cast<double>(stats.head_payload_bytes) / bench_tokens.size();
+                const uint64_t model_bytes = potluck::model_file_bytes(model_path);
+                std::printf("bench ring route windows=%zu\n", ring.windows.size());
+                for (size_t i = 0; i < ring.windows.size(); ++i) {
+                    const potluck::ring_window & window = ring.windows[i];
+                    const uint64_t bytes = model_bytes * (window.end - window.start) /
+                        std::max<uint32_t>(1, n_layer);
+                    std::printf("bench ring window %zu owner=%u [%u,%u) weight-bytes=%llu n_gpu_layers=%d\n",
+                                i, window.owner, window.start, window.end,
+                                static_cast<unsigned long long>(bytes), window.n_gpu_layers);
+                }
+                std::printf("bench ring prefill-tok/s %.2f decode-tok/s %.2f aggregate-tok/s %.2f "
+                            "ms/token %.2f wire-bytes/token %.1f head-peak-rss-mb %.1f\n",
+                            prefill, decode, aggregate, aggregate > 0.0 ? 1000.0 / aggregate : 0.0,
+                            bytes_per_token, peak_rss_mb());
+                std::fflush(stdout);
+            }
+            if (listener_thread.joinable()) {
+                listener_thread.join();
+            }
+            if (listener_failed_state.load(std::memory_order_acquire) &&
+                !signal_requested.load(std::memory_order_acquire)) {
+                throw std::runtime_error(listener_failure_message());
+            }
+            shutdown_once();
         } catch (...) {
             shutdown_once();
             throw;
         }
-        if (!listen_ok) {
-            fail("cannot bind HTTP port " + std::to_string(http_port));
+        } catch (...) {
+            metadata.reset();
+            throw;
         }
         return 0;
     } catch (const std::exception & e) {
