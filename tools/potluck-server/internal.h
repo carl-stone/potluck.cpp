@@ -317,6 +317,7 @@ struct scheduled_slot {
     uint32_t next_position = 0;
     llama_token last = 0;
     potluck::slot_config sampling;
+    std::vector<std::string> stops;
     bool configured = false;
     bool ever_used = false;
     bool needs_clear = false;
@@ -324,6 +325,8 @@ struct scheduled_slot {
     bool chat = false;
     std::string id;
     uint64_t created = 0;
+    std::string generated_text;
+    size_t stop_offset = std::string::npos;
     std::deque<std::string> pieces;
     std::deque<std::vector<potluck::token_logprob>> piece_logprobs;
     std::vector<llama_token> generated;
@@ -400,32 +403,33 @@ public:
         stop();
     }
 
-    std::shared_ptr<scheduled_slot> acquire(const std::vector<llama_token> & prompt,
-                                            uint32_t n_predict,
-                                            const potluck::slot_config & sampling,
-                                            bool stream, bool chat,
-                                            const std::string & id, uint64_t created) {
+    std::vector<std::shared_ptr<scheduled_slot>> acquire_many(
+            const std::vector<llama_token> & prompt,
+            uint32_t n_predict,
+            const potluck::slot_config & sampling,
+            const std::vector<std::string> & stops,
+            bool stream, bool chat,
+            const std::string & id, uint64_t created,
+            size_t count) {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (stopping_ || rebuilding_) {
+        if (count == 0 || count > slots_.size() || stopping_ || rebuilding_) {
             return {};
         }
+        const auto free_count = [&] {
+            size_t result = 0;
+            for (const auto & slot : slots_) {
+                std::lock_guard<std::mutex> slot_lock(slot->mutex);
+                result += slot->state == slot_state::free ? 1 : 0;
+            }
+            return result;
+        };
         if (!work_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
-                if (stopping_ || rebuilding_) {
-                    return true;
-                }
-                for (const auto & slot : slots_) {
-                    std::lock_guard<std::mutex> slot_lock(slot->mutex);
-                    if (slot->state == slot_state::free) {
-                        return true;
-                    }
-                }
-                return false;
-            })) {
+                return stopping_ || rebuilding_ || free_count() >= count;
+            }) || stopping_ || rebuilding_) {
             return {};
         }
-        if (stopping_ || rebuilding_) {
-            return {};
-        }
+        std::vector<std::shared_ptr<scheduled_slot>> acquired;
+        acquired.reserve(count);
         for (const auto & slot : slots_) {
             std::lock_guard<std::mutex> slot_lock(slot->mutex);
             if (slot->state != slot_state::free) {
@@ -435,19 +439,23 @@ public:
             slot->prefill_offset = 0;
             slot->n_predict = n_predict;
             slot->n_decoded = 0;
-
             slot->next_position = 0;
             slot->last = 0;
             slot->sampling = sampling;
             slot->sampling.seq = slot->seq;
+            slot->sampling.seed += static_cast<uint32_t>(acquired.size());
+            slot->stops = stops;
             slot->configured = false;
             slot->needs_clear = slot->ever_used;
             slot->stream = stream;
             slot->chat = chat;
             slot->id = id;
             slot->created = created;
+            slot->generated_text.clear();
+            slot->stop_offset = std::string::npos;
             slot->pieces.clear();
             slot->piece_logprobs.clear();
+            slot->generated.clear();
             slot->generated_logprobs.clear();
             slot->error.clear();
             slot->finished = false;
@@ -455,10 +463,13 @@ public:
             slot->release_when_finished = false;
             slot->callback_done = false;
             slot->state = slot_state::queued;
-            work_cv_.notify_all();
-            return slot;
+            acquired.push_back(slot);
+            if (acquired.size() == count) {
+                break;
+            }
         }
-        return {};
+        work_cv_.notify_all();
+        return acquired;
     }
     bool rebuilding() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -589,28 +600,7 @@ private:
 
     void emit(const std::shared_ptr<scheduled_slot> & slot, llama_token token,
               uint32_t position,
-              const std::vector<potluck::token_logprob> & logprobs = {}) {
-        std::lock_guard<std::mutex> lock(slot->mutex);
-        if (slot->cancelled) {
-            return;
-        }
-        if (!llama_vocab_is_eog(vocab_, token)) {
-            slot->generated.push_back(token);
-            slot->generated_logprobs.push_back(logprobs);
-            slot->pieces.push_back(token_piece(vocab_, token));
-            slot->piece_logprobs.push_back(logprobs);
-            ++slot->n_decoded;
-        }
-        slot->last = token;
-        slot->next_position = position + 1;
-        if (llama_vocab_is_eog(vocab_, token) || slot->n_decoded >= slot->n_predict) {
-            slot->finished = true;
-            slot->state = slot_state::done;
-        } else {
-            slot->state = slot_state::decode;
-        }
-        slot->cv.notify_all();
-    }
+              const std::vector<potluck::token_logprob> & logprobs = {});
 
 
     void run_round(const std::vector<std::shared_ptr<scheduled_slot>> & active) {

@@ -15,7 +15,54 @@
 
 namespace {
 
+size_t first_stop_offset(const std::string & text, const std::vector<std::string> & stops) {
+    size_t offset = std::string::npos;
+    for (const std::string & stop : stops) {
+        if (stop.empty()) {
+            continue;
+        }
+        const size_t candidate = text.find(stop);
+        if (candidate != std::string::npos) {
+            offset = std::min(offset, candidate);
+        }
+    }
+    return offset;
 }
+
+}
+
+void slot_scheduler::emit(const std::shared_ptr<scheduled_slot> & slot, llama_token token,
+                          uint32_t position,
+                          const std::vector<potluck::token_logprob> & logprobs) {
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    if (slot->cancelled || slot->finished) {
+        return;
+    }
+    if (!llama_vocab_is_eog(vocab_, token)) {
+        const std::string piece = token_piece(vocab_, token);
+        slot->generated.push_back(token);
+        slot->generated_logprobs.push_back(logprobs);
+        slot->pieces.push_back(piece);
+        slot->piece_logprobs.push_back(logprobs);
+        slot->generated_text += piece;
+        ++slot->n_decoded;
+        if (slot->stop_offset == std::string::npos) {
+            slot->stop_offset = first_stop_offset(slot->generated_text, slot->stops);
+        }
+    }
+    slot->last = token;
+    slot->next_position = position + 1;
+    if (llama_vocab_is_eog(vocab_, token) ||
+        slot->stop_offset != std::string::npos ||
+        slot->n_decoded >= slot->n_predict) {
+        slot->finished = true;
+        slot->state = slot_state::done;
+    } else {
+        slot->state = slot_state::decode;
+    }
+    slot->cv.notify_all();
+}
+
 
 std::vector<int32_t> drive_batch(ServerRing & ring,
                                  const std::vector<int32_t> & positions,
