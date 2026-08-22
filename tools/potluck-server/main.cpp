@@ -281,6 +281,9 @@ std::string resolve_hf_model(const std::string & repo,
         if (handler.plan.primary.path.empty() || handler.plan.model_files.empty()) {
             throw std::runtime_error("repository has no compatible GGUF model");
         }
+        if (handler.plan.model_files.size() != 1) {
+            throw std::runtime_error("split GGUF repositories are not supported");
+        }
         common_models_handler_apply(handler, params);
     } catch (const std::exception & e) {
         throw std::runtime_error("failed to resolve Hugging Face model '" + repo + "': " + e.what());
