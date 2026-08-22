@@ -590,7 +590,7 @@ bool heartbeat_ring(ring_session & session, std::string & error) {
     }
     const auto now = std::chrono::steady_clock::now();
     if (session.ring.last_heartbeat.time_since_epoch().count() != 0 &&
-        now - session.ring.last_heartbeat < std::chrono::seconds(1)) {
+        now - session.ring.last_heartbeat < std::chrono::seconds(3)) {
         return true;
     }
 
@@ -956,7 +956,8 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         target.head_reserve = head_reserve;
         target.head_cpu_load = head_load;
         target.head_profile = head.profile;
-        target.last_heartbeat = {};
+        target.ring.last_heartbeat = std::chrono::steady_clock::now();
+        target.last_heartbeat = target.ring.last_heartbeat;
         error.clear();
         return true;
     } catch (const std::exception & exception) {
