@@ -93,6 +93,7 @@ public:
         try {
             set_cloexec(pipe_[0]);
             set_cloexec(pipe_[1]);
+            set_nonblocking(pipe_[1]);
             signal_wakeup_fd.store(pipe_[1], std::memory_order_relaxed);
             install(SIGINT, old_int_, int_installed_);
             install(SIGTERM, old_term_, term_installed_);
