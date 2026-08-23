@@ -10,6 +10,7 @@
 #   MODEL_DIR  fixture directory        (default: $REPO/models)
 #   NPROC      parallel build jobs      (default: potluck_build_jobs)
 #   SKIP_BUILD skip configure/build     (set 1 to only fetch model + run tests)
+#   POTLUCK_CUDA_ARCHITECTURES CUDA architectures (default: native)
 #
 # Usage: bash setup_and_test_pc.sh [n_predict=32] [host=127.0.0.1]
 set -euo pipefail
@@ -41,9 +42,12 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
         NVCC=/opt/cuda/bin/nvcc # Arch installs CUDA off-PATH
     fi
     if command -v nvidia-smi >/dev/null 2>&1 && [[ -n "${NVCC}" ]]; then
-        cmake_opts+=(-DGGML_CUDA=ON)
+        cmake_opts+=(-DGGML_CUDA=ON -DGGML_NATIVE=ON)
+        if [[ -n "${POTLUCK_CUDA_ARCHITECTURES:-}" ]]; then
+            cmake_opts+=("-DCMAKE_CUDA_ARCHITECTURES=${POTLUCK_CUDA_ARCHITECTURES}")
+        fi
         export PATH="$(dirname "${NVCC}"):${PATH}"
-        echo "   (CUDA backend enabled via ${NVCC})"
+        echo "   (CUDA backend enabled via ${NVCC}; architectures ${POTLUCK_CUDA_ARCHITECTURES:-native when supported})"
     else
         echo "   (no nvidia-smi or no CUDA toolkit (nvcc); CPU-only build)"
     fi
@@ -68,4 +72,5 @@ echo "== running the suite (n_predict=${N_PREDICT}, host=${HOST}) =="
 export REPO="${REPO}"
 export BIN="${REPO}/build/bin"
 export MODEL="${MODEL_PATH}"
+export N_PREDICT HOST
 bash "${REPO}/tests/potluck/run_all.sh" 2>&1 | tail -20

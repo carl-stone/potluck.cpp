@@ -72,14 +72,16 @@ cmake -S "${REPO}" -B "${build_dir}" \
     -DLLAMA_BUILD_EXAMPLES=OFF \
     -DLLAMA_BUILD_APP=OFF \
     -DPOTLUCK_HIGHS=OFF
-potluck_build "${build_dir}" --target potluck-node potluck-worker
+potluck_build "${build_dir}" --target potluck-node potluck-worker potluck-shard
 
 worker="${build_dir}/bin/potluck-worker"
 node="${build_dir}/bin/potluck-node"
+shard="${build_dir}/bin/potluck-shard"
 [[ -x "${worker}" ]] || die "missing worker binary: ${worker}"
 [[ -x "${node}" ]] || die "missing node binary: ${node}"
+[[ -x "${shard}" ]] || die "missing shard binary: ${shard}"
 
-for binary in "${node}" "${worker}"; do
+for binary in "${node}" "${worker}" "${shard}"; do
     archs="$(lipo -archs "${binary}")" ||
         die "cannot inspect architecture: ${binary}"
     [[ "${archs}" == *arm64* ]] ||
@@ -114,6 +116,10 @@ if [[ -z "${zmq_path}" ]]; then
         awk '$1 ~ /libzmq[^[:space:]]*\.dylib$/ { print $1; exit }')"
 fi
 [[ -f "${zmq_path}" ]] || die 'cannot resolve a libzmq dynamic library'
+zmq_archs="$(lipo -archs "${zmq_path}")" ||
+    die "cannot inspect architecture: ${zmq_path}"
+[[ "${zmq_archs}" == *arm64* ]] ||
+    die "libzmq is not arm64-capable: ${zmq_path} (${zmq_archs})"
 
 out_parent="$(dirname "${out_dir}")"
 mkdir -p "${out_parent}"
@@ -127,10 +133,11 @@ trap cleanup EXIT
 
 cp "${node}" "${staging_dir}/potluck-node"
 cp "${worker}" "${staging_dir}/potluck-worker"
+cp "${shard}" "${staging_dir}/potluck-shard"
 cp "${zmq_path}" "${staging_dir}/libzmq.5.dylib"
-chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"
+chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"
 
-shipped_files=(potluck-node potluck-worker libzmq.5.dylib)
+shipped_files=(potluck-node potluck-worker potluck-shard libzmq.5.dylib)
 sodium_dependency="$(otool -L "${zmq_path}" |
     awk '$1 ~ /libsodium[^[:space:]]*\.dylib$/ { print $1; exit }')"
 sodium_path="${POTLUCK_SODIUM:-}"
@@ -149,6 +156,10 @@ if [[ -n "${sodium_dependency}" || -n "${sodium_path}" ]]; then
     fi
     [[ -f "${sodium_path}" ]] ||
         die "cannot resolve libzmq dependency: ${sodium_dependency:-libsodium}"
+    sodium_archs="$(lipo -archs "${sodium_path}")" ||
+        die "cannot inspect architecture: ${sodium_path}"
+    [[ "${sodium_archs}" == *arm64* ]] ||
+        die "libsodium is not arm64-capable: ${sodium_path} (${sodium_archs})"
     cp "${sodium_path}" "${staging_dir}/libsodium.26.dylib"
     if [[ -n "${sodium_dependency}" ]]; then
         install_name_tool -change "${sodium_dependency}" \
@@ -163,7 +174,7 @@ fi
 install_name_tool -id "@rpath/libzmq.5.dylib" "${staging_dir}/libzmq.5.dylib"
 codesign --force --sign - "${staging_dir}/libzmq.5.dylib"
 
-for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"; do
+for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"; do
     zmq_dependency="$(otool -L "${binary}" |
         awk '$1 ~ /libzmq[^[:space:]]*\.dylib$/ { print $1; exit }')"
     if [[ -n "${zmq_dependency}" ]]; then
@@ -202,7 +213,7 @@ if [[ -e "${out_dir}" ]]; then
     for entry in "${out_dir}"/* "${out_dir}"/.[!.]*; do
         [[ -e "${entry}" || -L "${entry}" ]] || continue
         case "$(basename "${entry}")" in
-            potluck-node|potluck-worker|libzmq.5.dylib|libsodium.26.dylib|potluck-build-id)
+            potluck-node|potluck-worker|potluck-shard|libzmq.5.dylib|libsodium.26.dylib|potluck-build-id)
                 ;;
             *)
                 die "refusing to replace non-payload output directory: ${out_dir}"

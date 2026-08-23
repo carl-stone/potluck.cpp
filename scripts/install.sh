@@ -176,7 +176,7 @@ if [[ -n "${payload_dir}" ]]; then
             "${expected_platform}" "${payload_platform:-missing}" >&2
         exit 2
     }
-    for required in potluck-node potluck-worker; do
+    for required in potluck-node potluck-worker potluck-shard; do
         found=0
         for known in "${payload_files[@]}"; do
             [[ "${known}" == "${required}" ]] && found=1
@@ -193,7 +193,8 @@ if [[ -n "${payload_dir}" ]]; then
         }
     done
     [[ -x "${payload_dir}/potluck-node" &&
-       -x "${payload_dir}/potluck-worker" ]] || {
+       -x "${payload_dir}/potluck-worker" &&
+       -x "${payload_dir}/potluck-shard" ]] || {
         printf 'install: payload worker binaries are not executable\n' >&2
         exit 2
     }
@@ -218,7 +219,7 @@ if [[ "${skip_build}" != "1" ]]; then
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_APP=OFF \
         -DPOTLUCK_HIGHS=OFF
-    targets=(potluck-node potluck-worker)
+    targets=(potluck-node potluck-worker potluck-shard)
     if [[ "${build_server}" == "1" ]]; then
         targets+=(potluck-server)
     fi
@@ -233,10 +234,10 @@ if [[ -n "${payload_dir}" ]]; then
         cp -f "${payload_dir}/${name}" "${prefix}/${name}"
     done
     cp -f "${payload_dir}/potluck-build-id" "${prefix}/potluck-build-id"
-    chmod +x "${prefix}/potluck-node" "${prefix}/potluck-worker"
+    chmod +x "${prefix}/potluck-node" "${prefix}/potluck-worker" "${prefix}/potluck-shard"
 else
     bin_dir="${build_dir}/bin"
-    for name in potluck-node potluck-worker; do
+    for name in potluck-node potluck-worker potluck-shard; do
         [[ -x "${bin_dir}/${name}" ]] || {
             printf 'install: missing built binary: %s\n' "${bin_dir}/${name}" >&2
             exit 2
@@ -244,11 +245,13 @@ else
         cp -f "${bin_dir}/${name}" "${prefix}/${name}"
     done
     if [[ "${build_server}" == "1" ]]; then
-        [[ -x "${bin_dir}/potluck-server" ]] || {
-            printf 'install: missing built binary: %s\n' "${bin_dir}/potluck-server" >&2
-            exit 2
-        }
-        cp -f "${bin_dir}/potluck-server" "${prefix}/potluck-server"
+        for name in potluck-server; do
+            [[ -x "${bin_dir}/${name}" ]] || {
+                printf 'install: missing built binary: %s\n' "${bin_dir}/${name}" >&2
+                exit 2
+            }
+            cp -f "${bin_dir}/${name}" "${prefix}/${name}"
+        done
     fi
 fi
 

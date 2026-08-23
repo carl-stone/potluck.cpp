@@ -79,12 +79,14 @@ cmake -S "${REPO}" -B "${build_dir}" \
     -DPOTLUCK_HIGHS=OFF \
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
     '-DCMAKE_INSTALL_RPATH=$ORIGIN'
-potluck_build "${build_dir}" --target potluck-node potluck-worker
+potluck_build "${build_dir}" --target potluck-node potluck-worker potluck-shard
 
 worker="${build_dir}/bin/potluck-worker"
 node="${build_dir}/bin/potluck-node"
+shard="${build_dir}/bin/potluck-shard"
 [[ -x "${worker}" ]] || die "missing worker binary: ${worker}"
 [[ -x "${node}" ]] || die "missing node binary: ${node}"
+[[ -x "${shard}" ]] || die "missing shard binary: ${shard}"
 
 readelf_tag() {
     readelf -d "$1" | awk -v tag="$2" '
@@ -145,10 +147,11 @@ trap cleanup EXIT
 
 cp "${node}" "${staging_dir}/potluck-node"
 cp "${worker}" "${staging_dir}/potluck-worker"
+cp "${shard}" "${staging_dir}/potluck-shard"
 cp "${zmq_path}" "${staging_dir}/libzmq.so.5"
-chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"
+chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"
 
-shipped_files=(potluck-node potluck-worker libzmq.so.5)
+shipped_files=(potluck-node potluck-worker potluck-shard libzmq.so.5)
 zmq_needs() {
     readelf_tag "$1" NEEDED
 }
@@ -183,14 +186,14 @@ if [[ -n "${sodium_path}" ]] ||
     shipped_files+=("${sodium_name}")
 fi
 
-for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"; do
+for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"; do
     zmq_needed="$(zmq_needs "${binary}" | awk '/^libzmq\.so/ { print; exit }')"
     if [[ -n "${zmq_needed}" && "${zmq_needed}" != "libzmq.so.5" ]]; then
         die "binary expects ${zmq_needed}, payload ships libzmq.so.5: ${binary}"
     fi
 done
 for staged in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" \
-    "${staging_dir}/libzmq.so.5"; do
+    "${staging_dir}/potluck-shard" "${staging_dir}/libzmq.so.5"; do
     if (cd "${staging_dir}" && ldd "$(basename "${staged}")" | grep -q 'not found'); then
         die "staged file has unresolved libraries: ${staged}"
     fi
@@ -212,7 +215,7 @@ if [[ -e "${out_dir}" ]]; then
     for entry in "${out_dir}"/* "${out_dir}"/.[!.]*; do
         [[ -e "${entry}" || -L "${entry}" ]] || continue
         case "$(basename "${entry}")" in
-            potluck-node|potluck-worker|libzmq.so.5|libsodium.so.*|potluck-build-id)
+            potluck-node|potluck-worker|potluck-shard|libzmq.so.5|libsodium.so.*|potluck-build-id)
                 ;;
             *)
                 die "refusing to replace non-payload output directory: ${out_dir}"

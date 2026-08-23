@@ -15,8 +15,9 @@ source "${REPO}/scripts/potluck-model.sh"
 MODEL="${MODEL:-$(potluck_model_path)}"
 
 source "${REPO}/tests/potluck/test_helpers.sh"
-if [[ ! -x "${BIN}/potluck-server" || ! -x "${BIN}/potluck-worker" || ! -x "${BIN}/llama-cli" ]]; then
-    printf 'missing binaries (build potluck-server, potluck-worker, llama-cli first): %s\n' "${BIN}" >&2
+if [[ ! -x "${BIN}/potluck-server" || ! -x "${BIN}/potluck-worker" ||
+      ! -x "${BIN}/potluck-shard" || ! -x "${BIN}/llama-cli" ]]; then
+    printf 'missing binaries (build potluck-server, potluck-worker, potluck-shard, llama-cli first): %s\n' "${BIN}" >&2
     exit 2
 fi
 if [[ ! -f "${MODEL}" ]]; then
@@ -528,21 +529,24 @@ assert models["data"] and models["data"][0]["id"] == model
 PY
 python3 - "${WORK}/server.log" <<'PY'
 import re, sys
-prefetched = {}
+prepared = {}
 computed = []
 for line_number, line in enumerate(open(sys.argv[1])):
     match = re.search(r"WORKER rank (\d+) prefetched window (\d+) \((\d+) bytes\)", line)
     if match:
         rank, window, byte_count = match.groups()
         assert int(byte_count) > 0, f"window {(rank, window)} reported zero prefetch bytes"
-        prefetched.setdefault((rank, window), line_number)
+        prepared.setdefault((rank, window), line_number)
+    match = re.search(r"WORKER rank (\d+) resident window (\d+)", line)
+    if match:
+        prepared.setdefault(match.groups(), line_number)
     match = re.search(r"WORKER rank (\d+) computing window (\d+)", line)
     if match:
         computed.append((match.groups(), line_number))
 assert computed, "no worker compute trace"
 for window, line_number in computed:
-    assert window in prefetched, f"window {window} computed without prefetch"
-    assert prefetched[window] < line_number, f"window {window} prefetch followed compute"
+    assert window in prepared, f"window {window} computed without prefetch or resident data"
+    assert prepared[window] < line_number, f"window {window} preparation followed compute"
 PY
 
 

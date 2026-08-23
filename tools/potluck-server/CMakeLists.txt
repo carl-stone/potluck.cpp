@@ -19,3 +19,4 @@ target_include_directories(potluck-server PRIVATE
 target_compile_features(potluck-server PRIVATE cxx_std_17)
 
 target_link_libraries(potluck-server PRIVATE potluck-discovery potluck-distributed llama llama-common cpp-httplib)
+add_dependencies(potluck-server potluck-shard)

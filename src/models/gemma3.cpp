@@ -36,23 +36,27 @@ void llama_model_gemma3::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_gemma3::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+    const uint32_t stage_start = params.potluck_layer_start;
+    const uint32_t stage_end = params.potluck_layer_end == 0 ? n_layer : params.potluck_layer_end;
+    GGML_ASSERT(stage_start <= stage_end && stage_end <= (uint32_t) n_layer);
 
-    // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
-
-    // if output is NULL, init from the input tok embed
-    if (output == NULL) {
-        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,   "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+    if (stage_start == 0) {
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
     }
 
-    // Dense linear weights
+    if (stage_end == (uint32_t) n_layer) {
+        output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+        output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+        if (output == NULL) {
+            output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+        }
+    }
+
     dense_2_out_layers = create_tensor(tn(LLM_TENSOR_DENSE_2_OUT, "weight"), {n_embd, hparams.dense_2_feat_out}, TENSOR_NOT_REQUIRED);
     dense_3_out_layers = create_tensor(tn(LLM_TENSOR_DENSE_3_OUT, "weight"), {hparams.dense_3_feat_in, n_embd}, TENSOR_NOT_REQUIRED);
 
-
-    for (int i = 0; i < n_layer; ++i) {
+    for (uint32_t i = stage_start; i < stage_end; ++i) {
         auto & layer = layers[i];
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
@@ -83,15 +87,21 @@ std::unique_ptr<llm_graph_context> llama_model_gemma3::build_arch_graph(const ll
 template <bool iswa>
 llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_k();
+    const uint32_t stage_start = cparams.potluck_layer_start;
+    const uint32_t stage_end = cparams.potluck_layer_end == 0 ? n_layer : cparams.potluck_layer_end;
+    GGML_ASSERT(stage_start <= stage_end && stage_end <= (uint32_t) n_layer);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
-
-    // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
-    inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
-    cb(inpL, "inp_scaled", -1);
+    if (stage_start == 0) {
+        inpL = build_inp_embd(model.tok_embd);
+        // important: do not normalize weights for raw embeddings input (i.e. encoded image embeddings)
+        inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
+        cb(inpL, "inp_scaled", -1);
+    } else {
+        inpL = build_inp_hidden();
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -106,9 +116,9 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
         inp_attn = build_attn_inp_kv();
     }
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = stage_end == (uint32_t) n_layer ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (uint32_t il = stage_start; il < stage_end; ++il) {
         float freq_base_l  = 0.0f;
         float freq_scale_l = 0.0f;
 
@@ -198,6 +208,12 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
         inpL = cur;
     }
     cur = inpL;
+    if (stage_end < (uint32_t) n_layer) {
+        res->t_embd = cur;
+        cb(cur, "stage_hidden", -1);
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

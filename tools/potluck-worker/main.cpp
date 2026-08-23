@@ -334,6 +334,34 @@ bool read_curve_bootstrap(potluck::curve_bootstrap_credentials & credentials,
     scrub_record();
     return decoded;
 }
+bool validate_shard(const potluck::stage_model & stage, uint32_t index, uint32_t count,
+                    uint32_t start, uint32_t end, std::string & error) {
+    struct expected_value {
+        const char * key;
+        uint32_t value;
+    };
+    const expected_value expected[] = {
+        { "potluck.shard.index", index },
+        { "potluck.shard.count", count },
+        { "potluck.shard.start", start },
+        { "potluck.shard.end", end },
+    };
+    for (const expected_value & item : expected) {
+        char value[32] = {};
+        if (llama_model_meta_val_str(stage.model, item.key, value, sizeof(value)) <= 0) {
+            error = std::string("shard is missing metadata key ") + item.key;
+            return false;
+        }
+        uint32_t parsed = 0;
+        if (!parse_u32(value, parsed) || parsed != item.value) {
+            error = std::string("shard metadata mismatch for ") + item.key +
+                " (expected " + std::to_string(item.value) + ", got " + value + ")";
+            return false;
+        }
+    }
+    return true;
+}
+
 
 
 } // namespace
@@ -582,12 +610,20 @@ int main(int argc, char ** argv) {
             }
             ++owned_windows;
             const bool tail = window.end == config.n_layer;
-            if (!potluck::stage_load(stages[i], model_path, window.start, window.end,
+            const std::string shard_path = model_path + ".potluck-" + std::to_string(i) +
+                "of" + std::to_string(config.windows.size()) + ".gguf";
+            if (!potluck::stage_load(stages[i], shard_path, window.start, window.end,
                                      /*embeddings=*/false, n_ctx, n_seq_max, n_ubatch,
                                      error, tail, window.n_gpu_layers, nullptr,
                                      /*explicit_gpu_head=*/false, /*single_thread=*/false)) {
                 fail("window [" + std::to_string(window.start) + "," +
-                     std::to_string(window.end) + ") load failed: " + error);
+                     std::to_string(window.end) + ") shard load failed: " + error);
+            }
+            if (!validate_shard(stages[i], static_cast<uint32_t>(i),
+                                static_cast<uint32_t>(config.windows.size()),
+                                window.start, window.end, error)) {
+                fail("window [" + std::to_string(window.start) + "," +
+                     std::to_string(window.end) + ") " + error);
             }
         }
         const bool trace_prefetch = std::getenv("POTLUCK_TRACE_PREFETCH") != nullptr;
@@ -599,8 +635,12 @@ int main(int argc, char ** argv) {
                     continue;
                 }
                 const size_t bytes = stages[next].model->prefetch();
-                std::printf("WORKER rank %u prefetched window %zu (%zu bytes)\n",
-                            config.index, next, bytes);
+                if (bytes == 0) {
+                    std::printf("WORKER rank %u resident window %zu\n", config.index, next);
+                } else {
+                    std::printf("WORKER rank %u prefetched window %zu (%zu bytes)\n",
+                                config.index, next, bytes);
+                }
                 std::fflush(stdout);
                 return;
             }

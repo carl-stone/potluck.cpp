@@ -30,6 +30,143 @@
 
 namespace {
 std::atomic<uint64_t> topology_generation { 1 };
+constexpr uint16_t head_result_port = 40001;
+constexpr uint16_t head_ring_port = 40002;
+struct window_shards {
+    std::filesystem::path directory;
+    std::string prefix;
+    std::vector<std::filesystem::path> files;
+};
+
+std::string shard_filename(const std::string & prefix, size_t index, size_t count) {
+    return prefix + ".potluck-" + std::to_string(index) + "of" +
+        std::to_string(count) + ".gguf";
+}
+
+window_shards ensure_window_shards(const std::filesystem::path & model_path,
+                                   const std::string & model_digest,
+                                   const std::vector<potluck::ring_window> & windows,
+                                   const std::string & worker_path) {
+    if (model_digest.empty() || windows.empty()) {
+        throw std::runtime_error("cannot create window shards without a model digest and route");
+    }
+    std::string route_key = model_digest;
+    std::string bounds = std::to_string(windows.front().start);
+    for (const potluck::ring_window & window : windows) {
+        route_key += "-" + std::to_string(window.end);
+        bounds += "," + std::to_string(window.end);
+    }
+    window_shards shards;
+    shards.directory = model_path.parent_path() / ".potluck-shards" / route_key;
+    shards.prefix = model_path.stem().string();
+    shards.files.reserve(windows.size());
+    const auto populate_files = [&](const std::filesystem::path & directory) {
+        std::vector<std::filesystem::path> files;
+        files.reserve(windows.size());
+        for (size_t index = 0; index < windows.size(); ++index) {
+            files.push_back(directory / shard_filename(shards.prefix, index, windows.size()));
+        }
+        return files;
+    };
+    shards.files = populate_files(shards.directory);
+    const auto complete = [](const std::vector<std::filesystem::path> & files) {
+        std::error_code error;
+        for (const std::filesystem::path & file : files) {
+            if (!std::filesystem::is_regular_file(file, error) || error ||
+                std::filesystem::file_size(file, error) == 0 || error) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (complete(shards.files)) {
+        return shards;
+    }
+
+    const std::filesystem::path shard_tool =
+        std::filesystem::path(worker_path).parent_path() / "potluck-shard";
+    if (!std::filesystem::is_regular_file(shard_tool)) {
+        throw std::runtime_error("missing potluck-shard beside potluck-worker");
+    }
+    const std::filesystem::path temporary =
+        shards.directory.string() + ".tmp-" + std::to_string(getpid());
+    std::error_code error;
+    std::filesystem::remove_all(temporary, error);
+    error.clear();
+    std::filesystem::create_directories(temporary, error);
+    if (error) {
+        throw std::runtime_error("cannot create shard cache directory: " + error.message());
+    }
+    const std::string command = shell_quote(shard_tool.string()) + " " +
+        shell_quote(model_path.string()) + " --bounds " + shell_quote(bounds) +
+        " -o " + shell_quote(temporary.string());
+    if (std::system(command.c_str()) != 0) {
+        std::filesystem::remove_all(temporary, error);
+        throw std::runtime_error("potluck-shard failed");
+    }
+    const std::vector<std::filesystem::path> temporary_files = populate_files(temporary);
+    if (!complete(temporary_files)) {
+        std::filesystem::remove_all(temporary, error);
+        throw std::runtime_error("potluck-shard did not produce every route window");
+    }
+    std::filesystem::remove_all(shards.directory, error);
+    error.clear();
+    std::filesystem::create_directories(shards.directory.parent_path(), error);
+    if (error) {
+        std::filesystem::remove_all(temporary, error);
+        throw std::runtime_error("cannot prepare shard cache parent: " + error.message());
+    }
+    std::filesystem::rename(temporary, shards.directory, error);
+    if (error) {
+        std::filesystem::remove_all(temporary, error);
+        throw std::runtime_error("cannot publish shard cache: " + error.message());
+    }
+    return shards;
+}
+std::string remote_artifact_digest(const bootstrap_node & bootstrap,
+                                   const std::filesystem::path & remote_path) {
+    const std::string remote = remote_path.generic_string();
+    const std::string command =
+        "cd ~/potluck && (sha256sum " + shell_quote(remote) +
+        " 2>/dev/null || shasum -a 256 " + shell_quote(remote) +
+        " 2>/dev/null) | cut -d' ' -f1";
+    return first_command_line(
+        ssh_options(bootstrap) + " " + shell_quote(bootstrap.ssh_target) + " " +
+        shell_quote(command));
+}
+
+bool generate_remote_shards(const bootstrap_node & bootstrap,
+                            const std::filesystem::path & remote_model,
+                            const std::string & model_digest,
+                            const std::filesystem::path & remote_directory,
+                            const std::vector<potluck::ring_window> & windows,
+                            const std::vector<size_t> & indexes) {
+    if (indexes.empty() || remote_artifact_digest(bootstrap, remote_model) != model_digest) {
+        return false;
+    }
+    std::string bounds = std::to_string(windows.front().start);
+    for (const potluck::ring_window & window : windows) {
+        bounds += "," + std::to_string(window.end);
+    }
+    std::string selected = std::to_string(indexes.front());
+    for (size_t i = 1; i < indexes.size(); ++i) {
+        selected += "," + std::to_string(indexes[i]);
+    }
+    const std::string remote =
+        "cd ~/potluck && test -x ./potluck-shard && mkdir -p " +
+        shell_quote(remote_directory.generic_string()) + " && ./potluck-shard " +
+        shell_quote(remote_model.generic_string()) + " --bounds " + shell_quote(bounds) +
+        " --indexes " + shell_quote(selected) + " -o " +
+        shell_quote(remote_directory.generic_string());
+    std::printf("potluck-server: creating %zu assigned shards on %s from its local model\n",
+                indexes.size(), bootstrap.ring_host.c_str());
+    std::fflush(stdout);
+    return std::system((ssh_options(bootstrap) + " " +
+                        shell_quote(bootstrap.ssh_target) + " " +
+                        shell_quote(remote)).c_str()) == 0;
+}
+
+
 
 bool worker_process_alive(pid_t pid, const std::string & label, std::string & error) {
     if (pid <= 0) {
@@ -926,7 +1063,8 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             const std::string address_host = is_remote
                 ? ipv4_address_for_host(device.bootstrap.ring_host)
                 : (has_remote ? head_address : "127.0.0.1");
-            const uint16_t port = is_remote ? device.bootstrap.ring_port : free_port();
+            const uint16_t port = is_remote ? device.bootstrap.ring_port
+                : (has_remote ? head_ring_port : free_port());
             plan.ring.address = { address_host, port };
             plan.ring.connect_endpoint = tcp_endpoint(address_host, port);
             plan.ring.bind_endpoint = tcp_endpoint(
@@ -994,8 +1132,11 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         }
         std::fflush(stdout);
         std::string result_error;
+        const std::string result_bind = has_remote
+            ? "tcp://0.0.0.0:" + std::to_string(head_result_port)
+            : "tcp://0.0.0.0:*";
         ring.result = potluck::ring_receiver::bind(
-            "tcp://0.0.0.0:*", result_server_keypair, ring.worker_server_keys, result_error);
+            result_bind, result_server_keypair, ring.worker_server_keys, result_error);
         if (!ring.result.valid()) {
             throw std::runtime_error("cannot bind ring result receiver: " + result_error);
         }
@@ -1003,17 +1144,21 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             : (host == "0.0.0.0" ? "127.0.0.1" : host);
         ring.result_endpoint = endpoint_host(ring.result.endpoint(), result_host);
 
-        std::string model_digest;
-        if (has_remote) {
-            model_digest = pinned_model_digest(model_path, adjacent_root);
-            if (model_digest.empty()) {
-                model_digest = digest_cache.get(model_path);
-            }
+        std::string model_digest = pinned_model_digest(model_path, adjacent_root);
+        if (model_digest.empty()) {
+            model_digest = digest_cache.get(model_path);
         }
-        for (const planned_worker & plan : planned) {
-            if (plan.kind != worker_kind::remote) {
+        const window_shards shards =
+            ensure_window_shards(model_path, model_digest, ring.windows, worker_path);
+        const std::filesystem::path remote_directory =
+            std::filesystem::path(".potluck-shards") / shards.directory.filename();
+        for (uint32_t rank = 0; rank < n_workers; ++rank) {
+            planned_worker & plan = planned[rank];
+            if (plan.kind == worker_kind::local) {
+                plan.model = (shards.directory / shards.prefix).string();
                 continue;
             }
+            plan.model = (remote_directory / shards.prefix).generic_string();
             if (!stop_remote_workers(plan.device.bootstrap)) {
                 throw std::runtime_error("remote worker cleanup failed for " +
                                          plan.device.bootstrap.ssh_target);
@@ -1023,12 +1168,41 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                 throw std::runtime_error("worker binary refresh failed for " +
                                          plan.device.bootstrap.ssh_target);
             }
-            std::string distribution_error;
-            if (!ensure_remote_model(plan.device.bootstrap, model_path, model_digest,
-                                     distribution_error)) {
-                throw std::runtime_error("model distribution failed for " +
-                                         plan.device.bootstrap.ssh_target + ": " +
-                                         distribution_error);
+            std::vector<std::string> shard_digests(ring.windows.size());
+            std::vector<size_t> missing_indexes;
+            for (size_t window_index = 0; window_index < ring.windows.size(); ++window_index) {
+                if (ring.windows[window_index].owner != rank) {
+                    continue;
+                }
+                const std::filesystem::path & local_shard = shards.files[window_index];
+                const std::filesystem::path remote_shard =
+                    remote_directory / local_shard.filename();
+                shard_digests[window_index] = digest_cache.get(local_shard);
+                if (remote_artifact_digest(plan.device.bootstrap, remote_shard) ==
+                    shard_digests[window_index]) {
+                    std::printf("potluck-server: %s already has %s\n",
+                                plan.device.bootstrap.ring_host.c_str(),
+                                remote_shard.generic_string().c_str());
+                } else {
+                    missing_indexes.push_back(window_index);
+                }
+            }
+            if (!missing_indexes.empty()) {
+                generate_remote_shards(plan.device.bootstrap, model_name, model_digest,
+                                       remote_directory, ring.windows, missing_indexes);
+            }
+            for (size_t window_index : missing_indexes) {
+                const std::filesystem::path & local_shard = shards.files[window_index];
+                const std::filesystem::path remote_shard =
+                    remote_directory / local_shard.filename();
+                std::string distribution_error;
+                if (!ensure_remote_artifact(plan.device.bootstrap, local_shard, remote_shard,
+                                            shard_digests[window_index],
+                                            distribution_error)) {
+                    throw std::runtime_error("shard distribution failed for " +
+                                             plan.device.bootstrap.ssh_target + ": " +
+                                             distribution_error);
+                }
             }
         }
         for (uint32_t index = 0; index < n_workers; ++index) {

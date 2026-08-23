@@ -26,7 +26,7 @@ struct bounds {
         std::fprintf(stderr, "potluck-shard: %s\n", message);
     }
     std::fprintf(stderr,
-        "usage: %s MODEL.gguf (--parts N | --bounds A,B,C,...) [-o OUTDIR] [--dry-run]\n",
+        "usage: %s MODEL.gguf (--parts N | --bounds A,B,C,...) [-o OUTDIR] [--indexes I,J,...] [--dry-run]\n",
         exe);
     std::exit(message == nullptr ? EXIT_SUCCESS : EXIT_FAILURE);
 }
@@ -43,16 +43,16 @@ uint32_t parse_u32(const std::string & text, const char * option) {
     return static_cast<uint32_t>(value);
 }
 
-std::vector<uint32_t> parse_csv(const std::string & spec) {
+std::vector<uint32_t> parse_csv(const std::string & spec, const char * option) {
     std::vector<uint32_t> values;
     size_t at = 0;
     for (;;) {
         const size_t comma = spec.find(',', at);
         const std::string part = spec.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
         if (part.empty()) {
-            usage("potluck-shard", "--bounds needs comma-separated integers");
+            usage("potluck-shard", (std::string(option) + " needs comma-separated integers").c_str());
         }
-        values.push_back(parse_u32(part, "--bounds"));
+        values.push_back(parse_u32(part, option));
         if (comma == std::string::npos) {
             break;
         }
@@ -244,6 +244,7 @@ int main(int argc, char ** argv) {
     const std::string input_path = argv[1];
     uint32_t parts = 0;
     std::vector<uint32_t> explicit_bounds;
+    std::vector<uint32_t> indexes;
     std::string output_dir = ".";
     bool dry_run = false;
 
@@ -255,7 +256,10 @@ int main(int argc, char ** argv) {
             if (parts == 0) usage(argv[0], "--parts must be positive");
         } else if (arg == "--bounds") {
             if (++i >= argc) usage(argv[0], "missing value for --bounds");
-            explicit_bounds = parse_csv(argv[i]);
+            explicit_bounds = parse_csv(argv[i], "--bounds");
+        } else if (arg == "--indexes") {
+            if (++i >= argc) usage(argv[0], "missing value for --indexes");
+            indexes = parse_csv(argv[i], "--indexes");
         } else if (arg == "-o" || arg == "--outdir") {
             if (++i >= argc) usage(argv[0], "missing value for -o/--outdir");
             output_dir = argv[i];
@@ -300,10 +304,21 @@ int main(int argc, char ** argv) {
         }
         validate_bounds(values, n_layer);
         const uint32_t n_shards = static_cast<uint32_t>(values.size() - 1);
+        for (size_t i = 0; i < indexes.size(); ++i) {
+            if (indexes[i] >= n_shards ||
+                std::find(indexes.begin(), indexes.begin() + static_cast<std::ptrdiff_t>(i),
+                          indexes[i]) != indexes.begin() + static_cast<std::ptrdiff_t>(i)) {
+                usage(argv[0], "--indexes values must be unique valid shard indexes");
+            }
+        }
         const std::string stem = stem_of(input_path);
         std::printf("shard  window      tensors  tensor-bytes\n");
         std::printf("-----  ----------  -------  ------------\n");
         for (uint32_t i = 0; i < n_shards; ++i) {
+            if (!indexes.empty() &&
+                std::find(indexes.begin(), indexes.end(), i) == indexes.end()) {
+                continue;
+            }
             const bounds window { values[i], values[i + 1] };
             size_t tensor_count = 0;
             uint64_t tensor_bytes = 0;

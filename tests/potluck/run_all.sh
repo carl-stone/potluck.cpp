@@ -36,6 +36,7 @@ printf '== test-potluck-run ==\n'
 "${BIN}/test-potluck-run" "${MODEL}"
 
 printf '== integrated potluck-server ==\n'
-bash "${REPO}/tests/potluck/test_server.sh"
+bash "${REPO}/tests/potluck/test_server.sh" \
+    "${POTLUCK_TEST_WORKERS:-2}" "${N_PREDICT:-8}" "${HOST:-127.0.0.1}"
 
 printf 'DIRECT-RING SUITE PASSED\n'

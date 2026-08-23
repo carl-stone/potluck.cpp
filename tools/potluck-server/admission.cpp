@@ -804,15 +804,27 @@ bool refresh_remote_binaries(const bootstrap_node & bootstrap,
 }
 
 
-bool ensure_remote_model(const bootstrap_node & bootstrap, const std::string & model_path,
-                         const std::string & digest, std::string & error) {
+bool ensure_remote_artifact(const bootstrap_node & bootstrap,
+                            const std::filesystem::path & local_path,
+                            const std::filesystem::path & remote_path,
+                            const std::string & digest, std::string & error) {
     error.clear();
-    const std::string name = basename_of(model_path);
-    const std::string source = canonical_model_path(model_path).string();
+    if (remote_path.empty() || remote_path.is_absolute() || remote_path.filename().empty()) {
+        error = "remote artifact path must be a relative file";
+        return false;
+    }
+    for (const std::filesystem::path & part : remote_path) {
+        if (part == "..") {
+            error = "remote artifact path cannot contain '..'";
+            return false;
+        }
+    }
+    const std::string source = canonical_model_path(local_path).string();
+    const std::string remote = remote_path.generic_string();
     const std::string ssh = ssh_options(bootstrap);
     const std::string remote_check =
-        "(cd ~/potluck && (sha256sum " + shell_quote(name) +
-        " 2>/dev/null || shasum -a 256 " + shell_quote(name) +
+        "(cd ~/potluck && (sha256sum " + shell_quote(remote) +
+        " 2>/dev/null || shasum -a 256 " + shell_quote(remote) +
         " 2>/dev/null) | cut -d' ' -f1)";
     const std::string check = ssh + " " + shell_quote(bootstrap.ssh_target) + " " +
         shell_quote(remote_check);
@@ -837,25 +849,28 @@ bool ensure_remote_model(const bootstrap_node & bootstrap, const std::string & m
     const std::string actual = remote_digest();
     if (actual == digest) {
         std::printf("potluck-server: %s already has %s\n",
-                    bootstrap.ring_host.c_str(), name.c_str());
+                    bootstrap.ring_host.c_str(), remote.c_str());
         return true;
     }
-    std::printf("potluck-server: sending %s to %s (%llu MiB)\n", name.c_str(),
+    std::printf("potluck-server: sending %s to %s (%llu MiB)\n", remote.c_str(),
                 bootstrap.ring_host.c_str(),
                 static_cast<unsigned long long>(
                     std::filesystem::file_size(source) / (1024ull * 1024ull)));
     std::fflush(stdout);
+    const std::filesystem::path parent = remote_path.parent_path();
+    const std::string directory = "mkdir -p ~/potluck && cd ~/potluck && mkdir -p " +
+        shell_quote(parent.empty() ? "." : parent.generic_string());
     const std::string mkdir = ssh + " " + shell_quote(bootstrap.ssh_target) +
-        " " + shell_quote("mkdir -p ~/potluck");
+        " " + shell_quote(directory);
     if (std::system(mkdir.c_str()) != 0) {
-        error = "cannot prepare remote model directory";
+        error = "cannot prepare remote artifact directory";
         return false;
     }
     const std::string rsync = "rsync -a --whole-file --partial --inplace -e " +
         shell_quote(ssh) + " " + shell_quote(source) + " " +
-        shell_quote(bootstrap.ssh_target + ":potluck/" + name);
+        shell_quote(bootstrap.ssh_target + ":potluck/" + remote);
     if (std::system(rsync.c_str()) != 0) {
-        error = "model transfer failed";
+        error = "artifact transfer failed";
         return false;
     }
     const std::string transferred = remote_digest();

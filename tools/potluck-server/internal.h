@@ -205,8 +205,10 @@ std::string first_command_line(const std::string & command);
 bool refresh_remote_binaries(const bootstrap_node & bootstrap,
                              const std::filesystem::path & stage_dir,
                              const std::string & local_platform);
-bool ensure_remote_model(const bootstrap_node & bootstrap, const std::string & model_path,
-                         const std::string & digest, std::string & error);
+bool ensure_remote_artifact(const bootstrap_node & bootstrap,
+                            const std::filesystem::path & local_path,
+                            const std::filesystem::path & remote_path,
+                            const std::string & digest, std::string & error);
 std::string pinned_model_digest(const std::filesystem::path & model_path,
                                 const std::filesystem::path & repo_root);
 
@@ -362,7 +364,7 @@ public:
           rebuild_(std::move(rebuild)),
           heartbeat_(std::move(heartbeat)),
           refresh_(std::move(refresh)),
-          next_topology_check_(std::chrono::steady_clock::now() + std::chrono::seconds(5)) {
+          next_topology_check_(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
         slots_.reserve(std::max<uint32_t>(1, n_slots));
         for (uint32_t i = 0; i < std::max<uint32_t>(1, n_slots); ++i) {
             auto slot = std::make_shared<scheduled_slot>();
@@ -417,7 +419,7 @@ public:
             const std::string & id, uint64_t created,
             size_t count) {
         std::unique_lock<std::mutex> lock(mutex_);
-        if (count == 0 || count > slots_.size() || stopping_ || rebuilding_) {
+        if (count == 0 || count > slots_.size() || stopping_ || recovery_exhausted_) {
             return {};
         }
         const auto free_count = [&] {
@@ -429,8 +431,9 @@ public:
             return result;
         };
         if (!work_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
-                return stopping_ || rebuilding_ || free_count() >= count;
-            }) || stopping_ || rebuilding_) {
+                return stopping_ || recovery_exhausted_ ||
+                       (!rebuilding_ && free_count() >= count);
+            }) || stopping_ || recovery_exhausted_) {
             return {};
         }
         std::vector<std::shared_ptr<scheduled_slot>> acquired;
@@ -921,7 +924,7 @@ private:
                 recovery_error_.clear();
                 next_rebuild_ = {};
                 next_topology_check_ = std::chrono::steady_clock::now() +
-                                       std::chrono::seconds(5);
+                                       std::chrono::seconds(30);
             } else {
                 retry = schedule_rebuild_retry_locked(detail, delay);
                 exhausted = recovery_exhausted_;
@@ -1001,7 +1004,7 @@ private:
                 } else if (!rebuilding_ && slots_idle && refresh_ && now >= next_topology_check_) {
                     rebuilding_ = true;
                     refresh_topology = true;
-                    next_topology_check_ = now + std::chrono::seconds(5);
+                    next_topology_check_ = now + std::chrono::seconds(30);
                 } else if (!rebuilding_) {
                     for (const auto & slot : slots_) {
                         std::lock_guard<std::mutex> slot_lock(slot->mutex);
@@ -1051,7 +1054,7 @@ private:
                     recovery_error_.clear();
                     next_rebuild_ = {};
                     next_topology_check_ = std::chrono::steady_clock::now() +
-                                           std::chrono::seconds(5);
+                                           std::chrono::seconds(30);
                     if (!detail.empty()) {
                         std::printf("potluck-server: topology refresh %s: %s\n",
                                     result == topology_refresh_result::rebuilt

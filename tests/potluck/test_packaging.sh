@@ -39,12 +39,13 @@ make_payload() {
     mkdir -p "${dir}"
     printf '%s node\n' "${marker}" > "${dir}/potluck-node"
     printf '%s worker\n' "${marker}" > "${dir}/potluck-worker"
+    printf '%s shard\n' "${marker}" > "${dir}/potluck-shard"
     printf '%s library\n' "${marker}" > "${dir}/${library}"
-    chmod +x "${dir}/potluck-node" "${dir}/potluck-worker"
+    chmod +x "${dir}/potluck-node" "${dir}/potluck-worker" "${dir}/potluck-shard"
     {
         printf 'platform %s\n' "${platform}"
         printf 'commit packaging-test\n'
-        for name in potluck-node potluck-worker "${library}"; do
+        for name in potluck-node potluck-worker potluck-shard "${library}"; do
             printf '%s  %s\n' "$(sha256_file "${dir}/${name}")" "${name}"
         done
     } > "${dir}/potluck-build-id"
@@ -52,6 +53,10 @@ make_payload() {
 
 make_payload "${dist}/mac-arm64" mac-arm64 mac-arm64 libzmq.5.dylib
 make_payload "${dist}/linux-x86_64" linux-x86_64 linux-x86_64 libzmq.so.5
+if [[ ! -d "${dist}/${local_payload_name}" ]]; then
+    make_payload "${dist}/${local_payload_name}" "${local_payload_name}" \
+        "${local_payload_name}" "${local_library}"
+fi
 
 # Local payload setup does not inspect a compiler or a source-build directory.
 payload="${dist}/${local_payload_name}"
@@ -60,6 +65,7 @@ HOME="${tmp}/home" bash "${REPO}/scripts/install.sh" \
     --payload "${payload}" --prefix "${prefix}"
 [[ -x "${prefix}/potluck-node" ]]
 [[ -x "${prefix}/potluck-worker" ]]
+[[ -x "${prefix}/potluck-shard" ]]
 [[ -f "${prefix}/${local_library}" ]]
 [[ -f "${prefix}/potluck-build-id" ]]
 [[ ! -e "${prefix}/Qwen3.5-0.8B-Q4_0.gguf" ]]
@@ -148,18 +154,20 @@ FAKE_SSH_PLATFORM='Linux x86_64' \
 bash "${REPO}/scripts/deploy.sh" --target fake-target
 remote_prefix="${remote_home}/potluck"
 remote_files=("${remote_prefix}"/*)
-[[ "${#remote_files[@]}" -eq 6 ]]
+[[ "${#remote_files[@]}" -eq 7 ]]
 for name in \
     existing.gguf \
     libzmq.so.5 \
     potluck-build-id \
     potluck-deploy.sha256 \
     potluck-node \
+    potluck-shard \
     potluck-worker; do
     [[ -f "${remote_prefix}/${name}" ]]
 done
 [[ "$(<"${remote_prefix}/potluck-node")" == 'linux-x86_64 node' ]]
 [[ "$(<"${remote_prefix}/potluck-worker")" == 'linux-x86_64 worker' ]]
+[[ "$(<"${remote_prefix}/potluck-shard")" == 'linux-x86_64 shard' ]]
 [[ "$(<"${remote_prefix}/libzmq.so.5")" == 'linux-x86_64 library' ]]
 [[ "$(<"${remote_prefix}/existing.gguf")" == 'keep this model' ]]
 checksum_count=0
@@ -169,5 +177,5 @@ while read -r checksum name extra; do
     [[ "$(sha256_file "${remote_prefix}/${name}")" == "${checksum}" ]]
     checksum_count=$((checksum_count + 1))
 done < "${remote_prefix}/potluck-deploy.sha256"
-[[ "${checksum_count}" -eq 4 ]]
+[[ "${checksum_count}" -eq 5 ]]
 printf 'PACKAGING REMOTE INSTALL CHECK PASSED\n'
