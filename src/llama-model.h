@@ -702,7 +702,7 @@ struct llama_model {
     uint64_t n_elements() const;
 
     void print_info() const;
-    size_t prefetch() const;
+    size_t prefetch(bool force = false) const;
 
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;

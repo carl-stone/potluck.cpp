@@ -680,19 +680,28 @@ int main(int argc, char ** argv) {
             std::fflush(stdout);
             if (bench) {
                 const std::vector<llama_token> bench_prompt = tokenize_prompt(vocab, "The capital of France is");
-                serve_stats stats;
                 const auto start = std::chrono::steady_clock::now();
-                const std::vector<llama_token> bench_tokens =
-                    serve(session.ring, vocab, bench_prompt, 8, {}, &stats, 0, {}, n_ubatch);
+                const auto bench_slots = scheduler.acquire_many(
+                    bench_prompt, 8, {}, {}, false, false, "bench", 0, 1);
+                if (bench_slots.size() != 1) {
+                    throw std::runtime_error("cannot acquire a benchmark conversation slot");
+                }
+                const std::shared_ptr<scheduled_slot> & bench_slot = bench_slots.front();
+                scheduler.wait_done(bench_slot);
+                std::vector<llama_token> bench_tokens;
+                std::string bench_error;
+                {
+                    std::lock_guard<std::mutex> lock(bench_slot->mutex);
+                    bench_tokens = bench_slot->generated;
+                    bench_error = bench_slot->error;
+                }
+                scheduler.release(bench_slot);
+                if (!bench_error.empty()) {
+                    throw std::runtime_error("benchmark failed: " + bench_error);
+                }
                 const double wall = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - start).count();
-                const double prefill = stats.prefill_seconds > 0.0
-                    ? bench_prompt.size() / stats.prefill_seconds : 0.0;
-                const double decode = stats.decode_seconds > 0.0
-                    ? bench_tokens.size() / stats.decode_seconds : 0.0;
                 const double aggregate = wall > 0.0 ? bench_tokens.size() / wall : 0.0;
-                const double bytes_per_token = bench_tokens.empty()
-                    ? 0.0 : static_cast<double>(stats.head_payload_bytes) / bench_tokens.size();
                 const uint64_t model_bytes = potluck::model_file_bytes(model_path);
                 std::printf("bench ring route windows=%zu\n", session.ring.windows.size());
                 for (size_t i = 0; i < session.ring.windows.size(); ++i) {
@@ -703,10 +712,9 @@ int main(int argc, char ** argv) {
                                 i, window.owner, window.start, window.end,
                                 static_cast<unsigned long long>(bytes), window.n_gpu_layers);
                 }
-                std::printf("bench ring prefill-tok/s %.2f decode-tok/s %.2f aggregate-tok/s %.2f "
-                            "ms/token %.2f wire-bytes/token %.1f head-peak-rss-mb %.1f\n",
-                            prefill, decode, aggregate, aggregate > 0.0 ? 1000.0 / aggregate : 0.0,
-                            bytes_per_token, peak_rss_mb());
+                std::printf("bench ring aggregate-tok/s %.2f ms/token %.2f head-peak-rss-mb %.1f\n",
+                            aggregate, aggregate > 0.0 ? 1000.0 / aggregate : 0.0,
+                            peak_rss_mb());
                 std::fflush(stdout);
             }
             if (listener_thread.joinable()) {

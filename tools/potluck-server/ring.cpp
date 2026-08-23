@@ -401,7 +401,8 @@ pid_t launch_remote_worker(const bootstrap_node & bootstrap, const std::string &
                            const potluck::curve_bootstrap_credentials & credentials) {
     const std::string log = "worker-" + std::to_string(index) + ".log";
     const std::string pid_file = ".potluck-worker-" + std::to_string(index) + ".pid";
-    const std::string remote = "cd ~/potluck || exit 1; nohup ./potluck-worker " +
+    const std::string remote = "cd ~/potluck || exit 1; "
+                               "LD_LIBRARY_PATH=.${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} nohup ./potluck-worker " +
                                shell_quote(model) +
                                " --bind " + shell_quote(worker.bind_endpoint) +
                                " --next " + shell_quote(worker.next_endpoint) +
@@ -612,7 +613,7 @@ void stop_planned_workers(const std::vector<planned_worker> & planned) {
 }
 
 
-void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int timeout_ms,
+static void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int timeout_ms,
                            const potluck::curve_client_credentials & controller_credentials) {
     if (ring.worker_server_keys.size() != n_workers) {
         throw std::runtime_error("ring CURVE server key count mismatch");
@@ -1015,19 +1016,18 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                 candidates.push_back(std::move(probe));
             }
         }
-        const bool allow_remote_shortfall =
-            has_remote && head_share == "auto" && head.ok;
+        const bool reserve_head_slot =
+            has_remote && head_share == "auto" && head.ok &&
+            head_plan.participates && n_layer >= 4;
         std::vector<device_probe> devices = admit_devices(
             std::move(candidates), n_layer, model_bytes, n_head_kv, head_dim, n_ctx,
-            allow_remote_shortfall);
-        if (has_remote && head_share == "auto" && head.ok) {
+            reserve_head_slot);
+        if (reserve_head_slot) {
             head.placement_usable_limit = head_plan.budget;
-            head_participates = head_plan.participates;
-            if (head_participates) {
-                head.bootstrap = {};
-                head.ok = true;
-                devices.push_back(std::move(head));
-            }
+            head_participates = true;
+            head.bootstrap = {};
+            head.ok = true;
+            devices.push_back(std::move(head));
         }
         std::printf("potluck-server: head participation %s (budget %llu MiB, reserve %llu MiB)\n",
                     head_participates ? "on" : "off",
@@ -1343,9 +1343,11 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
     }
 
     std::vector<planned_worker> current_workers;
+    std::vector<potluck::ring_window> current_windows;
     {
         std::lock_guard<std::mutex> lock(session.mutex);
         current_workers = session.workers;
+        current_windows = session.ring.windows;
     }
     const std::set<std::string> current_remote = remote_targets(current_workers);
 
@@ -1396,12 +1398,18 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
             return topology_refresh_result::unchanged;
         }
     }
+    const bool reserve_head_slot =
+        options.head_share == "auto" &&
+        std::any_of(current_workers.begin(), current_workers.end(),
+                    [](const planned_worker & worker) {
+                        return worker.kind == worker_kind::local;
+                    });
     std::vector<device_probe> replacement_devices;
     try {
         const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
         replacement_devices = admit_devices(
             valid, options.n_layer, model_bytes, options.n_head_kv,
-            options.head_dim, options.n_ctx, true);
+            options.head_dim, options.n_ctx, reserve_head_slot);
         if (probe_targets(replacement_devices) != current_remote) {
             changed = true;
         }
@@ -1414,14 +1422,17 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
         device_probe head = probe_local_worker(options.worker_path);
         bool current_head = false;
         bool has_current_head = false;
-        uint64_t current_budget = 0;
-        uint64_t current_reserve = 0;
+        uint64_t current_head_layers = 0;
         {
             std::lock_guard<std::mutex> lock(session.mutex);
             current_head = session.head_participates;
             has_current_head = session.has_head_profile;
-            current_budget = session.head_budget;
-            current_reserve = session.head_reserve;
+        }
+        for (const potluck::ring_window & window : current_windows) {
+            if (window.owner < current_workers.size() &&
+                current_workers[window.owner].kind == worker_kind::local) {
+                current_head_layers += window.end - window.start;
+            }
         }
         if (!head.ok) {
             error = "head reserve probe deferred: " + head.error;
@@ -1441,9 +1452,9 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
             if (participating) {
                 replacement_devices.push_back(head);
             }
-            changed = changed || !has_current_head || current_head != participating ||
-                      materially_changed(current_budget, budget) ||
-                      materially_changed(current_reserve, reserve);
+            changed = changed || head_placement_requires_refresh(
+                has_current_head, current_head, participating,
+                current_head_layers * layer_cost, budget);
         }
     }
     const uint64_t model_bytes = std::filesystem::file_size(options.model_path);

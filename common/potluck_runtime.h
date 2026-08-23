@@ -71,7 +71,7 @@ inline uint64_t model_file_bytes(const std::string & path) {
 
 inline llama_context_params stage_context_params(uint32_t start, uint32_t end, bool embeddings,
                                                  uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch,
-                                                 bool tail, bool single_thread = false) {
+                                                 bool single_thread = false) {
     llama_context_params params = llama_context_default_params();
     if (single_thread || std::getenv("POTLUCK_SINGLE_THREAD") != nullptr) {
         params.n_threads = 1;
@@ -243,7 +243,7 @@ inline bool stage_load(stage_model & sm, const std::string & path, uint32_t star
     sm.compute_embeddings = embeddings || is_emitter;
 
     sm.ctx = llama_init_from_model(sm.model, stage_context_params(start, end, sm.compute_embeddings,
-                                                                  n_ctx, n_seq_max, n_ubatch, tail,
+                                                                  n_ctx, n_seq_max, n_ubatch,
                                                                   single_thread));
     if (sm.ctx == nullptr) {
         error = "failed to allocate context for stage " + std::to_string(start) + ":" + std::to_string(end);
@@ -268,43 +268,6 @@ inline void stage_free(stage_model & sm) {
     if (sm.ctx) llama_free(sm.ctx);
     if (sm.model) llama_model_free(sm.model);
     sm = stage_model{};
-}
-// Decodes a single token at the given position. On success returns 0 and leaves
-// the logits available via llama_get_logits_ith(ctx, 0).
-//
-// NOTE: the current llama.cpp defers output synchronization, so the logits /
-// embeddings buffers are only guaranteed valid after llama_synchronize(). We
-// synchronize here so callers can read llama_get_logits_ith / llama_get_embeddings_ith
-// immediately after this returns (matching the behavior of older llama.cpp, which
-// synchronized internally).
-inline int stage_decode_token(stage_model & sm, llama_token token, uint32_t pos) {
-    sm.batch.n_tokens = 1;
-    sm.batch.token[0] = token;
-    sm.batch.pos[0] = static_cast<int32_t>(pos);
-    sm.batch.n_seq_id[0] = 1;
-    sm.batch.seq_id[0][0] = 0;
-    sm.batch.logits[0] = 1;
-    const int rc = llama_decode(sm.ctx, sm.batch);
-    if (rc == 0) {
-        llama_synchronize(sm.ctx);
-    }
-    return rc;
-}
-
-// Decodes a hidden-state vector at the given position (only valid for a stage
-// that starts after layer 0).
-inline int stage_decode_hidden(stage_model & sm, const float * hidden, uint32_t pos) {
-    sm.batch.n_tokens = 1;
-    std::memcpy(sm.batch.embd, hidden, sizeof(float) * sm.n_embd);
-    stage_set_position(sm.batch, 0, static_cast<llama_pos>(pos), 1, stage_n_pos_per_embd(sm));
-    sm.batch.n_seq_id[0] = 1;
-    sm.batch.seq_id[0][0] = 0;
-    sm.batch.logits[0] = 1;
-    const int rc = llama_decode(sm.ctx, sm.batch);
-    if (rc == 0) {
-        llama_synchronize(sm.ctx);
-    }
-    return rc;
 }
 
 // §11/§12 batched decode: decodes `n` tokens in a single llama_decode call.

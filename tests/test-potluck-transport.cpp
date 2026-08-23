@@ -20,7 +20,7 @@ namespace {
 
 potluck::message make_message(uint64_t sequence, uint8_t value) {
     potluck::message result;
-    result.type = potluck::message_type::hidden_state;
+    result.type = potluck::message_type::batch_result;
     result.flags = 0x12345678;
     result.rank = 3;
     result.sequence = sequence;

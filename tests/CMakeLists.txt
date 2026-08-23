@@ -388,8 +388,18 @@ llama_build_and_test(test-potluck-discovery.cpp LABEL discovery)
 target_include_directories(test-potluck-discovery PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-potluck-discovery PRIVATE potluck-discovery)
 
-llama_build_and_test(test-potluck-protocol.cpp)
-target_link_libraries(test-potluck-protocol PRIVATE potluck-distributed)
+llama_build_and_test(
+    test-potluck-protocol.cpp
+    ${PROJECT_SOURCE_DIR}/tools/potluck-server/admission.cpp)
+target_include_directories(test-potluck-protocol PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/potluck-server
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/common
+    ${PROJECT_SOURCE_DIR}/vendor)
+target_link_libraries(test-potluck-protocol PRIVATE
+    potluck-distributed
+    potluck-discovery
+    cpp-httplib)
 llama_build_and_test(test-potluck-transport.cpp)
 target_link_libraries(test-potluck-transport PRIVATE potluck-distributed)
 
@@ -404,5 +414,5 @@ llama_build_and_test(test-potluck-qwen35-stages.cpp ARGS ${PROJECT_SOURCE_DIR}/m
 
 # Full pipeline: prompt prefill + multi-token greedy generation across a split,
 # compared token-for-token against the unsplit full model.
-llama_build_and_test(test-potluck-run.cpp)
+llama_build_and_test(test-potluck-run.cpp ARGS ${PROJECT_SOURCE_DIR}/models/Qwen3.5-0.8B-Q4_0.gguf)
 target_include_directories(test-potluck-run PRIVATE ${PROJECT_SOURCE_DIR}/common)

@@ -1,12 +1,34 @@
 # Benchmarks
 
-> **Non-product historical measurement.** These numbers measure static,
-> manually configured, coordinator-routed raw-TCP component paths that ADR 0006
-> and ADR 0007 require Potluck to remove. They are retained only as dated
-> evidence and must not guide product configuration or performance claims.
-> Product benchmarks must run the integrated resource-aware direct-peer ZeroMQ
-> piped-ring server with automatic placement, per-window prefetch, per-device
-> offload, continuous batching, and slots.
+> Product measurements must run the integrated resource-aware direct-peer ZeroMQ piped-ring server with automatic placement, per-window prefetch, per-device offload, continuous batching, and slots.
+
+## Integrated 27B product acceptance
+
+The following measurements came from a supervised 2026-08-23 run of the integrated direct-peer ZeroMQ PRP server. This is an operating point, not a speedup claim.
+
+- Model: Gemma 3 27B Q4_K_M, 62 layers
+- Devices: Apple M4 Mac, Apple M1 Mac, and Linux PC with NVIDIA GTX 1650 SUPER
+- Build: Release
+- Discovery and placement: automatic DNS-SD discovery, live probing, head participation, six repeated windows, and automatic window-shard distribution
+- Request: `The capital of France is`, greedy sampling, 32 streamed completion tokens
+
+The route used M4 windows `[0,12)` and `[31,43)` with 12 Metal layers each, M1 windows `[12,22)` and `[43,53)` with 10 Metal layers each, and PC windows `[22,31)` and `[53,62)` with 6 CUDA layers followed by a CPU tail.
+
+Measured client-side results:
+
+```text
+TTFT                 38.943 s
+32-token total       57.159 s
+decode throughput     1.702 token/s
+```
+
+Two simultaneous 16-token conversations, one streaming and one non-streaming, both returned HTTP 200 in 46.874 s and 47.366 s. Killing the M1 worker during another request returned HTTP 503, the controller restored a ready three-device ring, and the next 16-token request returned HTTP 200 in 47.100 s.
+
+These values include the current PRP route, network transfers of intermediate activations, per-window synchronization, and client-visible HTTP streaming. They do not isolate prefill, compare against another topology, or establish a regression threshold.
+
+## Historical component measurements
+
+The numbers below measure static, manually configured, coordinator-routed raw-TCP component paths that ADR 0006 and ADR 0007 required Potluck to remove. They remain only as dated evidence and must not guide product configuration or performance claims.
 
 All numbers below were measured on 2026-08-20.
 
@@ -97,8 +119,4 @@ prefill message per prompt.
 
 ## Verification scope
 
-These benchmarks and the acceptance suite intentionally use small fixture
-models that fit the test host. The current correctness fixture is Qwen3.5
-0.8B; other small models may be used when they exercise a supported path.
-Verifying 27B correctness, performance, or end-to-end execution is an explicit
-non-goal. 27B is a deployment target, not an acceptance target.
+Exact token-parity checks use the Qwen3.5 0.8B fixture so a full-model reference fits one test host. The supervised Gemma 3 27B run establishes integrated three-device operation and a measured performance point; it does not claim reference-token parity or a speedup ratio.

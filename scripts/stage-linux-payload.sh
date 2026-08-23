@@ -66,19 +66,32 @@ for command in cmake git sha256sum awk readelf ldd; do
         die "required command not found: ${command}"
 done
 
-# $ORIGIN runpath at build time so the staged binaries find shipped libraries
-# next to themselves without any post-link patching.
-potluck_require_disk "${build_dir}" "${POTLUCK_MIN_DISK_GIB:-10}"
-cmake -S "${REPO}" -B "${build_dir}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DGGML_NATIVE=OFF \
-    -DLLAMA_BUILD_TESTS=OFF \
-    -DLLAMA_BUILD_EXAMPLES=OFF \
-    -DLLAMA_BUILD_APP=OFF \
-    -DPOTLUCK_HIGHS=OFF \
-    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+# $ORIGIN runpath at build time lets staged binaries find shipped libraries.
+cmake_opts=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DBUILD_SHARED_LIBS=OFF
+    -DGGML_NATIVE=OFF
+    -DGGML_CUDA=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_APP=OFF
+    -DPOTLUCK_HIGHS=OFF
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+)
+nvcc="$(command -v nvcc 2>/dev/null || true)"
+if [[ -z "${nvcc}" && -x /opt/cuda/bin/nvcc ]]; then
+    nvcc=/opt/cuda/bin/nvcc
+fi
+if command -v nvidia-smi >/dev/null 2>&1 && [[ -n "${nvcc}" ]]; then
+    cmake_opts[3]=-DGGML_CUDA=ON
+    if [[ -n "${POTLUCK_CUDA_ARCHITECTURES:-}" ]]; then
+        cmake_opts+=("-DCMAKE_CUDA_ARCHITECTURES=${POTLUCK_CUDA_ARCHITECTURES}")
+    fi
+    export PATH="$(dirname "${nvcc}"):${PATH}"
+fi
+potluck_require_disk "${build_dir}" "${POTLUCK_MIN_DISK_GIB:-10}"
+cmake -S "${REPO}" -B "${build_dir}" "${cmake_opts[@]}"
 potluck_build "${build_dir}" --target potluck-node potluck-worker potluck-shard
 
 worker="${build_dir}/bin/potluck-worker"
@@ -158,12 +171,9 @@ zmq_needs() {
 sodium_soname="$(zmq_needs "${staging_dir}/libzmq.so.5" |
     awk '/^libsodium\.so/ { print; exit }')"
 sodium_path="${POTLUCK_SODIUM:-}"
-# Ship libsodium only when the staged libzmq cannot resolve it on this host;
-# a system copy that ldconfig already sees needs no bundling.
-if [[ -n "${sodium_path}" ]] ||
-    (cd "${staging_dir}" && ldd libzmq.so.5 | grep -q 'not found'); then
-    command -v patchelf >/dev/null 2>&1 ||
-        die 'bundling libsodium requires patchelf to set an $ORIGIN runpath'
+# Bundle libsodium whenever libzmq needs it. The deployment target may not
+# provide the same system libraries as the build host.
+if [[ -n "${sodium_path}" || -n "${sodium_soname}" ]]; then
     if [[ -z "${sodium_path}" ]] && command -v pkg-config >/dev/null 2>&1; then
         sodium_libdir="$(pkg-config --variable=libdir libsodium 2>/dev/null || true)"
         if [[ -f "${sodium_libdir}/${sodium_soname}" ]]; then
@@ -182,7 +192,6 @@ if [[ -n "${sodium_path}" ]] ||
     sodium_name="$(zmq_soname "${sodium_path}")"
     [[ -n "${sodium_name}" ]] || sodium_name="${sodium_soname:-libsodium.so}"
     cp "${sodium_path}" "${staging_dir}/${sodium_name}"
-    patchelf --set-rpath '$ORIGIN' "${staging_dir}/libzmq.so.5"
     shipped_files+=("${sodium_name}")
 fi
 
@@ -194,7 +203,9 @@ for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${s
 done
 for staged in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" \
     "${staging_dir}/potluck-shard" "${staging_dir}/libzmq.so.5"; do
-    if (cd "${staging_dir}" && ldd "$(basename "${staged}")" | grep -q 'not found'); then
+    if (cd "${staging_dir}" &&
+        LD_LIBRARY_PATH="${staging_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+            ldd "$(basename "${staged}")" | grep -q 'not found'); then
         die "staged file has unresolved libraries: ${staged}"
     fi
 done

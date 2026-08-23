@@ -47,21 +47,21 @@ head; distributed configuration is not part of the normal interface.
 3. The scheduler selects the devices and assigns several disjoint windows to
    each device. Assignment is heterogeneity-aware and minimizes the limiting
    stage subject to live resource constraints.
-4. The controller ensures the complete GGUF is present on each selected
-   device, transferring it automatically and reusing a copy whose checksum
-   matches.
-5. Each worker opens that model file but loads only its assigned layer
-   windows. The full file may remain on disk; no worker or production head
-   loads the complete model into memory.
-6. Per-window prefetch is not implemented yet. Admission sizes assignments so
-   each device can hold all of its windows, so full-file presence is sufficient
-   for the current schedule.
+4. The controller derives route-keyed GGUF window shards from the selected model, transfers only each device's assigned shards, verifies their checksums, and reuses matching cached shards.
+5. Each worker loads only its assigned window shards. A complete GGUF may remain on controller storage, but no production worker or head loads the complete model into memory.
+6. Each worker synchronizes its current window output, sends it directly over
+   ZeroMQ, and only then advises the mmap range for its next owned window.
+   Advice is bounded to that window's mapped tensors; whole-file mmap prefetch
+   is not the execution path.
 7. CPU, CUDA, and Metal placement is selected independently for each device and
    window from current usable capacity.
-8. Active conversation slots are continuously batched through the ring. Each
-   slot keeps isolated sequence state and cache affinity.
-9. The tail samples or selects the next token and the head returns the
-   documented OpenAI-compatible JSON or streaming event.
+8. Active conversation slots are continuously batched at each token step: the
+   scheduler merges active sequence rows into one scheduled batch, preserving
+   per-slot sequence state and cache affinity.
+9. For autoregressive decode, token t+1 waits for the final logits returned
+   from the completed ring traversal for token t. The tail samples or selects
+   the next token and the head returns the documented OpenAI-compatible JSON or
+   streaming event.
 
 The implemented data plane in `potluck-server` uses ZeroMQ message-oriented
 communication between adjacent ring peers. Each worker binds its receive
@@ -72,17 +72,31 @@ windows it does not execute.
 DNS-SD candidate discovery, bounded pre-launch probing and admission,
 resource-weighted selection and placement, automatic SSH launch, and
 full-model distribution with checksum validation are implemented. Adaptive
-load changes, per-window prefetch, recovery migration, security implementation,
-and full API parity remain unfinished. The accepted trusted-LAN security
-baseline is defined by [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md).
+load changes, recovery migration, security implementation, and full API parity
+remain unfinished. The accepted trusted-LAN security baseline is defined by
+[ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md).
 
 ## Piped-ring execution
 
-Every selected worker can own several disjoint layer windows. A request visits
-those windows in ring order and can visit the same device more than once during
-one model pass. Window sizes and ownership come from the automatic scheduler in
-the finished product; equal splits and user-supplied static bounds are not
-product behavior.
+Every selected worker can own several disjoint layer windows. Prima's
+Pipelined-Ring Parallelism (PRP) behavior in Potluck's piped ring traverses
+every disjoint global window in cyclic ring order for each scheduled batch. A
+batch can therefore return to the same device multiple times in one model
+pass; it is not a single synchronous pass through one window per device.
+Window sizes and ownership come from the automatic scheduler in the finished
+product; equal splits and user-supplied static bounds are not product behavior.
+
+At each window, computation completes and the worker synchronizes its output
+before sending it directly over ZeroMQ to the next ring peer. The send occurs
+before the worker advises the mmap range for its next owned window. This permits
+bounded overlap between downstream window computation and OS page-cache work
+for the advised range; it does not provide unrestricted compute/send overlap.
+
+Continuous batching merges active sequence rows into the scheduled batch at one
+token step. Token t+1 waits for final logits from the full repeated-window
+traversal of token t, so ring work is not pipelined across token steps. There is
+no separate cycle scheduler: cyclic window traversal is the route of each
+scheduled batch.
 
 The current server route assigns repeated disjoint windows from pre-launch
 usable-capacity measurements. DNS-SD supplies candidate nodes and the server
@@ -98,21 +112,13 @@ ranks, addresses, ports, or launch order to the user.
 
 The ring supports prompt prefill, continuous decode, multiple active sequences,
 slot lifecycle, cancellation, and per-window accelerator placement through the
-same server runtime. Per-window prefetch is currently unimplemented because
-admission keeps every assigned window resident on its device; it remains a
-release-gate requirement. A transport smoke does not satisfy the architecture.
+same server runtime. A transport smoke does not satisfy the architecture.
 
 ## Model distribution and window loading
 
-`potluck-shard` remains an optional disk-saving and format-validation tool for
-offline workflows. Normal server startup does not require manually generated
-shards or a deployment script.
+`potluck-shard` provides the GGUF window-shard format used by automatic startup. Users do not generate shards or run deployment commands.
 
-The controller distributes the complete source GGUF to each admitted remote
-device, verifies its checksum, and reuses a valid copy on later starts. A
-worker opens that file with the layer bounds for its assigned windows and
-loads only those windows. A complete GGUF may exist on disk, but production
-execution must not load the complete model into memory.
+After placement selects the repeated window route, the controller creates a checksum-keyed shard set, sends each selected device only the shards for its assigned windows, and reuses valid cached files on later starts. A complete source GGUF may remain on controller storage, but production workers load only assigned window shards.
 
 ## Scheduling and head resource protection
 
@@ -147,22 +153,13 @@ server path. Slots own bounded sequence state, cache affinity, isolation,
 cancellation, and lifecycle. The API surface and live failure migration remain
 smaller than the full llama.cpp server contract.
 
-## Current implementation gap
+## Current implementation status
 
-The direct adjacent-peer ZeroMQ path now runs in `potluck-server`:
+The integrated direct-peer ZeroMQ server now implements repeated-window PRP traversal, automatic DNS-SD discovery, SSH bootstrap, live admission, resource-weighted placement, automatic window-shard distribution, per-window CPU/Metal/CUDA placement, bounded mmap advice, two conversation slots, and worker-loss recovery.
 
-- Local two-worker CPU smoke passed with repeated disjoint windows.
-- An M4 head bootstrapped one Linux CPU worker over SSH for the Qwen3.5 0.8B
-  fixture. The two-token result was ` located in`, and the server logged
-  windows `[0,12)` and `[12,24)`.
-- The same M4 head automatically discovered the Linux node through DNS-SD,
-  accepted its first SSH host key in a Potluck-specific trust file, launched
-  the worker, and returned the same two-token result.
-- The local two-worker smoke now reports each worker's accelerator through the
-  ring protocol and places window layers automatically: fully on M4 Metal and
-  on a GTX 1650 SUPER CUDA device, CPU-only when no device exists.
+A supervised 2026-08-23 acceptance run served Gemma 3 27B Q4_K_M across an M4 Mac, an M1 Mac, and a Linux PC with a GTX 1650 SUPER. The automatic route assigned six repeated windows across all three devices. Two concurrent conversations, including one streaming response, completed with HTTP 200. Killing the M1 worker during generation returned the required retryable HTTP 503; the controller relaunched the worker, restored a ready three-device ring, and completed the next request.
 
-The remaining product gaps are explicit:
+Implemented lifecycle and reliability behavior:
 
 - DNS-SD discovery, bounded pre-launch probing, capacity admission,
   heterogeneous window sizing, automatic model distribution, and accelerator
@@ -181,6 +178,9 @@ The remaining product gaps are explicit:
 - Recovery uses bounded exponential backoff with deterministic jitter and a
   terminal health reason after repeated failures. Topology checks never rebuild
   an active request.
+
+The remaining product gaps are:
+
 - The OpenAI-compatible HTTP surface is a subset; full request, response,
   error, usage, streaming, and cancellation parity is unfinished.
 - Authentication, encryption, credential handling, and tenant or prompt privacy

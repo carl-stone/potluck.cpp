@@ -86,6 +86,16 @@ inline head_participation_plan plan_head_participation(const device_probe & head
     };
 }
 
+inline bool head_placement_requires_refresh(bool has_profile,
+                                            bool current_participates,
+                                            bool proposed_participates,
+                                            uint64_t assigned_bytes,
+                                            uint64_t proposed_budget) {
+    return !has_profile ||
+           current_participates != proposed_participates ||
+           (current_participates && assigned_bytes > proposed_budget);
+}
+
 enum class worker_kind {
     local,
     remote,
@@ -133,11 +143,6 @@ struct ring_session {
     mutable std::mutex mutex;
 };
 
-struct serve_stats {
-    double prefill_seconds = 0.0;
-    double decode_seconds = 0.0;
-    uint64_t head_payload_bytes = 0;
-};
 
 struct model_digest_cache {
     std::mutex mutex;
@@ -195,7 +200,7 @@ uint64_t route_needed_bytes(uint32_t n_layer, uint64_t model_bytes, uint32_t n_h
 std::vector<device_probe> admit_devices(std::vector<device_probe> candidates,
                                          uint32_t n_layer, uint64_t model_bytes,
                                          uint32_t n_head_kv, uint32_t head_dim,
-                                         uint32_t n_ctx, bool allow_shortfall = false);
+                                         uint32_t n_ctx, bool reserve_owner_slot = false);
 std::vector<potluck::ring_window> build_ring_route(const std::vector<device_probe> & devices,
                                                    uint32_t n_layer, uint64_t model_bytes,
                                                    uint32_t n_head_kv, uint32_t head_dim,
@@ -267,13 +272,12 @@ public:
     using std::runtime_error::runtime_error;
 };
 
-std::vector<int32_t> drive_batch(ServerRing & ring,
+std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
                                  const std::vector<int32_t> & positions,
                                  const std::vector<int32_t> & sequences,
                                  const std::vector<int32_t> & tokens,
                                  int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
                                  uint32_t n_logits,
-                                 serve_stats * stats = nullptr,
                                  std::function<bool()> should_cancel = {},
                                  bool * batch_started = nullptr,
                                  std::function<bool(std::string &)> heartbeat = {},
@@ -284,14 +288,6 @@ std::string token_piece(const llama_vocab * vocab, llama_token token);
 std::string render_tokens(const llama_vocab * vocab, const std::vector<llama_token> & tokens);
 double peak_rss_mb();
 void configure_slot(ServerRing & ring, const potluck::slot_config & config);
-std::vector<llama_token> serve(ServerRing & ring, const llama_vocab * vocab,
-                               const std::vector<llama_token> & prompt,
-                               uint32_t n_predict,
-                               const std::function<void(const std::string &)> & emit,
-                               serve_stats * stats = nullptr,
-                               int32_t sequence_id = 0,
-                               potluck::slot_config sampling = {},
-                               uint32_t prefill_batch = 512);
 enum class slot_state {
     free,
     queued,
@@ -647,10 +643,10 @@ private:
             if (clear_slot) {
                 const std::vector<int32_t> empty;
                 try {
-                    (void) drive_batch(ring_, empty, empty, empty, clear_slot->seq,
-                                       -1, -1, 0, nullptr,
-                                       [this] { return is_stopping(); },
-                                       nullptr, heartbeat_);
+                    (void) drive_ring_cycle(ring_, empty, empty, empty, clear_slot->seq,
+                                            -1, -1, 0,
+                                            [this] { return is_stopping(); },
+                                            nullptr, heartbeat_);
                 } catch (const request_cancelled &) {
                     return;
                 }
@@ -778,9 +774,9 @@ private:
         std::vector<int32_t> result;
         potluck::batch_logprobs result_logprobs;
         try {
-            result = drive_batch(
+            result = drive_ring_cycle(
                 ring_, positions, sequences, tokens, clear_seq, -1, -1, n_logits,
-                nullptr, batch_cancelled, &batch_started, heartbeat_, &result_logprobs);
+                batch_cancelled, &batch_started, heartbeat_, &result_logprobs);
         } catch (const request_cancelled &) {
             if (batch_started) {
                 fail_selected();

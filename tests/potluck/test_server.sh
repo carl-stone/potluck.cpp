@@ -109,7 +109,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-POTLUCK_TRACE_PREFETCH=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 2 --ubatch 1 --port "${PORT}" \
+POTLUCK_TRACE_PRP=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 2 --ubatch 1 --port "${PORT}" \
     >"${WORK}/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 120); do
@@ -511,13 +511,27 @@ assert health["rebuilding"] is False
 actual = health["workers"]
 assert 1 <= actual <= expected
 assert len(health["slots"]) == 2
-windows = sorted(health["windows"], key=lambda w: w["start"])
+windows = sorted(health["windows"], key=lambda w: w["index"])
 assert windows and windows[0]["start"] == 0
+assert [w["index"] for w in windows] == list(range(len(windows)))
 for previous, current in zip(windows, windows[1:]):
     assert current["start"] == previous["end"]
 assert all(w["start"] < w["end"] for w in windows)
 assert all(0 <= w["owner"] < actual for w in windows)
-assert [w["index"] for w in windows] == list(range(len(windows)))
+assert len(windows) % actual == 0
+round_count = len(windows) // actual
+assert round_count >= 2
+owners_by_round = []
+for round_index in range(round_count):
+    group = windows[round_index * actual:(round_index + 1) * actual]
+    for previous, current in zip(group, group[1:]):
+        assert current["start"] == previous["end"]
+    owners = [window["owner"] for window in group]
+    assert len(set(owners)) == actual
+    assert sorted(owners) == list(range(actual))
+    owners_by_round.append(owners)
+assert all(owners == owners_by_round[0] for owners in owners_by_round[1:])
+assert len(windows) > actual
 PY
 
 MODELS=$(curl -fsS "http://${HOST}:${PORT}/v1/models")
@@ -527,26 +541,172 @@ models, model = json.loads(sys.argv[1]), sys.argv[2]
 assert models["object"] == "list"
 assert models["data"] and models["data"][0]["id"] == model
 PY
-python3 - "${WORK}/server.log" <<'PY'
-import re, sys
-prepared = {}
-computed = []
-for line_number, line in enumerate(open(sys.argv[1])):
-    match = re.search(r"WORKER rank (\d+) prefetched window (\d+) \((\d+) bytes\)", line)
-    if match:
-        rank, window, byte_count = match.groups()
-        assert int(byte_count) > 0, f"window {(rank, window)} reported zero prefetch bytes"
-        prepared.setdefault((rank, window), line_number)
-    match = re.search(r"WORKER rank (\d+) resident window (\d+)", line)
-    if match:
-        prepared.setdefault(match.groups(), line_number)
-    match = re.search(r"WORKER rank (\d+) computing window (\d+)", line)
-    if match:
-        computed.append((match.groups(), line_number))
-assert computed, "no worker compute trace"
-for window, line_number in computed:
-    assert window in prepared, f"window {window} computed without prefetch or resident data"
-    assert prepared[window] < line_number, f"window {window} preparation followed compute"
+python3 - "${WORK}/server.log" "${HEALTH}" <<'PY'
+import json
+import re
+import sys
+
+log_path, health_text = sys.argv[1:]
+health = json.loads(health_text)
+worker_count = int(health["workers"])
+windows = sorted(health["windows"], key=lambda w: w["index"])
+assert worker_count > 0
+assert windows and windows[0]["start"] == 0
+assert [w["index"] for w in windows] == list(range(len(windows)))
+for previous, current in zip(windows, windows[1:]):
+    assert current["start"] == previous["end"]
+assert all(w["start"] < w["end"] for w in windows)
+assert all(0 <= w["owner"] < worker_count for w in windows)
+assert len(windows) % worker_count == 0
+round_count = len(windows) // worker_count
+assert round_count >= 2
+
+round_for_window = {}
+owners_by_round = []
+for round_index in range(round_count):
+    group = windows[round_index * worker_count:(round_index + 1) * worker_count]
+    owners = [window["owner"] for window in group]
+    assert len(set(owners)) == worker_count
+    assert sorted(owners) == list(range(worker_count))
+    owners_by_round.append(owners)
+    for window in group:
+        round_for_window[window["index"]] = round_index
+assert all(owners == owners_by_round[0] for owners in owners_by_round[1:])
+
+owned_by_rank = {
+    rank: [window["index"] for window in windows if window["owner"] == rank]
+    for rank in range(worker_count)
+}
+assert all(owned_by_rank.values())
+next_owned = {}
+for rank, owned in owned_by_rank.items():
+    for position, window in enumerate(owned):
+        next_owned[window] = owned[(position + 1) % len(owned)]
+
+trace_re = re.compile(
+    r"PRP seq=(\d+) window=(\d+) round=(\d+) rank=(\d+) "
+    r"event=([a-z_]+) bytes=(\d+)(?:\s|$)"
+)
+allowed_events = {
+    "receive", "compute_begin", "compute_end", "send",
+    "prefetch_begin", "prefetch_end",
+    "startup_prefetch_begin", "startup_prefetch_end",
+}
+events = []
+with open(log_path) as log:
+    for line_number, line in enumerate(log, 1):
+        if "PRP " not in line:
+            continue
+        match = trace_re.search(line)
+        assert match, f"malformed PRP trace at line {line_number}: {line.rstrip()}"
+        seq, window, round_index, rank, event, byte_count = match.groups()
+        event_record = {
+            "seq": int(seq),
+            "window": int(window),
+            "round": int(round_index),
+            "rank": int(rank),
+            "event": event,
+            "bytes": int(byte_count),
+            "line": line_number,
+        }
+        assert event in allowed_events
+        assert 0 <= event_record["window"] < len(windows)
+        assert event_record["rank"] == windows[event_record["window"]]["owner"]
+        assert event_record["round"] == round_for_window[event_record["window"]]
+        assert event_record["bytes"] >= 0
+        events.append(event_record)
+
+startup = [event for event in events if event["seq"] == 0]
+assert startup
+startup_streams = {}
+for event in startup:
+    assert event["event"] in {"startup_prefetch_begin", "startup_prefetch_end"}
+    startup_streams.setdefault((event["rank"], event["window"]), []).append(event)
+for stream in startup_streams.values():
+    assert [event["event"] for event in stream] == [
+        "startup_prefetch_begin", "startup_prefetch_end"
+    ]
+runtime = [event for event in events if event["seq"] > 0]
+assert runtime
+streams = {}
+for event in runtime:
+    streams.setdefault((event["seq"], event["rank"]), []).append(event)
+
+for rank in range(worker_count):
+    receive_sequences = [
+        event["seq"] for event in runtime
+        if event["rank"] == rank and event["event"] == "receive"
+    ]
+    assert receive_sequences == sorted(receive_sequences)
+
+sequences = sorted({event["seq"] for event in runtime})
+assert sequences
+for seq in sequences:
+    sequence_events = [event for event in runtime if event["seq"] == seq]
+    received = [event for event in sequence_events if event["event"] == "receive"]
+    assert {event["window"] for event in received} == set(range(len(windows)))
+    observed_rounds = sorted({event["round"] for event in received})
+    assert observed_rounds == list(range(round_count))
+    for round_index in observed_rounds:
+        round_received = [
+            event for event in received if event["round"] == round_index
+        ]
+        assert len(round_received) == worker_count
+        assert sorted(event["rank"] for event in round_received) == list(range(worker_count))
+        expected = windows[
+            round_index * worker_count:(round_index + 1) * worker_count
+        ]
+        assert {event["window"] for event in round_received} == {
+            window["index"] for window in expected
+        }
+
+for (seq, rank), stream in streams.items():
+    expected_windows = owned_by_rank[rank]
+    receives = [event["window"] for event in stream if event["event"] == "receive"]
+    assert receives == expected_windows
+    compute_begin = {
+        event["window"]: event for event in stream if event["event"] == "compute_begin"
+    }
+    assert set(compute_begin) == set(expected_windows)
+    position = 0
+    for current_position, current_window in enumerate(expected_windows):
+        assert position + 4 <= len(stream)
+        block = stream[position:position + 4]
+        assert [event["event"] for event in block] == [
+            "receive", "compute_begin", "compute_end", "send"
+        ]
+        assert all(event["window"] == current_window for event in block)
+        assert block[0]["line"] < block[1]["line"] < block[2]["line"] < block[3]["line"]
+        position += 4
+
+        target_window = next_owned[current_window]
+        if position < len(stream) and stream[position]["event"] == "prefetch_begin":
+            assert position + 1 < len(stream)
+            prefetch = stream[position:position + 2]
+            assert [event["event"] for event in prefetch] == [
+                "prefetch_begin", "prefetch_end"
+            ]
+            assert all(event["window"] == target_window for event in prefetch)
+            assert prefetch[0]["line"] > block[3]["line"]
+            assert prefetch[0]["line"] < prefetch[1]["line"]
+            if target_window != expected_windows[0]:
+                assert prefetch[1]["line"] < compute_begin[target_window]["line"]
+            else:
+                later = [candidate for candidate in sequences
+                         if candidate > seq and (candidate, rank) in streams]
+                if later:
+                    later_begin = next(
+                        event for event in streams[(later[0], rank)]
+                        if event["event"] == "compute_begin" and
+                        event["window"] == target_window
+                    )
+                    assert prefetch[1]["line"] < later_begin["line"]
+            position += 2
+        elif target_window != expected_windows[0]:
+            raise AssertionError(
+                f"rank {rank} sequence {seq} did not prefetch window {target_window}"
+            )
+    assert position == len(stream)
 PY
 
 
@@ -657,7 +817,7 @@ AUTH_HOST="${POTLUCK_TEST_AUTH_HOST:-127.0.0.1}"
 AUTH_KEY="${POTLUCK_TEST_API_KEY:-potluck-smoke-key}"
 AUTH_ORIGIN="${POTLUCK_TEST_CORS_ORIGIN:-https://potluck.test}"
 AUTH_BASE="http://${AUTH_HOST}:${AUTH_PORT}"
-POTLUCK_TRACE_PREFETCH=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" \
+POTLUCK_TRACE_PRP=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" \
     --slots 2 --ubatch 1 --host "${AUTH_HOST}" --port "${AUTH_PORT}" \
     --api-key "${AUTH_KEY}" --cors-origin "${AUTH_ORIGIN}" \
     >"${WORK}/auth-server.log" 2>&1 &

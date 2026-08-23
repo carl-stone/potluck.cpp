@@ -1035,6 +1035,8 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    // Page-aligned tensor ranges grouped by mapping.
+    std::vector<std::vector<std::pair<size_t, size_t>>> prefetch_ranges;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -1733,6 +1735,44 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
+
+        pimpl->prefetch_ranges.clear();
+        pimpl->prefetch_ranges.resize(pimpl->mappings.size());
+        for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+            GGML_UNUSED(bufs);
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get());
+                 tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
+                if (tensor->data == nullptr) {
+                    continue;
+                }
+
+                for (size_t idx = 0; idx < pimpl->mappings.size(); ++idx) {
+                    size_t first = 0;
+                    size_t last  = 0;
+                    if (pimpl->mappings[idx]->get_range(tensor->data, ggml_nbytes(tensor), &first, &last)) {
+                        pimpl->prefetch_ranges[idx].emplace_back(first, last);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (auto & ranges : pimpl->prefetch_ranges) {
+            std::sort(ranges.begin(), ranges.end(),
+                [](const auto & lhs, const auto & rhs) {
+                    return lhs.first < rhs.first;
+                });
+
+            size_t n_ranges = 0;
+            for (const auto & range : ranges) {
+                if (n_ranges == 0 || range.first > ranges[n_ranges - 1].second) {
+                    ranges[n_ranges++] = range;
+                } else {
+                    ranges[n_ranges - 1].second = std::max(ranges[n_ranges - 1].second, range.second);
+                }
+            }
+            ranges.resize(n_ranges);
+        }
     }
 
     return true;
@@ -1808,22 +1848,17 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
 uint64_t llama_model::n_elements() const {
     return pimpl->n_elements;
 }
-size_t llama_model::prefetch() const {
+size_t llama_model::prefetch(bool force) const {
     size_t advised = 0;
-    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
-        GGML_UNUSED(bufs);
-        for (ggml_tensor * tensor = ggml_get_first_tensor(ctx.get());
-             tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
-            if (tensor->data == nullptr) {
-                continue;
-            }
-            for (const auto & mapping : pimpl->mappings) {
-                const size_t bytes = mapping->advise(tensor->data, ggml_nbytes(tensor));
-                advised += bytes;
-                if (bytes != 0) {
-                    break;
-                }
-            }
+    for (size_t idx = 0; idx < pimpl->mappings.size(); ++idx) {
+        const auto & mapping = pimpl->mappings[idx];
+        if (idx >= pimpl->prefetch_ranges.size()) {
+            break;
+        }
+
+        const auto * base = static_cast<const uint8_t *>(mapping->addr());
+        for (const auto & range : pimpl->prefetch_ranges[idx]) {
+            advised += mapping->advise(base + range.first, range.second - range.first, force);
         }
     }
     return advised;

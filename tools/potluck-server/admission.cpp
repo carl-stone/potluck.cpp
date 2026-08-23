@@ -2,6 +2,7 @@
 
 #include "internal.h"
 
+#include <cmath>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -31,38 +32,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace {
-
-}
-uint64_t saturating_add(uint64_t left, uint64_t right) {
+static uint64_t saturating_add(uint64_t left, uint64_t right) {
     if (left > std::numeric_limits<uint64_t>::max() - right) {
         return std::numeric_limits<uint64_t>::max();
     }
     return left + right;
 }
 
-uint64_t saturating_mul(uint64_t left, uint64_t right) {
+static uint64_t saturating_mul(uint64_t left, uint64_t right) {
     if (left != 0 && right > std::numeric_limits<uint64_t>::max() / left) {
         return std::numeric_limits<uint64_t>::max();
     }
     return left * right;
 }
 
-uint64_t proportional_layers(uint32_t n_layer, uint64_t usable, uint64_t capacity) {
-    if (capacity == 0 || usable == 0 || n_layer == 0) {
-        return 0;
-    }
-    const long double scaled = static_cast<long double>(n_layer) *
-                               static_cast<long double>(usable) /
-                               static_cast<long double>(capacity);
-    return static_cast<uint64_t>(std::min<long double>(
-        scaled, static_cast<long double>(std::numeric_limits<uint64_t>::max())));
-}
-
-std::string basename_of(const std::string & path) {
-    const size_t slash = path.find_last_of("/\\");
-    return slash == std::string::npos ? path : path.substr(slash + 1);
-}
 uint64_t route_layer_cost(uint32_t n_layer, uint64_t model_bytes, uint32_t n_head_kv,
                           uint32_t head_dim, uint32_t n_ctx) {
     if (n_layer == 0) {
@@ -79,6 +62,233 @@ uint64_t route_needed_bytes(uint32_t n_layer, uint64_t model_bytes, uint32_t n_h
     return saturating_mul(static_cast<uint64_t>(n_layer),
                           route_layer_cost(n_layer, model_bytes, n_head_kv, head_dim, n_ctx));
 }
+
+static bool allocate_round_spans(uint32_t total_layers, const std::vector<size_t> & owners,
+                          const std::vector<uint64_t> & usable,
+                          const std::vector<uint32_t> & max_layers,
+                          std::vector<uint32_t> & spans) {
+    if (owners.empty() || total_layers < owners.size() ||
+        usable.size() != max_layers.size()) {
+        return false;
+    }
+    uint64_t capacity = 0;
+    for (const size_t owner : owners) {
+        if (owner >= usable.size() || max_layers[owner] == 0) {
+            return false;
+        }
+        capacity = saturating_add(capacity, max_layers[owner]);
+    }
+    if (capacity < total_layers) {
+        return false;
+    }
+
+    spans.assign(usable.size(), 0);
+    for (const size_t owner : owners) {
+        spans[owner] = 1;
+    }
+    uint64_t remaining = total_layers - owners.size();
+    std::vector<long double> fractional(owners.size(), 0.0L);
+    while (remaining != 0) {
+        long double weight_sum = 0.0L;
+        for (const size_t owner : owners) {
+            if (spans[owner] < max_layers[owner]) {
+                weight_sum += static_cast<long double>(usable[owner]);
+            }
+        }
+        if (weight_sum <= 0.0L) {
+            return false;
+        }
+
+        uint64_t assigned = 0;
+        for (size_t index = 0; index < owners.size(); ++index) {
+            const size_t owner = owners[index];
+            if (spans[owner] >= max_layers[owner]) {
+                fractional[index] = -1.0L;
+                continue;
+            }
+            const long double ideal = static_cast<long double>(remaining) *
+                                      static_cast<long double>(usable[owner]) / weight_sum;
+            const uint64_t floor_extra = ideal >= static_cast<long double>(
+                std::numeric_limits<uint64_t>::max())
+                ? remaining : static_cast<uint64_t>(ideal);
+            const uint64_t room = max_layers[owner] - spans[owner];
+            const uint64_t extra = std::min({ floor_extra, room, remaining - assigned });
+            spans[owner] += static_cast<uint32_t>(extra);
+            assigned += extra;
+            fractional[index] = std::max<long double>(
+                0.0L, ideal - static_cast<long double>(floor_extra));
+        }
+        if (assigned != 0) {
+            remaining -= assigned;
+            continue;
+        }
+
+        size_t best = owners.size();
+        for (size_t index = 0; index < owners.size(); ++index) {
+            const size_t owner = owners[index];
+            if (spans[owner] >= max_layers[owner]) {
+                continue;
+            }
+            if (best == owners.size() || fractional[index] > fractional[best] ||
+                (fractional[index] == fractional[best] && owner < owners[best])) {
+                best = index;
+            }
+        }
+        if (best == owners.size()) {
+            return false;
+        }
+        ++spans[owners[best]];
+        --remaining;
+    }
+    return true;
+}
+std::vector<device_probe> admit_devices(std::vector<device_probe> candidates,
+                                         uint32_t n_layer, uint64_t model_bytes,
+                                         uint32_t n_head_kv, uint32_t head_dim,
+                                         uint32_t n_ctx, bool reserve_owner_slot) {
+    const uint64_t layer_cost = route_layer_cost(n_layer, model_bytes, n_head_kv,
+                                                 head_dim, n_ctx);
+    const uint64_t needed = route_needed_bytes(n_layer, model_bytes, n_head_kv,
+                                               head_dim, n_ctx);
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [](const device_probe & left, const device_probe & right) {
+                         return left.usable_bytes() > right.usable_bytes();
+                     });
+    std::vector<device_probe> positive;
+    positive.reserve(candidates.size());
+    for (device_probe & candidate : candidates) {
+        if (!candidate.ok) {
+            continue;
+        }
+        if (candidate.usable_bytes() < layer_cost) {
+            std::fprintf(stderr,
+                         "potluck-server: excluding %s: insufficient memory for one layer\n",
+                         candidate.host.c_str());
+            continue;
+        }
+        positive.push_back(std::move(candidate));
+    }
+    if (positive.empty()) {
+        throw std::runtime_error(
+            "cluster has no device able to hold one active layer (need " +
+            std::to_string(layer_cost / (1024ull * 1024ull)) + " MiB)");
+    }
+
+    // At least two rounds are required for every multi-layer model. Reserve
+    // one owner position when the head will be appended after remote admission.
+    const size_t max_owners = n_layer == 1
+        ? 1 : std::max<size_t>(1, n_layer / 2);
+    const size_t reserved_owners = reserve_owner_slot && max_owners > 1 ? 1 : 0;
+    const size_t admitted_count =
+        std::min(max_owners - reserved_owners, positive.size());
+    for (size_t i = admitted_count; i < positive.size(); ++i) {
+        std::fprintf(stderr, "potluck-server: excluding %s: no layer slot remains\n",
+                     positive[i].host.c_str());
+    }
+    positive.resize(admitted_count);
+
+    uint64_t capacity = 0;
+    for (const device_probe & candidate : positive) {
+        capacity = saturating_add(capacity, candidate.usable_bytes());
+    }
+    std::printf("potluck-server: admitted %zu devices (%llu MiB usable, need %llu MiB)\n",
+                positive.size(), static_cast<unsigned long long>(capacity / (1024ull * 1024ull)),
+                static_cast<unsigned long long>(needed / (1024ull * 1024ull)));
+    return positive;
+}
+
+std::vector<potluck::ring_window> build_ring_route(const std::vector<device_probe> & devices,
+                                                   uint32_t n_layer, uint64_t model_bytes,
+                                                   uint32_t n_head_kv, uint32_t head_dim,
+                                                   uint32_t n_ctx) {
+    if (devices.empty()) {
+        throw std::runtime_error("ring needs at least one admitted device");
+    }
+    if (n_layer == 0) {
+        throw std::runtime_error("model reports zero layers");
+    }
+    const uint64_t layer_cost = route_layer_cost(n_layer, model_bytes, n_head_kv,
+                                                 head_dim, n_ctx);
+    std::vector<uint64_t> usable;
+    std::vector<uint32_t> max_layers;
+    usable.reserve(devices.size());
+    max_layers.reserve(devices.size());
+    for (const device_probe & device : devices) {
+        const uint64_t bytes = device.usable_bytes();
+        if (bytes < layer_cost) {
+            throw std::runtime_error("ring device cannot hold one active layer");
+        }
+        usable.push_back(bytes);
+        max_layers.push_back(static_cast<uint32_t>(std::min<uint64_t>(
+            n_layer, bytes / layer_cost)));
+    }
+    if (n_layer > 1 && devices.size() > n_layer / 2) {
+        throw std::runtime_error("ring has too many owners for repeated windows");
+    }
+
+    std::vector<size_t> owners;
+    owners.reserve(devices.size());
+    for (size_t i = 0; i < devices.size(); ++i) {
+        owners.push_back(i);
+    }
+
+    uint32_t selected_rounds = 0;
+    uint32_t larger_rounds = 0;
+    std::vector<uint32_t> smaller_spans;
+    std::vector<uint32_t> larger_spans;
+    for (uint32_t rounds = n_layer == 1 ? 1 : 2; rounds <= n_layer; ++rounds) {
+        const uint32_t smaller_layers = n_layer / rounds;
+        const uint32_t remainder = n_layer % rounds;
+        if (smaller_layers < owners.size()) {
+            continue;
+        }
+        std::vector<uint32_t> candidate_smaller;
+        if (!allocate_round_spans(smaller_layers, owners, usable, max_layers,
+                                  candidate_smaller)) {
+            continue;
+        }
+        std::vector<uint32_t> candidate_larger = candidate_smaller;
+        if (remainder != 0 &&
+            !allocate_round_spans(smaller_layers + 1, owners, usable, max_layers,
+                                  candidate_larger)) {
+            continue;
+        }
+        selected_rounds = rounds;
+        larger_rounds = remainder;
+        smaller_spans = std::move(candidate_smaller);
+        larger_spans = std::move(candidate_larger);
+        break;
+    }
+    if (selected_rounds == 0) {
+        throw std::runtime_error("no repeated ring route fits admitted device memory");
+    }
+
+    std::vector<potluck::ring_window> windows;
+    windows.reserve(static_cast<size_t>(selected_rounds) * devices.size());
+    uint32_t next_layer = 0;
+    for (uint32_t round = 0; round < selected_rounds; ++round) {
+        const std::vector<uint32_t> & spans =
+            round < larger_rounds ? larger_spans : smaller_spans;
+        for (size_t i = 0; i < owners.size(); ++i) {
+            const uint32_t span = spans[owners[i]];
+            if (span == 0) {
+                throw std::runtime_error("ring route contains a zero-width owner");
+            }
+            windows.push_back({ static_cast<uint32_t>(owners[i]), next_layer,
+                                next_layer + span, 0 });
+            next_layer += span;
+        }
+    }
+    if (next_layer != n_layer) {
+        throw std::runtime_error("capability route does not cover the model");
+    }
+    return windows;
+}
+
+static std::string basename_of(const std::string & path) {
+    const size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
 std::string shell_quote(const std::string & value) {
     std::string quoted = "'";
     for (const char c : value) {
@@ -91,7 +301,7 @@ std::string shell_quote(const std::string & value) {
     quoted += '\'';
     return quoted;
 }
-bool valid_ssh_component(const std::string & value) {
+static bool valid_ssh_component(const std::string & value) {
     if (value.empty() || value.front() == '-') {
         return false;
     }
@@ -121,7 +331,7 @@ void validate_ssh_target(const std::string & target) {
     }
 }
 
-std::string discovery_known_hosts_file() {
+static std::string discovery_known_hosts_file() {
     const char * xdg = std::getenv("XDG_CONFIG_HOME");
     const char * home = std::getenv("HOME");
     std::filesystem::path directory;
@@ -138,170 +348,6 @@ std::string discovery_known_hosts_file() {
         throw std::runtime_error("cannot create Potluck config directory: " + error.message());
     }
     return (directory / "known_hosts").string();
-}
-std::vector<device_probe> admit_devices(std::vector<device_probe> candidates,
-                                         uint32_t n_layer, uint64_t model_bytes,
-                                         uint32_t n_head_kv, uint32_t head_dim,
-                                         uint32_t n_ctx, bool allow_shortfall) {
-    const uint64_t layer_cost = route_layer_cost(n_layer, model_bytes, n_head_kv,
-                                                 head_dim, n_ctx);
-    const uint64_t needed = route_needed_bytes(n_layer, model_bytes, n_head_kv,
-                                               head_dim, n_ctx);
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const device_probe & left, const device_probe & right) {
-                         return left.usable_bytes() > right.usable_bytes();
-                     });
-    std::vector<device_probe> positive;
-    positive.reserve(candidates.size());
-    for (device_probe & candidate : candidates) {
-        if (!candidate.ok) {
-            continue;
-        }
-        if (candidate.usable_bytes() < layer_cost) {
-            std::fprintf(stderr,
-                         "potluck-server: excluding %s: insufficient memory for one layer\n",
-                         candidate.host.c_str());
-            continue;
-        }
-        positive.push_back(std::move(candidate));
-    }
-    uint64_t capacity = 0;
-    uint64_t max_layer_sum = 0;
-    size_t prefix = 0;
-    for (; prefix < positive.size(); ++prefix) {
-        const uint64_t usable = positive[prefix].usable_bytes();
-        capacity = saturating_add(capacity, usable);
-        max_layer_sum = saturating_add(max_layer_sum, usable / layer_cost);
-        if (max_layer_sum >= n_layer) {
-            ++prefix;
-            break;
-        }
-    }
-    if ((prefix == 0 || max_layer_sum < n_layer) && !allow_shortfall) {
-        uint64_t admitted = 0;
-        for (const device_probe & candidate : positive) {
-            admitted = saturating_add(admitted, candidate.usable_bytes());
-        }
-        throw std::runtime_error(
-            "cluster memory is short: need " +
-            std::to_string(needed / (1024ull * 1024ull)) + " MiB, admitted " +
-            std::to_string(admitted / (1024ull * 1024ull)) + " MiB across " +
-            std::to_string(positive.size()) + " devices");
-    }
-    const size_t admitted_count = max_layer_sum < n_layer ? positive.size() : prefix;
-    for (size_t i = admitted_count; i < positive.size(); ++i) {
-        std::fprintf(stderr, "potluck-server: excluding %s: no layer slot remains\n",
-                     positive[i].host.c_str());
-    }
-    positive.resize(admitted_count);
-    capacity = 0;
-    for (const device_probe & candidate : positive) {
-        capacity = saturating_add(capacity, candidate.usable_bytes());
-    }
-    std::printf("potluck-server: admitted %zu devices (%llu MiB usable, need %llu MiB)\n",
-                positive.size(), static_cast<unsigned long long>(capacity / (1024ull * 1024ull)),
-                static_cast<unsigned long long>(needed / (1024ull * 1024ull)));
-    return positive;
-}
-
-
-std::vector<potluck::ring_window> build_ring_route(const std::vector<device_probe> & devices,
-                                                   uint32_t n_layer, uint64_t model_bytes,
-                                                   uint32_t n_head_kv, uint32_t head_dim,
-                                                   uint32_t n_ctx) {
-    if (devices.empty()) {
-        throw std::runtime_error("ring needs at least one admitted device");
-    }
-    if (n_layer == 0) {
-        throw std::runtime_error("model reports zero layers");
-    }
-    const uint64_t layer_cost = route_layer_cost(n_layer, model_bytes, n_head_kv,
-                                                 head_dim, n_ctx);
-    std::vector<uint64_t> usable;
-    std::vector<uint32_t> max_layers;
-    usable.reserve(devices.size());
-    max_layers.reserve(devices.size());
-    uint64_t capacity = 0;
-    for (const device_probe & device : devices) {
-        const uint64_t bytes = device.usable_bytes();
-        usable.push_back(bytes);
-        max_layers.push_back(static_cast<uint32_t>(std::min<uint64_t>(
-            n_layer, bytes / layer_cost)));
-        capacity = saturating_add(capacity, bytes);
-    }
-    uint64_t max_layer_sum = 0;
-    for (uint32_t count : max_layers) {
-        max_layer_sum = saturating_add(max_layer_sum, count);
-    }
-    if (capacity == 0 || max_layer_sum < n_layer) {
-        throw std::runtime_error("cluster memory is short: need " +
-                                 std::to_string(route_needed_bytes(
-                                     n_layer, model_bytes, n_head_kv, head_dim, n_ctx) /
-                                     (1024ull * 1024ull)) +
-                                 " MiB, admitted " + std::to_string(
-                                     (capacity / (1024ull * 1024ull))) + " MiB across " +
-                                 std::to_string(devices.size()) + " devices");
-    }
-    std::vector<uint32_t> share(devices.size(), 0);
-    for (size_t i = 0; i < devices.size(); ++i) {
-        const uint64_t raw = proportional_layers(n_layer, usable[i], capacity);
-        share[i] = static_cast<uint32_t>(std::min<uint64_t>(
-            max_layers[i], std::max<uint64_t>(max_layers[i] == 0 ? 0 : 1, raw)));
-    }
-    auto total_share = [&]() {
-        uint64_t total = 0;
-        for (uint32_t count : share) {
-            total = saturating_add(total, count);
-        }
-        return total;
-    };
-    while (total_share() < n_layer) {
-        size_t best = devices.size();
-        for (size_t i = 0; i < devices.size(); ++i) {
-            if (share[i] >= max_layers[i]) {
-                continue;
-            }
-            if (best == devices.size() ||
-                max_layers[i] - share[i] > max_layers[best] - share[best] ||
-                (max_layers[i] - share[i] == max_layers[best] - share[best] && i < best)) {
-                best = i;
-            }
-        }
-        if (best == devices.size()) {
-            throw std::runtime_error("cannot distribute model layers across admitted devices");
-        }
-        ++share[best];
-    }
-    while (total_share() > n_layer) {
-        size_t best = devices.size();
-        for (size_t i = 0; i < devices.size(); ++i) {
-            if (share[i] == 0) {
-                continue;
-            }
-            if (best == devices.size() || share[i] > share[best] ||
-                (share[i] == share[best] && i > best)) {
-                best = i;
-            }
-        }
-        --share[best];
-    }
-    std::vector<potluck::ring_window> windows;
-    uint32_t next_layer = 0;
-    for (uint32_t cycle = 0; cycle < 2; ++cycle) {
-        for (size_t i = 0; i < devices.size(); ++i) {
-            const uint32_t span = cycle == 0
-                ? share[i] / 2 + share[i] % 2 : share[i] / 2;
-            if (span == 0) {
-                continue;
-            }
-            windows.push_back({ static_cast<uint32_t>(i), next_layer, next_layer + span, 0 });
-            next_layer += span;
-        }
-    }
-    if (next_layer != n_layer) {
-        throw std::runtime_error("capability route does not cover the model");
-    }
-    return windows;
 }
 
 const char * accel_kind_name(potluck::accel_kind kind) {
@@ -389,7 +435,7 @@ std::vector<bootstrap_node> discover_bootstrap_nodes() {
     return result;
 }
 
-bool parse_probe_line(const std::string & line, potluck::accel_profile & profile,
+static bool parse_probe_line(const std::string & line, potluck::accel_profile & profile,
                       std::string & error) {
     char kind[32] = {};
     unsigned long long accel_free = 0;
@@ -421,7 +467,7 @@ bool parse_probe_line(const std::string & line, potluck::accel_profile & profile
     return true;
 }
 
-device_probe run_probe_command(const std::string & command, const std::string & host) {
+static device_probe run_probe_command(const std::string & command, const std::string & host) {
     device_probe result;
     result.host = host;
     int output_pipe[2] = {};
@@ -528,7 +574,7 @@ device_probe probe_local_worker(const std::string & worker_path) {
 
 device_probe probe_remote_worker(const bootstrap_node & bootstrap) {
     const std::string command = ssh_options(bootstrap) + " " + shell_quote(bootstrap.ssh_target) +
-        " " + shell_quote("cd ~/potluck || exit 1; ./potluck-worker --probe");
+        " " + shell_quote("cd ~/potluck || exit 1; LD_LIBRARY_PATH=.${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ./potluck-worker --probe");
     return run_probe_command(command, bootstrap.ring_host);
 }
 
@@ -587,7 +633,7 @@ std::vector<device_probe> probe_remote_candidates(
     return results;
 }
 
-std::string local_sha256(const std::string & path) {
+static std::string local_sha256(const std::string & path) {
     const std::string command = "(command -v sha256sum >/dev/null && sha256sum " +
         shell_quote(path) + " || shasum -a 256 " + shell_quote(path) + ") 2>/dev/null";
     FILE * pipe = popen(command.c_str(), "r");
@@ -617,7 +663,7 @@ std::filesystem::path canonical_model_path(const std::filesystem::path & model_p
     return canonical;
 }
 
-std::string model_path_key(const std::filesystem::path & canonical_path) {
+static std::string model_path_key(const std::filesystem::path & canonical_path) {
     static constexpr char hex[] = "0123456789abcdef";
     const std::string text = canonical_path.string();
     std::string key;
@@ -629,7 +675,7 @@ std::string model_path_key(const std::filesystem::path & canonical_path) {
     return key;
 }
 
-bool valid_sha256_digest(const std::string & digest) {
+static bool valid_sha256_digest(const std::string & digest) {
     if (digest.size() != 64) {
         return false;
     }
@@ -703,7 +749,7 @@ std::string model_digest_cache::get(const std::filesystem::path & model_path) {
     return digest;
 }
 
-std::string command_output(const std::string & command) {
+static std::string command_output(const std::string & command) {
     FILE * pipe = popen(command.c_str(), "r");
     if (pipe == nullptr) {
         return {};
@@ -717,7 +763,7 @@ std::string command_output(const std::string & command) {
     return status == 0 ? output : std::string();
 }
 
-std::string file_contents(const std::filesystem::path & path) {
+static std::string file_contents(const std::filesystem::path & path) {
     std::ifstream input(path);
     if (!input) {
         return {};
@@ -747,7 +793,7 @@ std::string first_command_line(const std::string & command) {
     return status == 0 ? line : std::string();
 }
 
-std::string first_file_line(const std::filesystem::path & path) {
+static std::string first_file_line(const std::filesystem::path & path) {
     std::ifstream input(path);
     std::string line;
     std::getline(input, line);

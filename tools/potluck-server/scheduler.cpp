@@ -66,17 +66,16 @@ void slot_scheduler::emit(const std::shared_ptr<scheduled_slot> & slot, llama_to
 }
 
 
-std::vector<int32_t> drive_batch(ServerRing & ring,
-                                 const std::vector<int32_t> & positions,
-                                 const std::vector<int32_t> & sequences,
-                                 const std::vector<int32_t> & tokens,
-                                 int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
-                                 uint32_t n_logits,
-                                 serve_stats * stats,
-                                 std::function<bool()> should_cancel,
-                                 bool * batch_started,
-                                 std::function<bool(std::string &)> heartbeat,
-                                 potluck::batch_logprobs * result_logprobs) {
+std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
+                                      const std::vector<int32_t> & positions,
+                                      const std::vector<int32_t> & sequences,
+                                      const std::vector<int32_t> & tokens,
+                                      int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
+                                      uint32_t n_logits,
+                                      std::function<bool()> should_cancel,
+                                      bool * batch_started,
+                                      std::function<bool(std::string &)> heartbeat,
+                                      potluck::batch_logprobs * result_logprobs) {
     if (result_logprobs != nullptr) {
         result_logprobs->clear();
     }
@@ -97,9 +96,6 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
     if (!potluck::encode_batch_payload(positions, sequences, tokens, nullptr, 0,
                                        clear_seq, trim_seq, trim_to, n_logits, input.payload)) {
         throw std::runtime_error("cannot encode ring batch");
-    }
-    if (stats != nullptr) {
-        stats->head_payload_bytes += input.payload.size();
     }
     const auto cancelled = [&]() {
         return should_cancel && should_cancel();
@@ -175,14 +171,11 @@ std::vector<int32_t> drive_batch(ServerRing & ring,
         }
         const auto now = std::chrono::steady_clock::now();
         if (cancel_requested && now >= cancel_deadline) {
-            throw std::runtime_error("ring result receiver timed out after cancellation");
+            throw request_cancelled("request cancelled");
         }
         if (now >= deadline) {
             throw std::runtime_error("ring result receiver timed out");
         }
-    }
-    if (stats != nullptr) {
-        stats->head_payload_bytes += output.payload.size();
     }
     const bool has_logprobs =
         output.type == potluck::message_type::batch_result_logprobs;
@@ -274,70 +267,3 @@ void configure_slot(ServerRing & ring, const potluck::slot_config & config) {
         throw std::runtime_error("cannot send slot configuration: " + ring.error);
     }
 }
-
-std::vector<llama_token> serve(ServerRing & ring, const llama_vocab * vocab,
-                               const std::vector<llama_token> & prompt,
-                               uint32_t n_predict,
-                               const std::function<void(const std::string &)> & emit,
-                               serve_stats * stats,
-                               int32_t sequence_id,
-                               potluck::slot_config sampling,
-                               uint32_t prefill_batch) {
-    if (prompt.empty()) {
-        throw std::runtime_error("prompt is empty");
-    }
-    sampling.seq = sequence_id;
-    configure_slot(ring, sampling);
-    const uint32_t batch_limit = std::max<uint32_t>(1, prefill_batch);
-    const auto prefill_start = std::chrono::steady_clock::now();
-    size_t offset = 0;
-    while (offset < prompt.size()) {
-        const size_t count = std::min<size_t>(batch_limit, prompt.size() - offset);
-        std::vector<int32_t> positions(count);
-        std::vector<int32_t> sequences(count, sequence_id);
-        std::vector<int32_t> tokens(count);
-        for (size_t i = 0; i < count; ++i) {
-            positions[i] = static_cast<int32_t>(offset + i);
-            tokens[i] = static_cast<int32_t>(prompt[offset + i]);
-        }
-        const bool final_chunk = offset + count == prompt.size();
-        (void) drive_batch(ring, positions, sequences, tokens,
-                           offset == 0 ? sequence_id : -1, -1, -1,
-                           final_chunk ? 1 : 0, stats);
-        offset += count;
-    }
-    if (stats != nullptr) {
-        stats->prefill_seconds = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - prefill_start).count();
-    }
-
-    std::vector<llama_token> generated;
-    generated.reserve(n_predict);
-    llama_token previous = prompt.back();
-    uint32_t position = static_cast<uint32_t>(prompt.size());
-    for (uint32_t i = 0; i < n_predict; ++i) {
-        const auto decode_start = std::chrono::steady_clock::now();
-        const std::vector<int32_t> result = drive_batch(
-            ring, { static_cast<int32_t>(position) }, { sequence_id },
-            { static_cast<int32_t>(previous) }, -1, -1, -1, 1, stats);
-        if (stats != nullptr) {
-            stats->decode_seconds += std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - decode_start).count();
-        }
-        if (result.empty()) {
-            break;
-        }
-        const llama_token next = static_cast<llama_token>(result.front());
-        if (llama_vocab_is_eog(vocab, next)) {
-            break;
-        }
-        generated.push_back(next);
-        if (emit) {
-            emit(token_piece(vocab, next));
-        }
-        previous = next;
-        ++position;
-    }
-    return generated;
-}
-

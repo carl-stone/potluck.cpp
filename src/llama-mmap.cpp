@@ -592,28 +592,104 @@ struct llama_mmap::impl {
         throw std::runtime_error("mmap not supported");
     }
 #endif
-    size_t advise(const void * data, size_t length) const {
-        if (data == nullptr || length == 0 || addr == nullptr || size == 0) {
-            return 0;
-        }
-        const uintptr_t base = reinterpret_cast<uintptr_t>(addr);
-        const uintptr_t first = reinterpret_cast<uintptr_t>(data);
-        if (first < base || first - base >= size) {
-            return 0;
-        }
-        const size_t offset = first - base;
-        const size_t clamped = std::min(length, size - offset);
+    static size_t page_size() {
 #ifdef _POSIX_MAPPED_FILES
-        const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-        const size_t aligned_offset = offset & ~(page_size - 1);
-        const size_t aligned_length = std::min(size - aligned_offset,
-                                               offset - aligned_offset + clamped);
-        const int result = posix_madvise(static_cast<uint8_t *>(addr) + aligned_offset,
-                                         aligned_length, POSIX_MADV_WILLNEED);
+        const long result = sysconf(_SC_PAGESIZE);
+        return result > 0 ? static_cast<size_t>(result) : 1;
+#elif defined(_WIN32)
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return info.dwPageSize > 0 ? static_cast<size_t>(info.dwPageSize) : 1;
+#else
+        return 1;
+#endif
+    }
+
+    bool get_range(const void * data, size_t length, size_t * first, size_t * last) const {
+        if (data == nullptr || length == 0 || addr == nullptr || size == 0 || first == nullptr || last == nullptr) {
+            return false;
+        }
+
+        const uintptr_t base = reinterpret_cast<uintptr_t>(addr);
+        const uintptr_t data_addr = reinterpret_cast<uintptr_t>(data);
+        if (data_addr < base || data_addr - base >= size) {
+            return false;
+        }
+
+        const size_t offset = static_cast<size_t>(data_addr - base);
+        const size_t clamped = std::min(length, size - offset);
+        if (clamped == 0) {
+            return false;
+        }
+
+        const size_t page = page_size();
+        const size_t aligned_first = offset - offset % page;
+        const size_t end = offset + clamped;
+        size_t aligned_last = end;
+        const size_t remainder = aligned_last % page;
+        if (remainder != 0) {
+            const size_t to_page = page - remainder;
+            aligned_last = to_page > size - aligned_last ? size : aligned_last + to_page;
+        }
+
+        if (aligned_last <= aligned_first) {
+            return false;
+        }
+#ifdef _POSIX_MAPPED_FILES
+        bool is_mapped = false;
+        for (const auto & fragment : mapped_fragments) {
+            if (aligned_first >= fragment.first && aligned_last <= fragment.second) {
+                is_mapped = true;
+                break;
+            }
+        }
+        if (!is_mapped) {
+            return false;
+        }
+#endif
+
+        *first = aligned_first;
+        *last = aligned_last;
+        return true;
+    }
+
+    bool touch_range(size_t first, size_t last) const {
+#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
+        const size_t page = page_size();
+        const volatile uint8_t * bytes = reinterpret_cast<const volatile uint8_t *>(addr);
+        volatile uint8_t sink = 0;
+        for (size_t offset = first; offset < last; ) {
+            sink ^= bytes[offset];
+            if (last - offset <= page) {
+                break;
+            }
+            offset += page;
+        }
+        (void) sink;
+        return true;
+#else
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return false;
+#endif
+    }
+
+    size_t advise(const void * data, size_t length, bool force) const {
+        size_t first = 0;
+        size_t last = 0;
+        if (!get_range(data, length, &first, &last)) {
+            return 0;
+        }
+
+        bool advised = false;
+#ifdef _POSIX_MAPPED_FILES
+        const int result = posix_madvise(static_cast<uint8_t *>(addr) + first,
+                                         last - first, POSIX_MADV_WILLNEED);
         if (result != 0) {
             LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
                            strerror(result));
-            return 0;
+        } else {
+            advised = true;
         }
 #elif defined(_WIN32) && _WIN32_WINNT >= 0x602
         BOOL (WINAPI * prefetch_virtual_memory)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
@@ -622,26 +698,30 @@ struct llama_mmap::impl {
             GetProcAddress(kernel32, "PrefetchVirtualMemory");
         if (prefetch_virtual_memory) {
             WIN32_MEMORY_RANGE_ENTRY range;
-            range.VirtualAddress = const_cast<void *>(data);
-            range.NumberOfBytes = static_cast<SIZE_T>(clamped);
+            range.VirtualAddress = static_cast<uint8_t *>(addr) + first;
+            range.NumberOfBytes = static_cast<SIZE_T>(last - first);
             if (!prefetch_virtual_memory(GetCurrentProcess(), 1, &range, 0)) {
                 LLAMA_LOG_WARN("warning: PrefetchVirtualMemory failed: %s\n",
                                llama_format_win_err(GetLastError()).c_str());
-                return 0;
+            } else {
+                advised = true;
             }
-        } else {
-            return 0;
         }
 #else
-        GGML_UNUSED(clamped);
-        return 0;
+        GGML_UNUSED(force);
 #endif
-        return clamped;
+
+        const bool touched = force && touch_range(first, last);
+        return advised || touched ? last - first : 0;
+    }
+
+    size_t advise(const void * data, size_t length) const {
+        return advise(data, length, false);
     }
 
 
-    void * addr;
-    size_t size;
+    void * addr = nullptr;
+    size_t size = 0;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
@@ -649,7 +729,13 @@ llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
+bool llama_mmap::get_range(const void * data, size_t length, size_t * first, size_t * last) const {
+    return pimpl->get_range(data, length, first, last);
+}
 size_t llama_mmap::advise(const void * data, size_t length) const { return pimpl->advise(data, length); }
+size_t llama_mmap::advise(const void * data, size_t length, bool force) const {
+    return pimpl->advise(data, length, force);
+}
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

@@ -120,8 +120,8 @@ std::vector<llama_token> run_split(const std::string & model_path,
     CHECK(potluck::stage_load(remote, model_path, split, 0, /*embeddings=*/false, /*n_ctx=*/2048,
                               /*n_seq_max=*/1, /*n_ubatch=*/1, error, /*tail=*/true));
     const uint64_t model_bytes = potluck::model_file_bytes(model_path);
-    const size_t head_prefetch_bytes = head.model->prefetch();
-    const size_t remote_prefetch_bytes = remote.model->prefetch();
+    const size_t head_prefetch_bytes = head.model->prefetch(true);
+    const size_t remote_prefetch_bytes = remote.model->prefetch(true);
     CHECK(model_bytes > 0);
     CHECK(head_prefetch_bytes > 0 && head_prefetch_bytes < model_bytes);
     CHECK(remote_prefetch_bytes > 0 && remote_prefetch_bytes < model_bytes);
@@ -129,10 +129,12 @@ std::vector<llama_token> run_split(const std::string & model_path,
     const llama_vocab * vocab = llama_model_get_vocab(head.model);
     const llama_token eos = llama_vocab_eos(vocab);
 
+    const int32_t seq = 0;
     auto run_remote = [&](uint32_t pos) -> llama_token {
         const float * hidden = llama_get_embeddings_ith(head.ctx, 0);
         CHECK(hidden != nullptr);
-        CHECK(potluck::stage_decode_hidden(remote, hidden, pos) == 0);
+        const int32_t position = static_cast<int32_t>(pos);
+        CHECK(potluck::stage_decode_hidden_batch(remote, hidden, &position, &seq, 1, 1) == 0);
         const float * logits = llama_get_logits_ith(remote.ctx, 0);
         CHECK(logits != nullptr);
         return static_cast<llama_token>(potluck::argmax_token(logits, n_vocab));
@@ -142,7 +144,9 @@ std::vector<llama_token> run_split(const std::string & model_path,
     // hidden state that predicts token i+1, so resolve the remote token for every
     // prefix position (sequences 0..size-1) to keep its recurrent state in sync.
     for (int i = 0; i < static_cast<int>(prompt_tokens.size()); ++i) {
-        CHECK(potluck::stage_decode_token(head, prompt_tokens[i], static_cast<uint32_t>(i)) == 0);
+        const int32_t token = static_cast<int32_t>(prompt_tokens[i]);
+        const int32_t position = i;
+        CHECK(potluck::stage_decode_tokens_batch(head, &token, &position, &seq, 1, 1) == 0);
         (void)run_remote(static_cast<uint32_t>(i));
     }
 
@@ -151,7 +155,9 @@ std::vector<llama_token> run_split(const std::string & model_path,
     llama_token prev = prompt_tokens.back();
     uint32_t pos = static_cast<uint32_t>(prompt_tokens.size());
     for (uint32_t step = 0; step < n_predict; ++step) {
-        CHECK(potluck::stage_decode_token(head, prev, pos) == 0);
+        const int32_t token = static_cast<int32_t>(prev);
+        const int32_t position = static_cast<int32_t>(pos);
+        CHECK(potluck::stage_decode_tokens_batch(head, &token, &position, &seq, 1, 1) == 0);
         const llama_token next = run_remote(pos);
         generated.push_back(next);
         if (next == eos) break;

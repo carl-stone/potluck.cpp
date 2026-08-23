@@ -342,6 +342,120 @@ int main() {
             plan_head_participation(head, 11ull * gib, 3ull * gib);
         CHECK(reserve_excluded.budget == 1ull * gib);
         CHECK(!reserve_excluded.participates);
+
+        CHECK(!head_placement_requires_refresh(true, true, true,
+                                               3ull * gib, 8ull * gib));
+        CHECK(head_placement_requires_refresh(true, true, true,
+                                              9ull * gib, 8ull * gib));
+        CHECK(head_placement_requires_refresh(true, true, false,
+                                              3ull * gib, 1ull * gib));
+        CHECK(head_placement_requires_refresh(true, false, true,
+                                              0, 8ull * gib));
+    }
+    {
+        constexpr uint64_t mib = 1024ull * 1024ull;
+        const auto make_device = [](uint64_t usable, const char * host) {
+            device_probe device;
+            device.host = host;
+            device.ok = true;
+            device.profile.host_total_bytes = 128ull * 1024ull * mib;
+            device.profile.host_free_bytes = 128ull * 1024ull * mib;
+            device.placement_usable_limit = usable;
+            return device;
+        };
+        const auto check_route = [](const std::vector<device_probe> & devices,
+                                    uint32_t n_layer,
+                                    const std::vector<potluck::ring_window> & route) {
+            CHECK(route.size() > devices.size());
+            uint32_t next_layer = 0;
+            for (const potluck::ring_window & window : route) {
+                CHECK(window.owner < devices.size());
+                CHECK(window.start == next_layer);
+                CHECK(window.start < window.end);
+                CHECK(window.end <= n_layer);
+                next_layer = window.end;
+            }
+            CHECK(next_layer == n_layer);
+        };
+
+        const uint32_t layers = 62;
+        const uint64_t model_bytes = layers * mib;
+        const std::vector<device_probe> heterogeneous = {
+            make_device(64ull * mib, "large"),
+            make_device(32ull * mib, "medium"),
+            make_device(16ull * mib, "small"),
+        };
+        const std::vector<potluck::ring_window> first =
+            build_ring_route(heterogeneous, layers, model_bytes, 0, 0, 0);
+        const std::vector<potluck::ring_window> second =
+            build_ring_route(heterogeneous, layers, model_bytes, 0, 0, 0);
+        check_route(heterogeneous, layers, first);
+        CHECK(first.size() == 6);
+        CHECK(first[0].owner == 0 && first[1].owner == 1 && first[2].owner == 2);
+        CHECK(first[3].owner == 0 && first[4].owner == 1 && first[5].owner == 2);
+        CHECK(first[0].end - first[0].start == first[3].end - first[3].start);
+        CHECK(first[1].end - first[1].start == first[4].end - first[4].start);
+        CHECK(first[2].end - first[2].start == first[5].end - first[5].start);
+        CHECK(first.size() == second.size());
+        for (size_t i = 0; i < first.size(); ++i) {
+            CHECK(first[i].owner == second[i].owner);
+            CHECK(first[i].start == second[i].start);
+            CHECK(first[i].end == second[i].end);
+        }
+
+        const uint32_t prime_layers = 13;
+        const std::vector<device_probe> prime_devices = {
+            make_device(4ull * mib, "prime-large"),
+            make_device(2ull * mib, "prime-medium"),
+            make_device(2ull * mib, "prime-small"),
+        };
+        const std::vector<potluck::ring_window> prime_route =
+            build_ring_route(prime_devices, prime_layers, prime_layers * mib, 0, 0, 0);
+        check_route(prime_devices, prime_layers, prime_route);
+        CHECK(prime_route.size() == 6);
+        CHECK(prime_route[0].owner == prime_route[3].owner);
+        CHECK(prime_route[1].owner == prime_route[4].owner);
+        CHECK(prime_route[2].owner == prime_route[5].owner);
+        CHECK(prime_route[2].end == 7);
+
+        const uint32_t resident_layers = 12;
+        const std::vector<device_probe> resident_devices = {
+            make_device(3ull * mib, "resident-large"),
+            make_device(2ull * mib, "resident-medium"),
+            make_device(1ull * mib, "resident-small"),
+        };
+        const std::vector<device_probe> admitted =
+            admit_devices(resident_devices, resident_layers, resident_layers * mib,
+                          0, 0, 0);
+        CHECK(admitted.size() == 3);
+        const std::vector<device_probe> max_owner_devices = {
+            make_device(1ull * mib, "remote-0"),
+            make_device(1ull * mib, "remote-1"),
+            make_device(1ull * mib, "remote-2"),
+            make_device(1ull * mib, "remote-3"),
+            make_device(1ull * mib, "remote-4"),
+            make_device(1ull * mib, "remote-5"),
+        };
+        const std::vector<device_probe> admitted_with_head =
+            admit_devices(max_owner_devices, resident_layers, resident_layers * mib,
+                          0, 0, 0, true);
+        CHECK(admitted_with_head.size() == 5);
+        std::vector<device_probe> devices_with_head = admitted_with_head;
+        devices_with_head.push_back(make_device(1ull * mib, "head"));
+        const std::vector<potluck::ring_window> route_with_head =
+            build_ring_route(devices_with_head, resident_layers, resident_layers * mib,
+                             0, 0, 0);
+        check_route(devices_with_head, resident_layers, route_with_head);
+        const std::vector<potluck::ring_window> resident_route =
+            build_ring_route(admitted, resident_layers, resident_layers * mib, 0, 0, 0);
+        check_route(admitted, resident_layers, resident_route);
+        CHECK(resident_route.size() == 6);
+        CHECK(resident_route[0].end - resident_route[0].start == 3);
+        CHECK(resident_route[1].end - resident_route[1].start == 2);
+        CHECK(resident_route[2].end - resident_route[2].start == 1);
+        CHECK(resident_route[3].end - resident_route[3].start == 3);
+        CHECK(resident_route[4].end - resident_route[4].start == 2);
+        CHECK(resident_route[5].end - resident_route[5].start == 1);
     }
 
     return 0;

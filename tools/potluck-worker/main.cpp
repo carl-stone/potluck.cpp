@@ -49,6 +49,17 @@ const char * accel_kind_name(potluck::accel_kind kind) {
     }
 }
 
+void trace_prp_event(bool enabled, uint32_t rank, uint64_t sequence,
+                     uint32_t window, uint32_t round, const char * event, size_t bytes) {
+    if (!enabled) {
+        return;
+    }
+    std::printf("PRP seq=%llu window=%u round=%u rank=%u event=%s bytes=%zu\n",
+                static_cast<unsigned long long>(sequence), window, round, rank, event, bytes);
+    std::fflush(stdout);
+}
+
+
 bool parse_u32(const std::string & text, uint32_t & value) {
     if (text.empty()) {
         return false;
@@ -626,26 +637,40 @@ int main(int argc, char ** argv) {
                      std::to_string(window.end) + ") " + error);
             }
         }
-        const bool trace_prefetch = std::getenv("POTLUCK_TRACE_PREFETCH") != nullptr;
-        std::vector<bool> traced_compute(config.windows.size(), false);
-        const auto prefetch_next_owned = [&](size_t current_window) {
+        const bool trace_prp = std::getenv("POTLUCK_TRACE_PRP") != nullptr;
+        const bool force_prefetch = std::getenv("POTLUCK_PREFETCH_FORCE") != nullptr;
+        std::vector<uint32_t> owner_round;
+        if (trace_prp) {
+            owner_round.resize(config.windows.size());
+            std::unordered_map<uint32_t, uint32_t> rounds;
+            for (size_t i = 0; i < config.windows.size(); ++i) {
+                owner_round[i] = rounds[config.windows[i].owner]++;
+            }
+        }
+        const auto trace_window_event = [&](uint64_t sequence, size_t window,
+                                            const char * event, size_t bytes) {
+            if (!trace_prp) {
+                return;
+            }
+            trace_prp_event(true, config.index, sequence, static_cast<uint32_t>(window),
+                            owner_round[window], event, bytes);
+        };
+        const auto prefetch_next_owned = [&](size_t current_window, uint64_t sequence,
+                                             bool startup) {
             for (size_t offset = 1; offset <= config.windows.size(); ++offset) {
                 const size_t next = (current_window + offset) % config.windows.size();
                 if (config.windows[next].owner != config.index || stages[next].model == nullptr) {
                     continue;
                 }
-                const size_t bytes = stages[next].model->prefetch();
-                if (bytes == 0) {
-                    std::printf("WORKER rank %u resident window %zu\n", config.index, next);
-                } else {
-                    std::printf("WORKER rank %u prefetched window %zu (%zu bytes)\n",
-                                config.index, next, bytes);
-                }
-                std::fflush(stdout);
+                trace_window_event(sequence, next,
+                                   startup ? "startup_prefetch_begin" : "prefetch_begin", 0);
+                const size_t bytes = stages[next].model->prefetch(force_prefetch);
+                trace_window_event(sequence, next,
+                                   startup ? "startup_prefetch_end" : "prefetch_end", bytes);
                 return;
             }
         };
-        prefetch_next_owned(config.windows.size() - 1);
+        prefetch_next_owned(config.windows.size() - 1, 0, true);
 
 
         std::printf("WORKER rank %u/%u loaded %zu owned windows\n",
@@ -745,9 +770,7 @@ int main(int argc, char ** argv) {
             }
             if (message.type != potluck::message_type::batch_decode &&
                 message.type != potluck::message_type::batch_result &&
-                message.type != potluck::message_type::slot_config &&
-                message.type != potluck::message_type::token &&
-                message.type != potluck::message_type::hidden_state) {
+                message.type != potluck::message_type::slot_config) {
                 fail("unsupported ring message type " +
                      std::to_string(static_cast<unsigned>(message.type)));
             }
@@ -797,23 +820,29 @@ int main(int argc, char ** argv) {
                 if (replacement != nullptr) {
                     samplers.emplace(slot.seq, replacement);
                 }
+
                 continue;
+            }
+            if (trace_prp) {
+                trace_window_event(message.sequence, window_index, "receive",
+                                   message.payload.size());
             }
 
             potluck::stage_model & stage = stages[window_index];
+
             if (stage.ctx == nullptr) {
                 fail("owned ring window was not loaded: " + std::to_string(window_index));
             }
+            if (trace_prp) {
+                trace_window_event(message.sequence, window_index, "compute_begin", 0);
+            }
             const bool first_window = window.start == 0;
-            const bool batch = message.type == potluck::message_type::batch_decode ||
-                               message.type == potluck::message_type::batch_result;
 
             potluck::message output;
             output.rank = config.index;
             output.sequence = message.sequence;
             output.flags = window_index + 1;
 
-            if (batch) {
                 const bool from_head = message.type == potluck::message_type::batch_decode;
                 if (from_head != first_window) {
                     fail("batch message type does not match global window position");
@@ -886,6 +915,9 @@ int main(int argc, char ** argv) {
                         fail("cannot encode clear-only batch at window " +
                              std::to_string(window_index));
                     }
+                    if (trace_prp) {
+                        trace_window_event(message.sequence, window_index, "compute_end", 0);
+                    }
                     if (tail) {
                         if (!result_sender.send(output, error)) {
                             fail("cannot send completed clear-only result to head: " + error);
@@ -894,14 +926,15 @@ int main(int argc, char ** argv) {
                         fail("cannot send clear-only window result " +
                              std::to_string(output.flags) + " to next peer: " + error);
                     }
+                    if (trace_prp) {
+                        trace_window_event(message.sequence, window_index, "send",
+                                           output.payload.size());
+                    }
+                    prefetch_next_owned(window_index, message.sequence, false);
+
                     continue;
                 }
 
-                if (trace_prefetch && !traced_compute[window_index]) {
-                    std::printf("WORKER rank %u computing window %u\n", config.index, window_index);
-                    std::fflush(stdout);
-                    traced_compute[window_index] = true;
-                }
                 const uint32_t n_entries = static_cast<uint32_t>(positions.size());
                 int decode_rc;
                 if (from_head) {
@@ -997,74 +1030,9 @@ int main(int argc, char ** argv) {
                         fail("cannot encode hidden batch at window " + std::to_string(window_index));
                     }
                 }
-            } else {
-                if (first_window && message.type != potluck::message_type::token) {
-                    fail("first ring window expected token input");
-                }
-                if (!first_window && message.type != potluck::message_type::hidden_state) {
-                    fail("non-first ring window expected hidden input");
-                }
-                if (message.sequence > std::numeric_limits<uint32_t>::max()) {
-                    fail("single-token position exceeds uint32 range");
-                }
-                const uint32_t position = static_cast<uint32_t>(message.sequence);
-                const int decode_rc = first_window
-                    ? [&] {
-                        if (message.payload.size() != sizeof(uint32_t)) {
-                            fail("token payload has invalid size");
-                        }
-                        uint32_t token = 0;
-                        std::memcpy(&token, message.payload.data(), sizeof(token));
-                        return potluck::stage_decode_token(stage, static_cast<llama_token>(token), position);
-                    }()
-                    : [&] {
-                        if (message.payload.size() != sizeof(float) * stage.n_embd) {
-                            fail("hidden payload has invalid size");
-                        }
-                        return potluck::stage_decode_hidden(
-                            stage, reinterpret_cast<const float *>(message.payload.data()), position);
-                    }();
-                if (decode_rc != 0) {
-                    fail("single-token decode failed at window " + std::to_string(window_index));
-                }
-
-                if (tail) {
-                    const float * logits = llama_get_logits_ith(stage.ctx, -1);
-                    if (logits == nullptr) {
-                        fail("tail token decode produced no logits at window " +
-                             std::to_string(window_index));
-                    }
-                    llama_sampler * sampler = nullptr;
-                    if (samplers.size() == 1) {
-                        sampler = samplers.begin()->second;
-                    }
-                    const uint32_t token = static_cast<uint32_t>(
-                        sampler == nullptr
-                            ? potluck::argmax_token(logits, stage.n_vocab)
-                            : llama_sampler_sample(sampler, stage.ctx, -1));
-                    output.type = potluck::message_type::token;
-                    output.dtype = potluck::data_type::i32;
-                    output.shape = {1};
-                    output.payload.resize(sizeof(token));
-                    std::memcpy(output.payload.data(), &token, sizeof(token));
-                } else {
-                    const float * hidden = llama_get_embeddings_ith(stage.ctx, -1);
-                    if (hidden == nullptr) {
-                        fail("window produced no hidden state at window " +
-                             std::to_string(window_index));
-                    }
-                    output.type = potluck::message_type::hidden_state;
-                    output.dtype = potluck::data_type::f32;
-                    output.shape = {1, stage.n_embd};
-                    output.payload.assign(reinterpret_cast<const uint8_t *>(hidden),
-                                          reinterpret_cast<const uint8_t *>(hidden) +
-                                          sizeof(float) * stage.n_embd);
-                }
+            if (trace_prp) {
+                trace_window_event(message.sequence, window_index, "compute_end", 0);
             }
-            if (owned_windows > 1) {
-                prefetch_next_owned(window_index);
-            }
-
             if (tail) {
                 if (!result_sender.send(output, error)) {
                     fail("cannot send completed result to head: " + error);
@@ -1073,6 +1041,11 @@ int main(int argc, char ** argv) {
                 fail("cannot send window " + std::to_string(output.flags) +
                      " to next peer: " + error);
             }
+            if (trace_prp) {
+                trace_window_event(message.sequence, window_index, "send",
+                                   output.payload.size());
+            }
+            prefetch_next_owned(window_index, message.sequence, false);
         }
 
         cleanup();

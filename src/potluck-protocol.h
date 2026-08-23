@@ -11,9 +11,6 @@ constexpr size_t max_payload_bytes = 256u * 1024u * 1024u;
 
 enum class message_type : uint16_t {
     hello = 1,
-    batch_meta = 2,
-    hidden_state = 3,
-    token = 4,
     reset = 5,
     node_config = 6,
     ready = 7,

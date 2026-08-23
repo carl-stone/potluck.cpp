@@ -391,9 +391,6 @@ void append_u64(std::vector<uint8_t> & output, uint64_t value) {
 bool valid_message_type(uint16_t type) {
     switch (static_cast<message_type>(type)) {
         case message_type::hello:
-        case message_type::batch_meta:
-        case message_type::hidden_state:
-        case message_type::token:
         case message_type::reset:
         case message_type::node_config:
         case message_type::ready:
