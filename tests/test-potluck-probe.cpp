@@ -92,7 +92,7 @@ int main(int argc, char ** argv) {
     CHECK(first.ok);
     print_probe("first_probe", first_seconds, first);
 
-    constexpr size_t pressure_bytes = 3ull << 30;
+    constexpr size_t pressure_bytes = 4ull << 30;
     CHECK(pressure_bytes % sizeof(std::uint64_t) == 0);
     std::vector<std::uint64_t> pressure(pressure_bytes / sizeof(std::uint64_t));
     volatile std::uint64_t * pressure_data = pressure.data();
