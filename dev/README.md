@@ -13,13 +13,18 @@ Read these files in order before changing Potluck:
    — the binding product architecture and finished-product boundary.
 2. [`decisions/0007-prima-direct-ring-zeromq.md`](decisions/0007-prima-direct-ring-zeromq.md)
    — the binding direct-ring topology and ZeroMQ communication decision.
-3. [`architecture.md`](architecture.md) — the required runtime, data flow,
-   scheduling, shard-loading, head-resource, and server design.
-4. [`open-questions.md`](open-questions.md) — the current implementation gaps,
+3. [`decisions/0010-prima-feature-parity-baseline.md`](decisions/0010-prima-feature-parity-baseline.md)
+   — the prima.cpp feature baseline: HALDA placement with HiGHS, speculative
+   decoding, quantized models, platforms, the CLI family, and manual workload.
+4. [`architecture.md`](architecture.md) — the required runtime, data flow,
+   scheduling, window-loading, head-resource, and server design.
+5. [`open-questions.md`](open-questions.md) — the current implementation gaps,
    removal targets, and end-to-end release gate.
-5. [`parity-and-accuracy.md`](parity-and-accuracy.md) — evidence from the current
+6. [`completion-goals.md`](completion-goals.md) - the three decided product
+   goals that still need implementation.
+7. [`parity-and-accuracy.md`](parity-and-accuracy.md) - evidence from the current
    component checks and the limits of that evidence.
-6. [`decisions/`](decisions/) — accepted architectural decisions and their
+8. [`decisions/`](decisions/) - accepted architectural decisions and their
    supersession history.
 
 Repository-wide agent and test rules are in [`../AGENTS.md`](../AGENTS.md).
@@ -43,9 +48,9 @@ replacing prima.cpp's distributed behavior with another architecture.
 
 For user flow and usability, the governing directive is different: Potluck
 must be easy to use as one normal local server. Automatic cluster operation
-must hide devices, ranks, windows, shards, ports, and launch mechanics. Do not
-copy prima.cpp's manual deployment interface into Potluck merely because its
-technical behavior is the reference.
+must hide devices, ranks, windows, model files, ports, and launch mechanics. Do
+not copy prima.cpp's manual deployment interface into Potluck merely because
+its technical behavior is the reference.
 
 ## Canonical boundary
 

@@ -250,6 +250,145 @@ std::vector<std::string> split_csv(const std::string & text) {
         at = comma + 1;
     }
 }
+std::vector<std::string> parse_spec_types(const std::string & text) {
+    const std::vector<std::string> names = split_csv(text);
+    const std::vector<common_speculative_type> types =
+        common_speculative_types_from_names(names);
+    if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NONE) != types.end()) {
+        throw std::runtime_error("--spec-type must select an implementation");
+    }
+    return names;
+}
+
+uint32_t parse_nonnegative_u32(const std::string & value, const char * option) {
+    try {
+        size_t used = 0;
+        const unsigned long parsed = std::stoul(value, &used);
+        if (used != value.size() ||
+            parsed > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("invalid value");
+        }
+        return static_cast<uint32_t>(parsed);
+    } catch (...) {
+        throw std::runtime_error(std::string(option) + " expects a non-negative integer");
+    }
+}
+
+
+uint32_t parse_positive_u32(const std::string & value, const char * option) {
+    try {
+        size_t used = 0;
+        const unsigned long parsed = std::stoul(value, &used);
+        if (used != value.size() || parsed == 0 ||
+            parsed > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("invalid value");
+        }
+        return static_cast<uint32_t>(parsed);
+    } catch (...) {
+        throw std::runtime_error(std::string(option) + " expects a positive integer");
+    }
+}
+int32_t parse_positive_i32(const std::string & value, const char * option) {
+    const uint32_t parsed = parse_positive_u32(value, option);
+    if (parsed > static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::runtime_error(std::string(option) + " exceeds the supported range");
+    }
+    return static_cast<int32_t>(parsed);
+}
+
+double parse_positive_double(const std::string & value, const char * option) {
+    try {
+        size_t used = 0;
+        const double parsed = std::stod(value, &used);
+        if (used != value.size() || !std::isfinite(parsed) || parsed <= 0.0) {
+            throw std::runtime_error("invalid value");
+        }
+        return parsed;
+    } catch (...) {
+        throw std::runtime_error(std::string(option) + " expects a positive finite number");
+    }
+}
+
+potluck::prefetch_mode parse_prefetch(const std::string & value) {
+    if (value == "off") {
+        return potluck::prefetch_mode::off;
+    }
+    if (value == "advise") {
+        return potluck::prefetch_mode::advise;
+    }
+    if (value == "force") {
+        return potluck::prefetch_mode::force;
+    }
+    throw std::runtime_error("--prefetch expects off, advise, or force");
+}
+
+std::vector<uint32_t> parse_layer_window(const std::string & text) {
+    const std::vector<std::string> values = split_csv(text);
+    if (values.size() > 32) {
+        throw std::runtime_error("--layer-window accepts at most 32 entries");
+    }
+    std::vector<uint32_t> windows;
+    windows.reserve(values.size());
+    for (const std::string & value : values) {
+        windows.push_back(parse_positive_u32(value, "--layer-window"));
+    }
+    return windows;
+}
+
+void validate_manual_workload(const std::vector<uint32_t> & layer_window,
+                              int32_t k_override, uint32_t n_layer) {
+    if (!layer_window.empty()) {
+        uint64_t total = 0;
+        for (const uint32_t layers : layer_window) {
+            total += layers;
+        }
+        if (total == 0 || n_layer % total != 0) {
+            throw std::runtime_error(
+                "--layer-window sum must divide the model layer count exactly");
+        }
+    }
+    if (k_override > 0 && n_layer % static_cast<uint32_t>(k_override) != 0) {
+        throw std::runtime_error("--n-cycles must divide the model layer count exactly");
+    }
+}
+const char * prefetch_name(potluck::prefetch_mode mode) {
+    switch (mode) {
+        case potluck::prefetch_mode::off: return "off";
+        case potluck::prefetch_mode::advise: return "advise";
+        case potluck::prefetch_mode::force: return "force";
+    }
+    return "advise";
+}
+
+void log_manual_overrides(const char * binary,
+                          const std::vector<uint32_t> & layer_window,
+                          double gpu_mem_gib, int32_t k_override,
+                          double master_priority, potluck::prefetch_mode prefetch) {
+    if (layer_window.empty() && gpu_mem_gib == 0.0 && k_override < 0 &&
+        master_priority == 1.01 && prefetch == potluck::prefetch_mode::advise) {
+        return;
+    }
+    std::fprintf(stderr, "%s: expert override", binary);
+    if (!layer_window.empty()) {
+        std::fprintf(stderr, " layer-window=");
+        for (size_t index = 0; index < layer_window.size(); ++index) {
+            std::fprintf(stderr, "%s%u", index == 0 ? "" : ",", layer_window[index]);
+        }
+    }
+    if (gpu_mem_gib > 0.0) {
+        std::fprintf(stderr, " gpu-mem=%.3fGiB", gpu_mem_gib);
+    }
+    if (k_override > 0) {
+        std::fprintf(stderr, " n-cycles=%d", k_override);
+    }
+    if (master_priority != 1.01) {
+        std::fprintf(stderr, " master-priority=%.6g", master_priority);
+    }
+    if (prefetch != potluck::prefetch_mode::advise) {
+        std::fprintf(stderr, " prefetch=%s", prefetch_name(prefetch));
+    }
+    std::fputc('\n', stderr);
+}
 
 std::vector<std::string> parse_hosts(const std::string & text) {
     return split_csv(text);
@@ -308,7 +447,11 @@ void validate_cors_origin(const std::string & origin) {
 std::string resolve_hf_model(const std::string & repo,
                              const std::string & file,
                              const std::string & token,
-                             bool offline) {
+                             bool offline,
+                             std::string & resolved_repo,
+                             std::string & resolved_file) {
+    resolved_repo.clear();
+    resolved_file.clear();
     common_params params;
     params.hf_token = token;
     params.offline = offline;
@@ -326,6 +469,8 @@ std::string resolve_hf_model(const std::string & repo,
         if (handler.plan.model_files.size() != 1) {
             throw std::runtime_error("split GGUF repositories are not supported");
         }
+        resolved_repo = common_download_split_repo_tag(repo).first;
+        resolved_file = handler.plan.primary.path;
         common_models_handler_apply(handler, params);
     } catch (const std::exception & e) {
         throw std::runtime_error("failed to resolve Hugging Face model '" + repo + "': " + e.what());
@@ -354,8 +499,6 @@ std::string resolve_hf_model(const std::string & repo,
 
 
 
-
-
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -363,6 +506,8 @@ int main(int argc, char ** argv) {
         std::string model_path;
         std::string hf_repo;
         std::string hf_file;
+        std::string hf_remote_repo;
+        std::string hf_remote_file;
         const char * hf_token_env = std::getenv("HF_TOKEN");
         std::string hf_token = hf_token_env == nullptr ? std::string() : hf_token_env;
         bool hf_offline = false;
@@ -371,7 +516,7 @@ int main(int argc, char ** argv) {
         std::string launch;
         std::string head_share = "auto";
         uint16_t http_port = 8080;
-        uint32_t worker_local = 0;
+        uint32_t worker_local = 1;
         uint32_t n_predict_default = 24;
         uint32_t n_ctx = 4096;
         uint32_t n_seq_max = 4;
@@ -379,6 +524,15 @@ int main(int argc, char ** argv) {
         uint32_t seed = 0;
         float temp = 0.0f;
         float top_p = 0.0f;
+        potluck::prefetch_mode prefetch = potluck::prefetch_mode::advise;
+        bool force_prefetch = false;
+        std::vector<uint32_t> layer_window;
+        double gpu_mem_gib = 0.0;
+        int32_t k_override = -1;
+        double master_priority = 1.01;
+        std::string spec_draft_model;
+        std::vector<std::string> spec_types;
+        uint32_t spec_draft_n_max = 0;
         bool bench = false;
         bool workers_option = false;
         std::string api_key;
@@ -418,7 +572,9 @@ int main(int argc, char ** argv) {
             else if (arg == "--hosts") hosts_spec = take("--hosts");
             else if (arg == "--launch") launch = take("--launch");
             else if (arg == "--head-share") head_share = take("--head-share");
-            else if (arg == "--ctx") n_ctx = static_cast<uint32_t>(std::stoul(take("--ctx")));
+            else if (arg == "-c" || arg == "--ctx" || arg == "--ctx-size") {
+                n_ctx = static_cast<uint32_t>(std::stoul(take(arg.c_str())));
+            }
             else if (arg == "--slots" || arg == "--batch") {
                 n_seq_max = std::max<uint32_t>(1, static_cast<uint32_t>(std::stoul(take(arg.c_str()))));
             }
@@ -428,14 +584,54 @@ int main(int argc, char ** argv) {
             else if (arg == "--temp") temp = std::stof(take("--temp"));
             else if (arg == "--top-p") top_p = std::stof(take("--top-p"));
             else if (arg == "--seed") seed = static_cast<uint32_t>(std::stoul(take("--seed")));
-            else if (arg == "--n-predict") n_predict_default = static_cast<uint32_t>(std::stoul(take("--n-predict")));
+            else if (arg == "-n" || arg == "--n-predict") {
+                n_predict_default = static_cast<uint32_t>(std::stoul(take(arg.c_str())));
+            }
+            else if (arg == "-lw" || arg == "--layer-window" || arg == "--n-layer-window") {
+                layer_window = parse_layer_window(take(arg.c_str()));
+            }
+            else if (arg == "-gm" || arg == "--gpu-mem") {
+                gpu_mem_gib = parse_positive_double(take(arg.c_str()), arg.c_str());
+            }
+            else if (arg == "-k" || arg == "--n-cycles") {
+                k_override = parse_positive_i32(take(arg.c_str()), arg.c_str());
+            }
+            else if (arg == "--master-priority") {
+                master_priority = parse_positive_double(take("--master-priority"),
+                                                        "--master-priority");
+            }
+            else if (arg == "--prefetch") {
+                prefetch = parse_prefetch(take("--prefetch"));
+            }
+            else if (arg == "--force") {
+                force_prefetch = true;
+            }
+            else if (arg == "--spec-draft-model" || arg == "-md" ||
+                     arg == "--model-draft") {
+                spec_draft_model = take(arg.c_str());
+            }
+            else if (arg == "--spec-type") {
+                spec_types = parse_spec_types(take("--spec-type"));
+            }
+            else if (arg == "--spec-draft-n-max") {
+                spec_draft_n_max = parse_nonnegative_u32(
+                    take("--spec-draft-n-max"), "--spec-draft-n-max");
+            }
             else if (arg == "--bench") bench = true;
             else throw std::runtime_error(
                 "usage: potluck-server -m model.gguf | -hf owner/repo[:quant] "
                 "[--hf-file FILE] [--hf-token TOKEN] [--offline] "
-                "[--workers N] [--slots N] [--ubatch N] "
+                "[-c N] [-n N] [--slots N] [--ubatch N] "
+                "[--temp F] [--top-p F] [--seed N] "
+                "[-lw A,B | -gm N | -k N] [--master-priority F] "
+                "[--prefetch off|advise|force] [--force] "
+                "[--spec-type TYPE[,TYPE]] [--spec-draft-model FILE] "
+                "[--spec-draft-n-max N] "
                 "[--api-key VALUE] [--cors-origin ORIGIN] "
                 "[--head-share auto|off] [--hosts a,b,c --launch ssh]");
+        }
+        if (force_prefetch) {
+            prefetch = potluck::prefetch_mode::force;
         }
         if (api_key_option) {
             validate_api_key(api_key);
@@ -453,7 +649,8 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("-hff/--hf-file requires -hf/--hf-repo");
         }
         if (!hf_repo.empty()) {
-            model_path = resolve_hf_model(hf_repo, hf_file, hf_token, hf_offline);
+            model_path = resolve_hf_model(hf_repo, hf_file, hf_token, hf_offline,
+                                          hf_remote_repo, hf_remote_file);
         }
         if (head_share != "auto" && head_share != "off") {
             throw std::runtime_error("--head-share must be auto or off");
@@ -491,6 +688,7 @@ int main(int argc, char ** argv) {
         if (n_layer == 0) {
             throw std::runtime_error("model metadata reports zero layers");
         }
+        validate_manual_workload(layer_window, k_override, n_layer);
         uint32_t head_dim = 0;
         char key_length_buf[64] = {0};
         if (llama_model_meta_val_str(meta, "attention.key_length", key_length_buf,
@@ -521,6 +719,10 @@ int main(int argc, char ** argv) {
         ring_startup_options options;
         options.hosts_spec = hosts_spec;
         options.model_path = model_path;
+        options.hf_repo = hf_remote_repo;
+        options.hf_file = hf_remote_file;
+        options.hf_token = hf_token;
+        options.hf_offline = hf_offline;
         options.model_name = worker_model_name;
         options.worker_path = exe_dir(argv[0]) + "/potluck-worker";
         options.host = host;
@@ -544,11 +746,31 @@ int main(int argc, char ** argv) {
         options.n_ctx = n_ctx;
         options.n_seq_max = n_seq_max;
         options.n_ubatch = n_ubatch;
+        options.speculative_n_rs_seq = potluck_speculative_n_rs_seq(
+            spec_types, spec_draft_model, spec_draft_n_max);
+        options.speculative_head_reserve = potluck_speculative_head_reserve(
+            options.n_head_kv, options.head_dim, options.n_ctx, options.n_layer,
+            options.n_seq_max, spec_types, spec_draft_model);
         options.seed = seed;
         options.temp = temp;
         options.top_p = top_p;
+        options.prefetch = prefetch;
+        options.layer_window = layer_window;
+        options.gpu_mem_gib = gpu_mem_gib;
+        options.k_override = k_override;
+        options.master_priority = master_priority;
+        log_manual_overrides("potluck-server", layer_window, gpu_mem_gib,
+                             k_override, master_priority, prefetch);
 
         httplib::Server server;
+        slot_speculative_config speculative;
+        speculative.draft_model = spec_draft_model;
+        speculative.types = spec_types;
+        speculative.n_draft = spec_draft_n_max;
+        speculative.n_ctx = n_ctx;
+        speculative.n_batch = n_ubatch;
+        speculative.n_ubatch = n_ubatch;
+
         slot_scheduler scheduler(session.ring, vocab, n_seq_max, n_ubatch,
                                  [&](std::string & error) {
                                      return rebuild_ring(session, options, false, error);
@@ -558,7 +780,8 @@ int main(int argc, char ** argv) {
                                  },
                                  [&](std::string & error) {
                                      return refresh_ring_if_needed(session, options, error);
-                                 });
+                                 },
+                                 meta, std::move(speculative));
         session.health_reason = "ring startup in progress";
         setup_http_routes(server, session, scheduler, vocab, model_identity,
                           chat_templates, n_predict_default, temp, top_p, seed,

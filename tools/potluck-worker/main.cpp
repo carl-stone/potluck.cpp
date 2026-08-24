@@ -2,22 +2,24 @@
 #include "potluck-transport.h"
 #include "potluck_runtime.h"
 
-#include "llama.h"
 #include "llama-model.h"
+#include "llama.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
-#include <cstdlib>
+#include <fstream>
 #include <filesystem>
+#include <fcntl.h>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -28,7 +30,11 @@
 #include <utility>
 #include <vector>
 
+#include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
 namespace {
 
@@ -61,7 +67,10 @@ void trace_prp_event(bool enabled, uint32_t rank, uint64_t sequence,
 
 
 bool parse_u32(const std::string & text, uint32_t & value) {
-    if (text.empty()) {
+    if (text.empty() ||
+        !std::all_of(text.begin(), text.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        })) {
         return false;
     }
     size_t used = 0;
@@ -77,56 +86,503 @@ bool parse_u32(const std::string & text, uint32_t & value) {
     }
 }
 
-bool probe_local_accel(potluck::accel_profile & out, std::string & error) {
-    const uint32_t rank = out.rank;
-    out = potluck::accel_profile{};
-    out.rank = rank;
-    error.clear();
-
-    const ggml_backend_dev_t cpu =
-        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    if (cpu == nullptr) {
-        error = "CPU backend is unavailable";
+bool parse_u64(const std::string & text, uint64_t & value) {
+    if (text.empty() ||
+        !std::all_of(text.begin(), text.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        })) {
         return false;
     }
-    size_t host_free = 0;
-    size_t host_total = 0;
-    ggml_backend_dev_memory(cpu, &host_free, &host_total);
-    out.host_free_bytes = host_free;
-    out.host_total_bytes = host_total;
+    size_t used = 0;
+    try {
+        const unsigned long long parsed = std::stoull(text, &used, 10);
+        if (used != text.size()) {
+            return false;
+        }
+        value = static_cast<uint64_t>(parsed);
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
 
-    const enum ggml_backend_dev_type wanted[] = {
-        GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_ACCEL
-    };
-    for (size_t ti = 0; ti < 2 && out.kind == potluck::accel_kind::none; ++ti) {
-        for (size_t di = 0; di < ggml_backend_dev_count(); ++di) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(di);
-            if (dev == nullptr || ggml_backend_dev_type(dev) != wanted[ti]) {
-                continue;
+std::string lower_ascii(std::string value) {
+    for (char & c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+bool parse_probe_types(const std::string & text, std::vector<ggml_type> & types,
+                       std::string & error) {
+    types.clear();
+    if (text.empty()) {
+        error = "--probe-types must not be empty";
+        return false;
+    }
+    size_t begin = 0;
+    while (begin <= text.size()) {
+        const size_t end = text.find(',', begin);
+        const std::string token = text.substr(begin, end == std::string::npos
+            ? std::string::npos : end - begin);
+        if (token.empty()) {
+            error = "--probe-types contains an empty type";
+            return false;
+        }
+        const std::string wanted = lower_ascii(token);
+        ggml_type match = GGML_TYPE_COUNT;
+        for (int value = 0; value < GGML_TYPE_COUNT; ++value) {
+            if (wanted == lower_ascii(ggml_type_name(static_cast<ggml_type>(value)))) {
+                match = static_cast<ggml_type>(value);
+                break;
             }
-            size_t free_bytes = 0;
-            size_t total_bytes = 0;
-            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
-            if (total_bytes == 0) {
-                continue;
-            }
-            out.free_bytes = free_bytes;
-            out.total_bytes = total_bytes;
-            const std::string name = ggml_backend_dev_name(dev);
-            const std::string description = ggml_backend_dev_description(dev);
-            if (name.rfind("MTL", 0) == 0 || description.find("Metal") != std::string::npos) {
-                out.kind = potluck::accel_kind::metal;
-            } else if (name.rfind("CUDA", 0) == 0 || name.rfind("ROCm", 0) == 0 ||
-                       name.rfind("MUSA", 0) == 0 ||
-                       description.find("CUDA") != std::string::npos) {
-                out.kind = potluck::accel_kind::cuda;
-            } else {
-                out.kind = potluck::accel_kind::other;
-            }
+        }
+        if (match == GGML_TYPE_COUNT) {
+            error = "unknown GGML probe type: " + token;
+            return false;
+        }
+        if (std::find(types.begin(), types.end(), match) != types.end()) {
+            error = "duplicate GGML probe type: " + token;
+            return false;
+        }
+        types.push_back(match);
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (types.empty()) {
+        error = "--probe-types must contain at least one type";
+        return false;
+    }
+    return true;
+}
+
+const char * os_kind_name(potluck::os_kind kind) {
+    switch (kind) {
+        case potluck::os_kind::macos: return "macos";
+        case potluck::os_kind::linux_os: return "linux";
+        default: return "none";
+    }
+}
+
+std::string format_float_vector(const std::vector<float> & values) {
+    std::string result;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) {
+            result += ',';
+        }
+        char value[64] = {};
+        std::snprintf(value, sizeof(value), "%.9g", values[i]);
+        result += value;
+    }
+    return result;
+}
+
+std::string format_probe_types(const std::vector<ggml_type> & types) {
+    std::string result;
+    for (size_t i = 0; i < types.size(); ++i) {
+        if (i != 0) {
+            result += ',';
+        }
+        result += ggml_type_name(types[i]);
+    }
+    return result;
+}
+
+void read_host_memory(uint64_t & free_bytes, uint64_t & total_bytes) {
+    size_t free_size = 0;
+    size_t total_size = 0;
+    const ggml_backend_dev_t cpu =
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu != nullptr) {
+        ggml_backend_dev_memory(cpu, &free_size, &total_size);
+    }
+#if !defined(_WIN32)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const long total_pages = sysconf(_SC_PHYS_PAGES);
+    if (page_size > 0 && total_pages > 0) {
+        const size_t system_total = static_cast<size_t>(page_size) *
+                                    static_cast<size_t>(total_pages);
+        if (total_size == 0) {
+            total_size = system_total;
+        }
+#if defined(_SC_AVPHYS_PAGES)
+        const long available_pages = sysconf(_SC_AVPHYS_PAGES);
+        if (available_pages > 0) {
+            free_size = static_cast<size_t>(page_size) *
+                        static_cast<size_t>(available_pages);
+        }
+#endif
+    }
+#if defined(__linux__)
+    std::ifstream meminfo("/proc/meminfo");
+    std::string name;
+    uint64_t value = 0;
+    std::string unit;
+    while (meminfo >> name >> value >> unit) {
+        if (name == "MemAvailable:" && value <=
+            std::numeric_limits<uint64_t>::max() / 1024u) {
+            free_size = static_cast<size_t>(value * 1024u);
             break;
         }
     }
+#endif
+#if defined(__APPLE__)
+    mach_port_t host = mach_host_self();
+    vm_size_t mach_page_size = 0;
+    if (host_page_size(host, &mach_page_size) == KERN_SUCCESS && mach_page_size > 0) {
+        vm_statistics64_data_t statistics = {};
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(host, HOST_VM_INFO64,
+                              reinterpret_cast<host_info64_t>(&statistics),
+                              &count) == KERN_SUCCESS) {
+            const uint64_t available_pages =
+                static_cast<uint64_t>(statistics.free_count) +
+                static_cast<uint64_t>(statistics.inactive_count) +
+                static_cast<uint64_t>(statistics.speculative_count);
+            free_size = static_cast<size_t>(available_pages) *
+                        static_cast<size_t>(mach_page_size);
+        }
+    }
+    mach_port_deallocate(mach_task_self(), host);
+#endif
+#endif
+    free_bytes = static_cast<uint64_t>(free_size);
+    total_bytes = static_cast<uint64_t>(total_size);
+}
+
+ggml_backend_dev_t find_accelerator(size_t & free_bytes, size_t & total_bytes,
+                                    potluck::accel_kind & kind) {
+    const enum ggml_backend_dev_type wanted[] = {
+        GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_ACCEL
+    };
+    for (const enum ggml_backend_dev_type type : wanted) {
+        for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(index);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != type) {
+                continue;
+            }
+            size_t candidate_free = 0;
+            size_t candidate_total = 0;
+            ggml_backend_dev_memory(dev, &candidate_free, &candidate_total);
+            if (candidate_total == 0) {
+                continue;
+            }
+            const std::string name = ggml_backend_dev_name(dev);
+            const std::string description = ggml_backend_dev_description(dev);
+            free_bytes = candidate_free;
+            total_bytes = candidate_total;
+            if (name.rfind("MTL", 0) == 0 ||
+                description.find("Metal") != std::string::npos) {
+                kind = potluck::accel_kind::metal;
+            } else if (name.rfind("CUDA", 0) == 0 ||
+                       name.rfind("ROCm", 0) == 0 ||
+                       name.rfind("MUSA", 0) == 0 ||
+                       description.find("CUDA") != std::string::npos) {
+                kind = potluck::accel_kind::cuda;
+            } else {
+                kind = potluck::accel_kind::other;
+            }
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+bool benchmark_matmul(ggml_backend_dev_t device, ggml_type type, uint32_t n_threads,
+                      float & gflops, std::string & error) {
+    const int64_t block = ggml_blck_size(type);
+    if (device == nullptr || block <= 0) {
+        error = "GGML backend or type is unavailable";
+        return false;
+    }
+    constexpr int64_t k_base = 4096;
+    constexpr int64_t m = 1024;
+    constexpr int64_t n = 16;
+    const int64_t k = (k_base / block) * block;
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    if (backend == nullptr) {
+        error = "cannot initialize benchmark backend";
+        return false;
+    }
+    ggml_init_params init = {};
+    init.mem_size = 96ull * 1024ull * 1024ull;
+    init.no_alloc = true;
+    ggml_context * ctx = ggml_init(init);
+    if (ctx == nullptr) {
+        ggml_backend_free(backend);
+        error = "cannot create benchmark context";
+        return false;
+    }
+    ggml_tensor * weights = ggml_new_tensor_2d(ctx, type, k, m);
+    ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    ggml_tensor * output = ggml_mul_mat(ctx, weights, input);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, output);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buffer == nullptr) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        error = "benchmark tensor allocation failed";
+        return false;
+    }
+    if (!ggml_backend_dev_supports_op(device, output)) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        error = "backend does not support requested matmul type";
+        return false;
+    }
+    ggml_backend_tensor_memset(weights, 0, 0, ggml_nbytes(weights));
+    std::vector<float> input_values(static_cast<size_t>(k) * static_cast<size_t>(n), 1.0f);
+    ggml_backend_tensor_set(input, input_values.data(), 0,
+                            input_values.size() * sizeof(float));
+    if (n_threads > 0) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg != nullptr) {
+            auto set_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+            if (set_threads != nullptr) {
+                set_threads(backend, static_cast<int>(n_threads));
+            }
+        }
+    }
+    if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        error = "benchmark warmup failed";
+        return false;
+    }
+    constexpr int repeats = 3;
+    const auto started = std::chrono::steady_clock::now();
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            error = "benchmark compute failed";
+            return false;
+        }
+    }
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const double operations = 2.0 * static_cast<double>(k) *
+                              static_cast<double>(m) * static_cast<double>(n) *
+                              repeats;
+    gflops = static_cast<float>(operations / std::max(seconds, 1.0e-9) / 1.0e9);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return std::isfinite(gflops) && gflops >= 0.0f;
+}
+
+float benchmark_host_copy(size_t bytes) {
+    std::vector<uint8_t> source(bytes, 0x5a);
+    std::vector<uint8_t> destination(bytes);
+    const int repeats = bytes < 16ull * 1024ull * 1024ull ? 8 : 2;
+    volatile uint8_t sink = 0;
+    const auto started = std::chrono::steady_clock::now();
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        std::memcpy(destination.data(), source.data(), bytes);
+        sink ^= destination[repeat % bytes];
+    }
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    (void) sink;
+    return static_cast<float>(seconds * 1000.0 / repeats);
+}
+
+float benchmark_accel_copy(ggml_backend_dev_t device, size_t bytes,
+                           std::string & error) {
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    if (backend == nullptr) {
+        error = "cannot initialize accelerator copy backend";
+        return 0.0f;
+    }
+    ggml_init_params init = {};
+    init.mem_size = bytes + 1024 * 1024;
+    init.no_alloc = true;
+    ggml_context * ctx = ggml_init(init);
+    if (ctx == nullptr) {
+        ggml_backend_free(backend);
+        error = "cannot create accelerator copy context";
+        return 0.0f;
+    }
+    ggml_tensor * transfer = ggml_new_tensor_1d(ctx, GGML_TYPE_I8,
+                                                 static_cast<int64_t>(bytes));
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buffer == nullptr) {
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        error = "accelerator copy allocation failed";
+        return 0.0f;
+    }
+    std::vector<uint8_t> source(bytes, 0xa5);
+    std::vector<uint8_t> destination(bytes);
+    const int repeats = bytes < 16ull * 1024ull * 1024ull ? 4 : 1;
+    const auto started = std::chrono::steady_clock::now();
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        ggml_backend_tensor_set(transfer, source.data(), 0, bytes);
+        ggml_backend_tensor_get(transfer, destination.data(), 0, bytes);
+    }
+    const double seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+    return static_cast<float>(seconds * 1000.0 / (2 * repeats));
+}
+
+bool benchmark_disk(float & sequential_gbps, float & random_gbps, std::string & error) {
+    constexpr size_t file_bytes = 500ull * 1024ull * 1024ull;
+    constexpr size_t sequential_bytes = 100ull * 1024ull * 1024ull;
+    constexpr size_t block_bytes = 1024ull * 1024ull;
+    constexpr size_t random_bytes = 4ull * 1024ull;
+    char path[] = "/tmp/potluck-probe-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) {
+        error = "cannot create temporary disk probe file";
+        return false;
+    }
+    const auto cleanup = [&] {
+        close(fd);
+        unlink(path);
+    };
+    std::vector<uint8_t> write_buffer(block_bytes, 0x3c);
+    for (size_t offset = 0; offset < file_bytes; offset += block_bytes) {
+        size_t written = 0;
+        while (written < block_bytes) {
+            const ssize_t count = write(fd, write_buffer.data() + written,
+                                        block_bytes - written);
+            if (count <= 0) {
+                cleanup();
+                error = "temporary disk probe write failed";
+                return false;
+            }
+            written += static_cast<size_t>(count);
+        }
+    }
+    if (fsync(fd) != 0) {
+        cleanup();
+        error = "temporary disk probe sync failed";
+        return false;
+    }
+    std::vector<uint8_t> read_buffer(block_bytes);
+    auto started = std::chrono::steady_clock::now();
+    for (size_t offset = 0; offset < sequential_bytes; offset += block_bytes) {
+        if (pread(fd, read_buffer.data(), block_bytes, static_cast<off_t>(offset)) !=
+            static_cast<ssize_t>(block_bytes)) {
+            cleanup();
+            error = "temporary disk sequential read failed";
+            return false;
+        }
+    }
+    const double sequential_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    const size_t random_count = sequential_bytes / random_bytes;
+    read_buffer.resize(random_bytes);
+    uint64_t state = 0x6d2b79f5u;
+    started = std::chrono::steady_clock::now();
+    const off_t last_block = static_cast<off_t>((file_bytes - random_bytes) / random_bytes);
+    for (size_t index = 0; index < random_count; ++index) {
+        state = state * 6364136223846793005ull + 1;
+        const off_t block = static_cast<off_t>(state % static_cast<uint64_t>(last_block));
+        const off_t offset = block * static_cast<off_t>(random_bytes);
+        if (pread(fd, read_buffer.data(), random_bytes, offset) !=
+            static_cast<ssize_t>(random_bytes)) {
+            cleanup();
+            error = "temporary disk random read failed";
+            return false;
+        }
+    }
+    const double random_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - started).count();
+    cleanup();
+    sequential_gbps = static_cast<float>(sequential_bytes /
+        std::max(sequential_seconds, 1.0e-9) / 1.0e9);
+    random_gbps = static_cast<float>(sequential_bytes /
+        std::max(random_seconds, 1.0e-9) / 1.0e9);
+    if (!std::isfinite(sequential_gbps) || !std::isfinite(random_gbps)) {
+        error = "temporary disk probe produced invalid speed";
+        return false;
+    }
     return true;
+}
+
+bool probe_local_device(potluck::device_profile & out, std::string & error,
+                        const std::vector<ggml_type> & requested_types = {},
+                        uint64_t requested_bytes = 0,
+                        bool pressure_only = false) {
+#if defined(_WIN32)
+    (void) out;
+    (void) requested_types;
+    (void) requested_bytes;
+    (void) pressure_only;
+    error = "Windows worker probes are not supported by Potluck yet";
+    return false;
+#else
+    const uint32_t rank = out.rank;
+    out = potluck::device_profile{};
+    out.rank = rank;
+#if defined(__APPLE__)
+    out.os = potluck::os_kind::macos;
+#elif defined(__linux__)
+    out.os = potluck::os_kind::linux_os;
+#else
+    error = "unsupported operating system for worker probe";
+    return false;
+#endif
+    out.n_cpu_threads = std::max(1u, std::thread::hardware_concurrency());
+    error.clear();
+    read_host_memory(out.host_free_bytes, out.host_total_bytes);
+    size_t accelerator_free = 0;
+    size_t accelerator_total = 0;
+    const ggml_backend_dev_t accelerator =
+        find_accelerator(accelerator_free, accelerator_total, out.kind);
+    out.free_bytes = accelerator_free;
+    out.total_bytes = accelerator_total;
+    std::vector<ggml_type> types = requested_types;
+    if (types.empty()) {
+        types = { GGML_TYPE_F32 };
+    }
+    if (pressure_only) {
+        return true;
+    }
+    const size_t probe_bytes = std::min<size_t>(
+        std::max<size_t>(requested_bytes == 0 ? 8ull * 1024ull * 1024ull : requested_bytes,
+                         4096), 256ull * 1024ull * 1024ull);
+    ggml_time_init();
+    out.cpu_gflops.resize(types.size(), 0.0f);
+    out.accel_gflops.resize(types.size(), 0.0f);
+    for (size_t index = 0; index < types.size(); ++index) {
+        std::string benchmark_error;
+        if (!benchmark_matmul(
+                ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), types[index],
+                out.n_cpu_threads, out.cpu_gflops[index], benchmark_error)) {
+            error = "CPU probe failed for " + std::string(ggml_type_name(types[index])) +
+                    ": " + benchmark_error;
+            return false;
+        }
+        if (accelerator != nullptr &&
+            !benchmark_matmul(accelerator, types[index], out.n_cpu_threads,
+                              out.accel_gflops[index], benchmark_error)) {
+            out.accel_gflops[index] = 0.0f;
+        }
+    }
+    out.mem_copy_delay_ms = benchmark_host_copy(probe_bytes);
+    if (accelerator != nullptr) {
+        std::string copy_error;
+        out.accel_copy_delay_ms = benchmark_accel_copy(accelerator, probe_bytes, copy_error);
+    }
+    std::string disk_error;
+    if (!benchmark_disk(out.disk_read_seq_gbps, out.disk_read_rnd_gbps, disk_error)) {
+        error = disk_error;
+        return false;
+    }
+    return true;
+#endif
 }
 llama_sampler * make_sampler(const potluck::slot_config & config, uint32_t n_vocab,
                              std::string & error) {
@@ -307,6 +763,13 @@ void clear_stages(std::vector<potluck::stage_model> & stages) {
         clear_stage(stage);
     }
 }
+struct prefetch_request {
+    llama_model * model = nullptr;
+    uint64_t sequence = 0;
+    uint32_t window = 0;
+    bool startup = false;
+};
+
 
 void append_error_payload(potluck::message & message, const std::string & text) {
     message.payload.assign(text.begin(), text.end());
@@ -345,33 +808,6 @@ bool read_curve_bootstrap(potluck::curve_bootstrap_credentials & credentials,
     scrub_record();
     return decoded;
 }
-bool validate_shard(const potluck::stage_model & stage, uint32_t index, uint32_t count,
-                    uint32_t start, uint32_t end, std::string & error) {
-    struct expected_value {
-        const char * key;
-        uint32_t value;
-    };
-    const expected_value expected[] = {
-        { "potluck.shard.index", index },
-        { "potluck.shard.count", count },
-        { "potluck.shard.start", start },
-        { "potluck.shard.end", end },
-    };
-    for (const expected_value & item : expected) {
-        char value[32] = {};
-        if (llama_model_meta_val_str(stage.model, item.key, value, sizeof(value)) <= 0) {
-            error = std::string("shard is missing metadata key ") + item.key;
-            return false;
-        }
-        uint32_t parsed = 0;
-        if (!parse_u32(value, parsed) || parsed != item.value) {
-            error = std::string("shard metadata mismatch for ") + item.key +
-                " (expected " + std::to_string(item.value) + ", got " + value + ")";
-            return false;
-        }
-    }
-    return true;
-}
 
 
 
@@ -393,11 +829,29 @@ int main(int argc, char ** argv) {
     std::string inbox_error;
     std::atomic<bool> receiver_stopping{false};
     std::thread receiver_thread;
+    std::mutex prefetch_mutex;
+    std::condition_variable prefetch_cv;
+    std::deque<prefetch_request> prefetch_queue;
+    std::atomic<bool> prefetch_stopping{false};
+    std::atomic<bool> prefetch_failed{false};
+    std::mutex prefetch_error_mutex;
+    std::string prefetch_error;
+    std::thread prefetch_thread;
+
 
     auto cleanup = [&]() noexcept {
         receiver_stopping.store(true);
         if (receiver_thread.joinable()) {
             receiver_thread.join();
+        }
+        prefetch_stopping.store(true);
+        {
+            std::lock_guard<std::mutex> lock(prefetch_mutex);
+            prefetch_queue.clear();
+        }
+        prefetch_cv.notify_one();
+        if (prefetch_thread.joinable()) {
+            prefetch_thread.join();
         }
         for (auto & entry : samplers) {
             if (entry.second != nullptr) {
@@ -420,23 +874,81 @@ int main(int argc, char ** argv) {
         }
     };
     try {
-        if (argc == 2 && std::string(argv[1]) == "--probe") {
+        if (argc >= 2 && std::string(argv[1]) == "--probe") {
+            std::vector<ggml_type> probe_types = { GGML_TYPE_F32 };
+            uint64_t probe_bytes = 0;
+            bool pressure_only = false;
+            bool have_types = false;
+            bool have_bytes = false;
+            for (int index = 2; index < argc; ++index) {
+                const std::string arg = argv[index];
+                if (arg == "--probe-pressure") {
+                    if (pressure_only) {
+                        fail("duplicate --probe-pressure");
+                    }
+                    pressure_only = true;
+                    continue;
+                }
+                if (arg == "--probe-types" || arg == "--probe-bytes") {
+                    if (index + 1 >= argc) {
+                        fail("missing value for " + arg);
+                    }
+                    const std::string value = argv[++index];
+                    if (arg == "--probe-types") {
+                        if (have_types) {
+                            fail("duplicate --probe-types");
+                        }
+                        std::string type_error;
+                        if (!parse_probe_types(value, probe_types, type_error)) {
+                            fail(type_error);
+                        }
+                        have_types = true;
+                    } else {
+                        if (have_bytes || !parse_u64(value, probe_bytes) || probe_bytes == 0) {
+                            fail("invalid --probe-bytes value: " + value);
+                        }
+                        have_bytes = true;
+                    }
+                    continue;
+                }
+                fail("unknown probe argument: " + arg);
+            }
+#if defined(_WIN32)
+            fail("Windows worker probes are not supported by Potluck yet");
+#else
             llama_backend_init();
-            potluck::accel_profile probe;
+            potluck::device_profile probe;
             std::string probe_error;
-            const bool probed = probe_local_accel(probe, probe_error);
+            const bool probed = probe_local_device(
+                probe, probe_error, probe_types, probe_bytes, pressure_only);
             llama_backend_free();
             if (!probed) {
                 fail(probe_error);
             }
-            std::printf("potluck-probe kind=%s accel_free=%llu accel_total=%llu host_free=%llu host_total=%llu\n",
-                        accel_kind_name(probe.kind),
-                        static_cast<unsigned long long>(probe.free_bytes),
-                        static_cast<unsigned long long>(probe.total_bytes),
-                        static_cast<unsigned long long>(probe.host_free_bytes),
-                        static_cast<unsigned long long>(probe.host_total_bytes));
+            std::printf(
+                "potluck-probe protocol=EDP3 build=potluck mode=%s rank=0 os=%s kind=%s "
+                "accel_free=%llu accel_total=%llu host_free=%llu host_total=%llu",
+                pressure_only ? "pressure" : "startup", os_kind_name(probe.os),
+                accel_kind_name(probe.kind),
+                static_cast<unsigned long long>(probe.free_bytes),
+                static_cast<unsigned long long>(probe.total_bytes),
+                static_cast<unsigned long long>(probe.host_free_bytes),
+                static_cast<unsigned long long>(probe.host_total_bytes));
+            if (!pressure_only) {
+                std::printf(
+                    " n_cpu_threads=%u types=%s cpu_gflops=%s accel_gflops=%s "
+                    "mem_copy_delay_ms=%.9g accel_copy_delay_ms=%.9g "
+                    "disk_read_seq_gbps=%.9g disk_read_rnd_gbps=%.9g",
+                    probe.n_cpu_threads, format_probe_types(probe_types).c_str(),
+                    format_float_vector(probe.cpu_gflops).c_str(),
+                    format_float_vector(probe.accel_gflops).c_str(),
+                    probe.mem_copy_delay_ms, probe.accel_copy_delay_ms,
+                    probe.disk_read_seq_gbps, probe.disk_read_rnd_gbps);
+            }
+            std::putchar('\n');
             std::fflush(stdout);
             return 0;
+#endif
         }
         if (argc < 10) {
             fail("usage: potluck-worker <model.gguf> --bind <endpoint> --next <endpoint> --result <endpoint> --rank N --credentials-stdin");
@@ -495,12 +1007,11 @@ int main(int argc, char ** argv) {
         if (curve_credentials.rank != launch_rank) {
             fail("security bootstrap rank mismatch");
         }
-        potluck::accel_profile profile;
+        potluck::device_profile profile;
         profile.rank = launch_rank;
         llama_backend_init();
         backend_initialized = true;
-        if (!probe_local_accel(profile, error)) {
-            fail("cannot probe accelerator: " + error);
+        if (!probe_local_device(profile, error)) {
         }
 
         potluck::curve_public_key_list allowed_clients = {
@@ -561,15 +1072,15 @@ int main(int argc, char ** argv) {
         }
 
         std::vector<uint8_t> profile_payload;
-        if (!potluck::encode_accel_profile(profile, profile_payload)) {
-            fail("cannot encode accelerator profile");
+        if (!potluck::encode_device_profile(profile, profile_payload)) {
+            fail("cannot encode device profile");
         }
         potluck::message profile_message;
         profile_message.type = potluck::message_type::profile_result;
         profile_message.rank = launch_rank;
         profile_message.payload = std::move(profile_payload);
         if (!result_sender.send(profile_message, error)) {
-            fail("cannot send accelerator profile: " + error);
+            fail("cannot send device profile: " + error);
         }
         std::printf("WORKER rank %u accelerator %s free %llu MiB total %llu MiB\n",
                     launch_rank, accel_kind_name(profile.kind),
@@ -621,24 +1132,20 @@ int main(int argc, char ** argv) {
             }
             ++owned_windows;
             const bool tail = window.end == config.n_layer;
-            const std::string shard_path = model_path + ".potluck-" + std::to_string(i) +
-                "of" + std::to_string(config.windows.size()) + ".gguf";
-            if (!potluck::stage_load(stages[i], shard_path, window.start, window.end,
+            if (!potluck::stage_load(stages[i], model_path, window.start, window.end,
                                      /*embeddings=*/false, n_ctx, n_seq_max, n_ubatch,
                                      error, tail, window.n_gpu_layers, nullptr,
-                                     /*explicit_gpu_head=*/false, /*single_thread=*/false)) {
+                                     /*explicit_gpu_head=*/false, /*single_thread=*/false,
+                                     config.n_rs_seq)) {
                 fail("window [" + std::to_string(window.start) + "," +
-                     std::to_string(window.end) + ") shard load failed: " + error);
-            }
-            if (!validate_shard(stages[i], static_cast<uint32_t>(i),
-                                static_cast<uint32_t>(config.windows.size()),
-                                window.start, window.end, error)) {
-                fail("window [" + std::to_string(window.start) + "," +
-                     std::to_string(window.end) + ") " + error);
+                     std::to_string(window.end) + ") model load failed: " + error);
             }
         }
-        const bool trace_prp = std::getenv("POTLUCK_TRACE_PRP") != nullptr;
-        const bool force_prefetch = std::getenv("POTLUCK_PREFETCH_FORCE") != nullptr;
+        const bool trace_prp = config.prefetch != potluck::prefetch_mode::off;
+        std::vector<llama_model *> prefetch_models(config.windows.size(), nullptr);
+        for (size_t i = 0; i < stages.size(); ++i) {
+            prefetch_models[i] = stages[i].model;
+        }
         std::vector<uint32_t> owner_round;
         if (trace_prp) {
             owner_round.resize(config.windows.size());
@@ -655,18 +1162,82 @@ int main(int argc, char ** argv) {
             trace_prp_event(true, config.index, sequence, static_cast<uint32_t>(window),
                             owner_round[window], event, bytes);
         };
+        const auto fail_prefetch = [&](const std::string & text) {
+            {
+                std::lock_guard<std::mutex> lock(prefetch_error_mutex);
+                prefetch_error = text;
+            }
+            prefetch_failed.store(true);
+            prefetch_stopping.store(true);
+            {
+                std::lock_guard<std::mutex> lock(prefetch_mutex);
+                prefetch_queue.clear();
+            }
+            prefetch_cv.notify_all();
+            inbox_cv.notify_one();
+        };
+        if (config.prefetch == potluck::prefetch_mode::force) {
+            prefetch_thread = std::thread([&] {
+                try {
+                    for (;;) {
+                        prefetch_request request;
+                        {
+                            std::unique_lock<std::mutex> lock(prefetch_mutex);
+                            prefetch_cv.wait(lock, [&] {
+                                return prefetch_stopping.load() || !prefetch_queue.empty();
+                            });
+                            if (prefetch_stopping.load()) {
+                                return;
+                            }
+                            request = std::move(prefetch_queue.front());
+                            prefetch_queue.pop_front();
+                        }
+                        trace_window_event(
+                            request.sequence, request.window,
+                            request.startup ? "startup_prefetch_begin" : "prefetch_begin", 0);
+                        const size_t bytes = request.model->prefetch(true);
+                        trace_window_event(
+                            request.sequence, request.window,
+                            request.startup ? "startup_prefetch_end" : "prefetch_end", bytes);
+                    }
+                } catch (const std::exception & exception) {
+                    fail_prefetch("prefetch failed: " + std::string(exception.what()));
+                } catch (...) {
+                    fail_prefetch("prefetch failed with unknown error");
+                }
+            });
+        }
         const auto prefetch_next_owned = [&](size_t current_window, uint64_t sequence,
                                              bool startup) {
+            if (config.prefetch == potluck::prefetch_mode::off) {
+                return;
+            }
             for (size_t offset = 1; offset <= config.windows.size(); ++offset) {
                 const size_t next = (current_window + offset) % config.windows.size();
-                if (config.windows[next].owner != config.index || stages[next].model == nullptr) {
+                if (config.windows[next].owner != config.index ||
+                    prefetch_models[next] == nullptr) {
                     continue;
                 }
-                trace_window_event(sequence, next,
-                                   startup ? "startup_prefetch_begin" : "prefetch_begin", 0);
-                const size_t bytes = stages[next].model->prefetch(force_prefetch);
-                trace_window_event(sequence, next,
-                                   startup ? "startup_prefetch_end" : "prefetch_end", bytes);
+                if (config.prefetch == potluck::prefetch_mode::advise) {
+                    trace_window_event(
+                        sequence, next,
+                        startup ? "startup_prefetch_begin" : "prefetch_begin", 0);
+                    const size_t bytes = prefetch_models[next]->prefetch(false);
+                    trace_window_event(
+                        sequence, next,
+                        startup ? "startup_prefetch_end" : "prefetch_end", bytes);
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lock(prefetch_mutex);
+                        if (prefetch_stopping.load()) {
+                            return;
+                        }
+                        prefetch_queue.push_back(
+                            { prefetch_models[next], sequence,
+                              static_cast<uint32_t>(next), startup });
+                    }
+                    prefetch_cv.notify_one();
+                }
                 return;
             }
         };
@@ -756,10 +1327,15 @@ int main(int argc, char ** argv) {
             {
                 std::unique_lock<std::mutex> lock(inbox_mutex);
                 inbox_cv.wait(lock, [&] {
-                    return !inbox.empty() || !inbox_error.empty();
+                    return !inbox.empty() || !inbox_error.empty() ||
+                           prefetch_failed.load();
                 });
                 if (!inbox_error.empty()) {
                     fail(inbox_error);
+                }
+                if (prefetch_failed.load()) {
+                    std::lock_guard<std::mutex> error_lock(prefetch_error_mutex);
+                    fail(prefetch_error.empty() ? "prefetch thread failed" : prefetch_error);
                 }
                 message = std::move(inbox.front());
                 inbox.pop_front();
@@ -850,15 +1426,18 @@ int main(int argc, char ** argv) {
                 std::vector<int32_t> positions;
                 std::vector<int32_t> sequences;
                 std::vector<int32_t> tokens;
+                std::vector<int32_t> draft_tokens;
                 std::vector<float> hidden;
                 int32_t clear_seq = -1;
                 int32_t trim_seq = -1;
                 int32_t trim_to = -1;
                 uint32_t n_logits = 0;
+                uint32_t accepted_count = 0;
                 const size_t n_embd_hint = from_head ? 0 : stage.n_embd;
                 if (!potluck::decode_batch_payload(message.payload.data(), message.payload.size(),
                                                    n_embd_hint, clear_seq, trim_seq, trim_to,
-                                                   n_logits, positions, sequences, tokens, hidden, error)) {
+                                                   n_logits, positions, sequences, tokens,
+                                                   draft_tokens, accepted_count, hidden, error)) {
                     fail("invalid batch payload at window " + std::to_string(window_index) +
                          ": " + error);
                 }
@@ -866,8 +1445,8 @@ int main(int argc, char ** argv) {
                     fail("batch logits count exceeds entries at window " +
                          std::to_string(window_index));
                 }
-                if (tail && n_logits > n_seq_max) {
-                    fail("batch logits count exceeds configured slots at window " +
+                if (tail && n_logits > n_ubatch) {
+                    fail("batch logits count exceeds configured ubatch at window " +
                          std::to_string(window_index));
                 }
                 if (positions.size() > n_ubatch) {
@@ -910,8 +1489,8 @@ int main(int argc, char ** argv) {
                     output.type = potluck::message_type::batch_result;
                     output.dtype = potluck::data_type::i32;
                     if (!potluck::encode_batch_payload(
-                            positions, sequences, tokens, nullptr, 0,
-                            clear_seq, trim_seq, trim_to, 0, output.payload)) {
+                            positions, sequences, tokens, draft_tokens, accepted_count,
+                            nullptr, 0, clear_seq, trim_seq, trim_to, 0, output.payload)) {
                         fail("cannot encode clear-only batch at window " +
                              std::to_string(window_index));
                     }
@@ -953,8 +1532,29 @@ int main(int argc, char ** argv) {
                     std::vector<int32_t> results(n_entries, 0);
                     potluck::batch_logprobs output_logprobs(n_logits);
                     bool want_logprobs = false;
-                    for (uint32_t i = n_entries - n_logits; i < n_entries; ++i) {
-                        const float * logits = llama_get_logits_ith(stage.ctx, static_cast<int32_t>(i));
+                    const uint32_t logits_start = n_entries - n_logits;
+                    uint32_t spec_start = n_entries;
+                    if (!draft_tokens.empty()) {
+                        const size_t spec_rows = draft_tokens.size() + 1;
+                        if (n_logits < spec_rows || n_entries < spec_rows) {
+                            fail("speculative draft rows exceed tail logits");
+                        }
+                        spec_start = n_entries - static_cast<uint32_t>(spec_rows);
+                        if (spec_start < logits_start) {
+                            fail("speculative draft rows are outside tail logits");
+                        }
+                        for (size_t i = 0; i < spec_rows; ++i) {
+                            const size_t row = spec_start + i;
+                            if (sequences[row] != sequences[spec_start] ||
+                                (i != 0 && positions[row] != positions[spec_start] +
+                                    static_cast<int32_t>(i))) {
+                                fail("speculative draft rows are not one contiguous sequence");
+                            }
+                        }
+                    }
+                    for (uint32_t i = logits_start; i < spec_start; ++i) {
+                        const float * logits = llama_get_logits_ith(stage.ctx,
+                                                                      static_cast<int32_t>(i));
                         if (logits == nullptr) {
                             fail("tail batch produced no logits at window " +
                                  std::to_string(window_index));
@@ -972,7 +1572,7 @@ int main(int argc, char ** argv) {
                         results[i] = static_cast<int32_t>(sampled);
                         if (sampling.logprobs) {
                             want_logprobs = true;
-                            output_logprobs[i - (n_entries - n_logits)] =
+                            output_logprobs[i - logits_start] =
                                 make_logprobs(stage.ctx, static_cast<int32_t>(i), logits,
                                               stage.n_vocab, sampling, sampled);
                         }
@@ -980,13 +1580,79 @@ int main(int argc, char ** argv) {
                             llama_sampler_accept(sampler->second, sampled);
                         }
                     }
+
+                    uint32_t speculative_accepted = 0;
+                    if (!draft_tokens.empty()) {
+                        const auto sampler = samplers.find(sequences[spec_start]);
+                        const auto config_it = sampler_configs.find(sequences[spec_start]);
+                        const potluck::slot_config sampling =
+                            config_it == sampler_configs.end()
+                                ? potluck::slot_config{}
+                                : config_it->second;
+                        llama_sampler * checkpoint = sampler == samplers.end()
+                            ? nullptr : llama_sampler_clone(sampler->second);
+                        if (sampler != samplers.end() && checkpoint == nullptr) {
+                            fail("cannot checkpoint speculative sampler");
+                        }
+                        std::vector<llama_token> committed;
+                        bool rejected = false;
+                        for (size_t offset = 0; offset <= draft_tokens.size(); ++offset) {
+                            const uint32_t row = spec_start + static_cast<uint32_t>(offset);
+                            const float * logits = llama_get_logits_ith(
+                                stage.ctx, static_cast<int32_t>(row));
+                            if (logits == nullptr) {
+                                if (checkpoint != nullptr) {
+                                    llama_sampler_free(checkpoint);
+                                }
+                                fail("tail speculative row produced no logits at window " +
+                                     std::to_string(window_index));
+                            }
+                            const llama_token sampled = sampler == samplers.end()
+                                ? static_cast<llama_token>(
+                                    potluck::argmax_token(logits, stage.n_vocab))
+                                : llama_sampler_sample(sampler->second, stage.ctx,
+                                                       static_cast<int32_t>(row));
+                            results[row] = static_cast<int32_t>(sampled);
+                            if (sampling.logprobs) {
+                                want_logprobs = true;
+                                output_logprobs[row - logits_start] =
+                                    make_logprobs(stage.ctx, static_cast<int32_t>(row), logits,
+                                                  stage.n_vocab, sampling, sampled);
+                            }
+                            committed.push_back(sampled);
+                            if (offset < draft_tokens.size() &&
+                                sampled != static_cast<llama_token>(draft_tokens[offset])) {
+                                rejected = true;
+                                break;
+                            }
+                            if (sampler != samplers.end()) {
+                                llama_sampler_accept(sampler->second, sampled);
+                            }
+                            if (offset < draft_tokens.size()) {
+                                ++speculative_accepted;
+                            }
+                        }
+                        if (rejected && sampler != samplers.end()) {
+                            llama_sampler_free(sampler->second);
+                            sampler->second = checkpoint;
+                            checkpoint = nullptr;
+                            for (const llama_token token : committed) {
+                                llama_sampler_accept(sampler->second, token);
+                            }
+                        }
+                        if (checkpoint != nullptr) {
+                            llama_sampler_free(checkpoint);
+                        }
+                    }
+                    accepted_count = speculative_accepted;
                     output.type = want_logprobs
                         ? potluck::message_type::batch_result_logprobs
                         : potluck::message_type::batch_result;
                     output.dtype = potluck::data_type::i32;
-                    if (!potluck::encode_batch_payload(positions, sequences, results, nullptr, 0,
-                                                       clear_seq, trim_seq, trim_to, n_logits,
-                                                       output.payload)) {
+                    if (!potluck::encode_batch_payload(
+                            positions, sequences, results, draft_tokens, accepted_count,
+                            nullptr, 0, clear_seq, trim_seq, trim_to, n_logits,
+                            output.payload)) {
                         fail("cannot encode token batch at window " + std::to_string(window_index));
                     }
                     if (want_logprobs) {
@@ -1023,10 +1689,10 @@ int main(int argc, char ** argv) {
                                     hidden_row, sizeof(float) * stage.n_embd);
                     }
                     output.dtype = potluck::data_type::f32;
-                    if (!potluck::encode_batch_payload(positions, sequences, std::vector<int32_t>{},
-                                                       output_hidden.data(), stage.n_embd,
-                                                       clear_seq, trim_seq, trim_to, n_logits,
-                                                       output.payload)) {
+                    if (!potluck::encode_batch_payload(
+                            positions, sequences, std::vector<int32_t>{},
+                            draft_tokens, accepted_count, output_hidden.data(), stage.n_embd,
+                            clear_seq, trim_seq, trim_to, n_logits, output.payload)) {
                         fail("cannot encode hidden batch at window " + std::to_string(window_index));
                     }
                 }

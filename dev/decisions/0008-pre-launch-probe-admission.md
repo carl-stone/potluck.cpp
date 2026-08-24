@@ -2,6 +2,7 @@
 
 - Date: 2026-08-21
 - Status: Accepted
+- Capacity admission behavior superseded by: ADR 0011
 - Decision owner: Carl Stone
 - Supersedes: nothing
 

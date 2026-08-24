@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -32,139 +33,6 @@ namespace {
 std::atomic<uint64_t> topology_generation { 1 };
 constexpr uint16_t head_result_port = 40001;
 constexpr uint16_t head_ring_port = 40002;
-struct window_shards {
-    std::filesystem::path directory;
-    std::string prefix;
-    std::vector<std::filesystem::path> files;
-};
-
-std::string shard_filename(const std::string & prefix, size_t index, size_t count) {
-    return prefix + ".potluck-" + std::to_string(index) + "of" +
-        std::to_string(count) + ".gguf";
-}
-
-window_shards ensure_window_shards(const std::filesystem::path & model_path,
-                                   const std::string & model_digest,
-                                   const std::vector<potluck::ring_window> & windows,
-                                   const std::string & worker_path) {
-    if (model_digest.empty() || windows.empty()) {
-        throw std::runtime_error("cannot create window shards without a model digest and route");
-    }
-    std::string route_key = model_digest;
-    std::string bounds = std::to_string(windows.front().start);
-    for (const potluck::ring_window & window : windows) {
-        route_key += "-" + std::to_string(window.end);
-        bounds += "," + std::to_string(window.end);
-    }
-    window_shards shards;
-    shards.directory = model_path.parent_path() / ".potluck-shards" / route_key;
-    shards.prefix = model_path.stem().string();
-    shards.files.reserve(windows.size());
-    const auto populate_files = [&](const std::filesystem::path & directory) {
-        std::vector<std::filesystem::path> files;
-        files.reserve(windows.size());
-        for (size_t index = 0; index < windows.size(); ++index) {
-            files.push_back(directory / shard_filename(shards.prefix, index, windows.size()));
-        }
-        return files;
-    };
-    shards.files = populate_files(shards.directory);
-    const auto complete = [](const std::vector<std::filesystem::path> & files) {
-        std::error_code error;
-        for (const std::filesystem::path & file : files) {
-            if (!std::filesystem::is_regular_file(file, error) || error ||
-                std::filesystem::file_size(file, error) == 0 || error) {
-                return false;
-            }
-        }
-        return true;
-    };
-    if (complete(shards.files)) {
-        return shards;
-    }
-
-    const std::filesystem::path shard_tool =
-        std::filesystem::path(worker_path).parent_path() / "potluck-shard";
-    if (!std::filesystem::is_regular_file(shard_tool)) {
-        throw std::runtime_error("missing potluck-shard beside potluck-worker");
-    }
-    const std::filesystem::path temporary =
-        shards.directory.string() + ".tmp-" + std::to_string(getpid());
-    std::error_code error;
-    std::filesystem::remove_all(temporary, error);
-    error.clear();
-    std::filesystem::create_directories(temporary, error);
-    if (error) {
-        throw std::runtime_error("cannot create shard cache directory: " + error.message());
-    }
-    const std::string command = shell_quote(shard_tool.string()) + " " +
-        shell_quote(model_path.string()) + " --bounds " + shell_quote(bounds) +
-        " -o " + shell_quote(temporary.string());
-    if (std::system(command.c_str()) != 0) {
-        std::filesystem::remove_all(temporary, error);
-        throw std::runtime_error("potluck-shard failed");
-    }
-    const std::vector<std::filesystem::path> temporary_files = populate_files(temporary);
-    if (!complete(temporary_files)) {
-        std::filesystem::remove_all(temporary, error);
-        throw std::runtime_error("potluck-shard did not produce every route window");
-    }
-    std::filesystem::remove_all(shards.directory, error);
-    error.clear();
-    std::filesystem::create_directories(shards.directory.parent_path(), error);
-    if (error) {
-        std::filesystem::remove_all(temporary, error);
-        throw std::runtime_error("cannot prepare shard cache parent: " + error.message());
-    }
-    std::filesystem::rename(temporary, shards.directory, error);
-    if (error) {
-        std::filesystem::remove_all(temporary, error);
-        throw std::runtime_error("cannot publish shard cache: " + error.message());
-    }
-    return shards;
-}
-std::string remote_artifact_digest(const bootstrap_node & bootstrap,
-                                   const std::filesystem::path & remote_path) {
-    const std::string remote = remote_path.generic_string();
-    const std::string command =
-        "cd ~/potluck && (sha256sum " + shell_quote(remote) +
-        " 2>/dev/null || shasum -a 256 " + shell_quote(remote) +
-        " 2>/dev/null) | cut -d' ' -f1";
-    return first_command_line(
-        ssh_options(bootstrap) + " " + shell_quote(bootstrap.ssh_target) + " " +
-        shell_quote(command));
-}
-
-bool generate_remote_shards(const bootstrap_node & bootstrap,
-                            const std::filesystem::path & remote_model,
-                            const std::string & model_digest,
-                            const std::filesystem::path & remote_directory,
-                            const std::vector<potluck::ring_window> & windows,
-                            const std::vector<size_t> & indexes) {
-    if (indexes.empty() || remote_artifact_digest(bootstrap, remote_model) != model_digest) {
-        return false;
-    }
-    std::string bounds = std::to_string(windows.front().start);
-    for (const potluck::ring_window & window : windows) {
-        bounds += "," + std::to_string(window.end);
-    }
-    std::string selected = std::to_string(indexes.front());
-    for (size_t i = 1; i < indexes.size(); ++i) {
-        selected += "," + std::to_string(indexes[i]);
-    }
-    const std::string remote =
-        "cd ~/potluck && test -x ./potluck-shard && mkdir -p " +
-        shell_quote(remote_directory.generic_string()) + " && ./potluck-shard " +
-        shell_quote(remote_model.generic_string()) + " --bounds " + shell_quote(bounds) +
-        " --indexes " + shell_quote(selected) + " -o " +
-        shell_quote(remote_directory.generic_string());
-    std::printf("potluck-server: creating %zu assigned shards on %s from its local model\n",
-                indexes.size(), bootstrap.ring_host.c_str());
-    std::fflush(stdout);
-    return std::system((ssh_options(bootstrap) + " " +
-                        shell_quote(bootstrap.ssh_target) + " " +
-                        shell_quote(remote)).c_str()) == 0;
-}
 
 
 
@@ -199,7 +67,7 @@ double host_cpu_load() {
     return std::max(0.0, loads[0] / static_cast<double>(cores));
 }
 
-uint64_t adaptive_head_reserve(const potluck::accel_profile & profile, double load) {
+uint64_t adaptive_head_reserve(const potluck::device_profile & profile, double load) {
     constexpr uint64_t gib = 1024ull * 1024ull * 1024ull;
     uint64_t reserve = std::max(4 * gib, profile.host_total_bytes / 4);
     if (load >= 0.75) {
@@ -644,8 +512,8 @@ static void prepare_ring_controls(ServerRing & ring, uint32_t n_workers, int tim
 }
 
 void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
-                    uint32_t n_seq_max, uint32_t n_ubatch, uint32_t seed,
-                    float temp, float top_p,
+                    uint32_t n_seq_max, uint32_t n_ubatch, uint32_t n_rs_seq,
+                    uint32_t seed, float temp, float top_p, potluck::prefetch_mode prefetch,
                     const potluck::curve_client_credentials & controller_credentials) {
     const uint32_t n_workers = static_cast<uint32_t>(ring.workers.size());
     if (n_workers == 0 || ring.windows.empty()) {
@@ -664,9 +532,11 @@ void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
         config.n_ctx = n_ctx;
         config.n_seq_max = n_seq_max;
         config.n_ubatch = n_ubatch;
+        config.n_rs_seq = n_rs_seq;
         config.seed = seed;
         config.temp = temp;
         config.top_p = top_p;
+        config.prefetch = prefetch;
         config.windows = ring.windows;
         std::vector<uint8_t> payload;
         if (!potluck::encode_config(config, payload)) {
@@ -890,12 +760,9 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
     const bool workers_option = options.workers_option;
     const uint32_t worker_local = options.worker_local;
     const std::string & model_path = options.model_path;
-    const std::string & model_name = options.model_name;
     const std::string & host = options.host;
     const std::string & head_share = options.head_share;
     const uint32_t n_layer = options.n_layer;
-    const uint32_t head_dim = options.head_dim;
-    const uint32_t n_head_kv = options.n_head_kv;
     const uint32_t n_ctx = options.n_ctx;
     const uint32_t n_seq_max = options.n_seq_max;
     const uint32_t n_ubatch = options.n_ubatch;
@@ -922,7 +789,7 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                 if (hosts_spec.empty() && !workers_option) {
                     bootstrap_nodes = discover_bootstrap_nodes();
                 }
-                const bool has_remote = !bootstrap_nodes.empty();
+        bool has_remote = !bootstrap_nodes.empty();
         if (!has_remote && worker_local == 0) {
             throw std::runtime_error("need at least one ring worker");
         }
@@ -941,9 +808,27 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         }
 
  
-        const uint64_t model_bytes = std::filesystem::file_size(model_path);
-        const uint64_t layer_cost = route_layer_cost(
-            n_layer, model_bytes, n_head_kv, head_dim, n_ctx);
+        halda_model_metadata model_metadata;
+        std::string metadata_error;
+        if (!extract_halda_model_metadata(model_path, n_ctx, model_metadata,
+                                          metadata_error)) {
+            throw std::runtime_error("cannot prepare HALDA model: " +
+                                     (metadata_error.empty()
+                                          ? std::string("invalid model metadata")
+                                          : metadata_error));
+        }
+        if (model_metadata.n_layer != n_layer) {
+            throw std::runtime_error("HALDA model layer count differs from runtime metadata");
+        }
+        const uint64_t layer_cost = model_metadata.b_prime;
+        const std::vector<ggml_type> & probe_types = model_metadata.ordered_types;
+        const uint64_t probe_bytes = model_metadata.b_prime;
+        if (options.k_override != -1 || options.gpu_mem_gib > 0.0 ||
+            options.master_priority != 1.01) {
+            std::printf("potluck-server: HALDA expert override k=%d gpu_mem_gib=%.9g master_priority=%.9g\n",
+                        options.k_override, options.gpu_mem_gib,
+                        options.master_priority);
+        }
         std::vector<device_probe> candidates;
         device_probe head;
         bool head_participates = false;
@@ -952,12 +837,13 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         uint64_t head_reserve = 4ull * 1024ull * 1024ull * 1024ull;
         double head_load = 0.0;
         if (has_remote) {
-            candidates = probe_remote_candidates(bootstrap_nodes);
+            candidates = probe_remote_candidates(bootstrap_nodes, probe_types, probe_bytes);
             if (has_staged_payload) {
                 for (device_probe & candidate : candidates) {
                     if (!candidate.ok &&
                         refresh_remote_binaries(candidate.bootstrap, stage_dir, local_platform)) {
-                        device_probe retry = probe_remote_worker(candidate.bootstrap);
+                        device_probe retry = probe_remote_worker(
+                            candidate.bootstrap, probe_types, probe_bytes);
                         if (retry.ok) {
                             candidate = std::move(retry);
                         }
@@ -966,7 +852,7 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             }
             for (const device_probe & probe : candidates) {
                 if (!probe.ok) {
-                    std::fprintf(stderr, "potluck-server: excluding %s: %s\n",
+                    std::fprintf(stderr, "potluck-server: rejecting %s: %s\n",
                                  probe.bootstrap.ssh_target.c_str(),
                                  probe.error.empty() ? "probe failed" : probe.error.c_str());
                 }
@@ -977,11 +863,15 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                                             }),
                              candidates.end());
             if (candidates.empty()) {
-                throw std::runtime_error("no admissible Potluck devices");
-            }
-
-            if (head_share == "auto") {
-                head = probe_local_worker(worker_path);
+                if (worker_local == 0 || !hosts_spec.empty() || workers_option) {
+                    throw std::runtime_error("no reachable Potluck device");
+                }
+                std::fprintf(stderr,
+                             "potluck-server: no remote device is reachable; selecting the local device\n");
+                bootstrap_nodes.clear();
+                has_remote = false;
+            } else if (head_share == "auto") {
+                head = probe_local_worker(worker_path, probe_types, probe_bytes);
                 if (!head.ok) {
                     std::fprintf(stderr, "potluck-server: head probe failed: %s\n",
                                  head.error.c_str());
@@ -989,26 +879,31 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                     head.host = "head";
                     head_load = host_cpu_load();
                     head_reserve = adaptive_head_reserve(head.profile, head_load);
+                    if (options.speculative_head_reserve >
+                        std::numeric_limits<uint64_t>::max() - head_reserve) {
+                        head_reserve = std::numeric_limits<uint64_t>::max();
+                    } else {
+                        head_reserve += options.speculative_head_reserve;
+                    }
                     head_plan = plan_head_participation(head, head_reserve, layer_cost);
                     head_budget = head_plan.budget;
                     head.placement_usable_limit = head_budget;
                 }
             }
         }
-        else {
-            device_probe physical = probe_local_worker(worker_path);
+        if (!has_remote) {
+            device_probe physical = probe_local_worker(worker_path, probe_types, probe_bytes);
             physical.host = "127.0.0.1";
             if (!physical.ok) {
                 throw std::runtime_error("local worker probe failed: " + physical.error);
             }
+            const uint32_t local_count = worker_local == 0
+                ? 1 : std::min<uint32_t>(worker_local, n_layer);
             const uint64_t physical_usable = physical.usable_bytes();
-            const uint64_t max_local_peers = std::min<uint64_t>(
-                { static_cast<uint64_t>(worker_local), static_cast<uint64_t>(n_layer),
-                  physical_usable / layer_cost });
-            const uint32_t local_count = static_cast<uint32_t>(
-                std::max<uint64_t>(1, max_local_peers));
-            const uint64_t shared_bytes = physical_usable / local_count;
-            const uint64_t remainder = physical_usable % local_count;
+            const uint64_t shared_bytes = local_count == 0
+                ? 0 : physical_usable / local_count;
+            const uint64_t remainder = local_count == 0
+                ? 0 : physical_usable % local_count;
             for (uint32_t index = 0; index < local_count; ++index) {
                 device_probe probe = physical;
                 probe.placement_usable_limit = shared_bytes +
@@ -1017,31 +912,65 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             }
         }
         const bool reserve_head_slot =
-            has_remote && head_share == "auto" && head.ok &&
-            head_plan.participates && n_layer >= 4;
-        std::vector<device_probe> devices = admit_devices(
-            std::move(candidates), n_layer, model_bytes, n_head_kv, head_dim, n_ctx,
-            reserve_head_slot);
+            has_remote && head_share == "auto" && head.ok && head_plan.participates;
+        std::vector<device_probe> solver_candidates;
+        solver_candidates.reserve(candidates.size() + (reserve_head_slot ? 1 : 0));
         if (reserve_head_slot) {
             head.placement_usable_limit = head_plan.budget;
             head_participates = true;
             head.bootstrap = {};
             head.ok = true;
-            devices.push_back(std::move(head));
+            solver_candidates.push_back(std::move(head));
+        }
+        for (device_probe & candidate : candidates) {
+            solver_candidates.push_back(std::move(candidate));
+        }
+        std::vector<device_probe> devices;
+        halda_solution solution;
+        std::string solve_error;
+        if (!solve_ring_placement(
+                solver_candidates, model_metadata, n_ubatch, head_participates,
+                options.layer_window, options.k_override, options.master_priority,
+                options.gpu_mem_gib, devices, ring.windows, &solution, solve_error)) {
+            throw std::runtime_error(
+                solve_error.empty() ? "HALDA could not form a feasible ring" : solve_error);
+        }
+        if (solution.original_rank_w.size() != solver_candidates.size() ||
+            solution.original_rank_n.size() != solver_candidates.size() ||
+            solution.original_set_labels.size() != solver_candidates.size()) {
+            throw std::runtime_error("HALDA returned incomplete device assignments");
+        }
+        for (size_t index = 0; index < solver_candidates.size(); ++index) {
+            const uint32_t rank = static_cast<uint32_t>(index);
+            const device_probe & candidate = solver_candidates[index];
+            const bool removed = std::find(
+                solution.removed_original_ranks.begin(),
+                solution.removed_original_ranks.end(), rank) !=
+                solution.removed_original_ranks.end();
+            if (removed) {
+                std::printf("potluck-server: device %u host=%s removed by placement\n",
+                            rank, candidate.host.c_str());
+            } else {
+                std::printf("potluck-server: device %u host=%s set=%s layers=%u gpu-layers=%u\n",
+                            rank, candidate.host.c_str(),
+                            solution.original_set_labels[index].c_str(),
+                            solution.original_rank_w[index],
+                            solution.original_rank_n[index]);
+            }
         }
         std::printf("potluck-server: head participation %s (budget %llu MiB, reserve %llu MiB)\n",
                     head_participates ? "on" : "off",
                     static_cast<unsigned long long>(head_budget / (1024ull * 1024ull)),
                     static_cast<unsigned long long>(head_reserve / (1024ull * 1024ull)));
         if (devices.empty()) {
-            throw std::runtime_error("no admissible Potluck devices");
+            throw std::runtime_error("HALDA selected no ring devices");
         }
-
-        if (has_remote && std::none_of(devices.begin(), devices.end(),
-                                       [](const device_probe & device) {
-                                           return !device.bootstrap.ssh_target.empty();
-                                       })) {
-            throw std::runtime_error("no remote device remains after admission");
+        if (has_remote && !head_participates &&
+            std::none_of(devices.begin(), devices.end(),
+                         [](const device_probe & device) {
+                             return !device.bootstrap.ssh_target.empty();
+                         })) {
+            throw std::runtime_error("HALDA removed every remote ring device");
         }
         const uint32_t n_workers = static_cast<uint32_t>(devices.size());
         if (n_workers == 0) {
@@ -1049,8 +978,17 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         }
         std::string head_address;
         if (has_remote) {
-            head_address = local_address_for_peer(devices.front().bootstrap.ring_host,
-                                                  devices.front().bootstrap.ring_port);
+            const auto remote = std::find_if(
+                devices.begin(), devices.end(),
+                [](const device_probe & device) {
+                    return !device.bootstrap.ssh_target.empty();
+                });
+            if (remote != devices.end()) {
+                head_address = local_address_for_peer(
+                    remote->bootstrap.ring_host, remote->bootstrap.ring_port);
+            } else {
+                head_address = "127.0.0.1";
+            }
         }
         planned.reserve(n_workers);
         for (uint32_t index = 0; index < n_workers; ++index) {
@@ -1059,7 +997,7 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             plan.device = device;
             const bool is_remote = has_remote && !device.bootstrap.ssh_target.empty();
             plan.kind = is_remote ? worker_kind::remote : worker_kind::local;
-            plan.model = is_remote ? model_name : model_path;
+            plan.model = model_path;
             const std::string address_host = is_remote
                 ? ipv4_address_for_host(device.bootstrap.ring_host)
                 : (has_remote ? head_address : "127.0.0.1");
@@ -1116,8 +1054,9 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         for (const planned_worker & plan : planned) {
             ring.workers.push_back(plan.ring);
         }
-        ring.windows = build_ring_route(devices, n_layer, model_bytes, n_head_kv,
-                                        head_dim, n_ctx);
+        if (ring.windows.empty()) {
+            throw std::runtime_error("HALDA returned no ring windows");
+        }
         std::vector<uint32_t> device_share(devices.size(), 0);
         for (const potluck::ring_window & window : ring.windows) {
             device_share[window.owner] += window.end - window.start;
@@ -1148,17 +1087,15 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         if (model_digest.empty()) {
             model_digest = digest_cache.get(model_path);
         }
-        const window_shards shards =
-            ensure_window_shards(model_path, model_digest, ring.windows, worker_path);
-        const std::filesystem::path remote_directory =
-            std::filesystem::path(".potluck-shards") / shards.directory.filename();
+        const std::filesystem::path remote_model =
+            std::filesystem::path("models") / std::filesystem::path(model_path).filename();
+        std::set<std::string> distributed_models;
         for (uint32_t rank = 0; rank < n_workers; ++rank) {
             planned_worker & plan = planned[rank];
             if (plan.kind == worker_kind::local) {
-                plan.model = (shards.directory / shards.prefix).string();
                 continue;
             }
-            plan.model = (remote_directory / shards.prefix).generic_string();
+            plan.model = remote_model.generic_string();
             if (!stop_remote_workers(plan.device.bootstrap)) {
                 throw std::runtime_error("remote worker cleanup failed for " +
                                          plan.device.bootstrap.ssh_target);
@@ -1168,41 +1105,21 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                 throw std::runtime_error("worker binary refresh failed for " +
                                          plan.device.bootstrap.ssh_target);
             }
-            std::vector<std::string> shard_digests(ring.windows.size());
-            std::vector<size_t> missing_indexes;
-            for (size_t window_index = 0; window_index < ring.windows.size(); ++window_index) {
-                if (ring.windows[window_index].owner != rank) {
-                    continue;
-                }
-                const std::filesystem::path & local_shard = shards.files[window_index];
-                const std::filesystem::path remote_shard =
-                    remote_directory / local_shard.filename();
-                shard_digests[window_index] = digest_cache.get(local_shard);
-                if (remote_artifact_digest(plan.device.bootstrap, remote_shard) ==
-                    shard_digests[window_index]) {
-                    std::printf("potluck-server: %s already has %s\n",
-                                plan.device.bootstrap.ring_host.c_str(),
-                                remote_shard.generic_string().c_str());
-                } else {
-                    missing_indexes.push_back(window_index);
-                }
+            if (!distributed_models.insert(plan.device.bootstrap.ssh_target).second) {
+                continue;
             }
-            if (!missing_indexes.empty()) {
-                generate_remote_shards(plan.device.bootstrap, model_name, model_digest,
-                                       remote_directory, ring.windows, missing_indexes);
-            }
-            for (size_t window_index : missing_indexes) {
-                const std::filesystem::path & local_shard = shards.files[window_index];
-                const std::filesystem::path remote_shard =
-                    remote_directory / local_shard.filename();
-                std::string distribution_error;
-                if (!ensure_remote_artifact(plan.device.bootstrap, local_shard, remote_shard,
-                                            shard_digests[window_index],
-                                            distribution_error)) {
-                    throw std::runtime_error("shard distribution failed for " +
-                                             plan.device.bootstrap.ssh_target + ": " +
-                                             distribution_error);
-                }
+            std::string distribution_error;
+            const bool model_ready = options.hf_repo.empty()
+                ? ensure_remote_artifact(plan.device.bootstrap, model_path, remote_model,
+                                          model_digest, distribution_error)
+                : ensure_remote_hf_artifact(plan.device.bootstrap, remote_model,
+                                            options.hf_repo, options.hf_file,
+                                            options.hf_token, model_digest,
+                                            options.hf_offline, distribution_error);
+            if (!model_ready) {
+                throw std::runtime_error("model distribution failed for " +
+                                         plan.device.bootstrap.ssh_target + ": " +
+                                         distribution_error);
             }
         }
         for (uint32_t index = 0; index < n_workers; ++index) {
@@ -1220,13 +1137,11 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
             }
             potluck::scrub_curve_credentials(credentials[index]);
         }
-        const std::vector<potluck::accel_profile> profiles =
-            collect_accel_profiles(ring, n_workers);
-        assign_gpu_layers(ring.windows, profiles, n_workers, model_bytes, n_layer,
-                          n_head_kv, head_dim, n_ctx);
+        (void) collect_device_profiles(ring, n_workers);
         std::fflush(stdout);
-        configure_ring(ring, n_layer, n_ctx, n_seq_max, n_ubatch, seed, temp, top_p,
-                      controller_credentials);
+        configure_ring(ring, n_layer, n_ctx, n_seq_max, n_ubatch,
+                       options.speculative_n_rs_seq, seed, temp, top_p,
+                       options.prefetch, controller_credentials);
         potluck::scrub_curve_keypair(result_server_keypair);
         potluck::scrub_curve_keypair(controller_credentials.keypair);
         controller_credentials.server_public_key.clear();
@@ -1343,11 +1258,9 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
     }
 
     std::vector<planned_worker> current_workers;
-    std::vector<potluck::ring_window> current_windows;
     {
         std::lock_guard<std::mutex> lock(session.mutex);
         current_workers = session.workers;
-        current_windows = session.ring.windows;
     }
     const std::set<std::string> current_remote = remote_targets(current_workers);
 
@@ -1359,125 +1272,70 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
         error = "topology discovery deferred: " + std::string(exception.what());
         return topology_refresh_result::unchanged;
     }
-
-    std::vector<device_probe> probes = probe_remote_candidates(candidates);
-    bool changed = false;
-    for (const device_probe & probe : probes) {
-        if (!probe.ok) {
-            continue;
-        }
-        const auto current = std::find_if(
-            current_workers.begin(), current_workers.end(),
-            [&](const planned_worker & worker) {
-                return worker.kind == worker_kind::remote &&
-                       worker.device.bootstrap.ssh_target == probe.bootstrap.ssh_target;
-            });
-        if (current != current_workers.end() &&
-            (materially_changed(current->device.usable_bytes(), probe.usable_bytes()) ||
-             current->device.bootstrap.ssh_port != probe.bootstrap.ssh_port ||
-             current->device.bootstrap.ring_host != probe.bootstrap.ring_host ||
-             current->device.bootstrap.ring_port != probe.bootstrap.ring_port)) {
-            changed = true;
-        }
-    }
-
+    const std::vector<device_probe> probes = probe_remote_pressure_candidates(candidates);
     std::vector<device_probe> valid;
+    valid.reserve(probes.size());
     for (const device_probe & probe : probes) {
         if (probe.ok) {
             valid.push_back(probe);
         }
     }
     if (valid.empty()) {
-        error = "topology probes deferred: no remote candidate responded";
+        error = "topology pressure probes deferred: no candidate responded";
         return topology_refresh_result::unchanged;
     }
     const std::set<std::string> responding_remote = probe_targets(valid);
     for (const std::string & target : current_remote) {
         if (responding_remote.count(target) == 0) {
-            error = "topology probe deferred for current worker " + target;
+            error = "topology pressure probe deferred for current worker " + target;
             return topology_refresh_result::unchanged;
         }
     }
-    const bool reserve_head_slot =
-        options.head_share == "auto" &&
-        std::any_of(current_workers.begin(), current_workers.end(),
-                    [](const planned_worker & worker) {
-                        return worker.kind == worker_kind::local;
-                    });
-    std::vector<device_probe> replacement_devices;
-    try {
-        const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
-        replacement_devices = admit_devices(
-            valid, options.n_layer, model_bytes, options.n_head_kv,
-            options.head_dim, options.n_ctx, reserve_head_slot);
-        if (probe_targets(replacement_devices) != current_remote) {
-            changed = true;
+
+    bool changed = responding_remote != current_remote;
+    for (const device_probe & probe : valid) {
+        const auto current = std::find_if(
+            current_workers.begin(), current_workers.end(),
+            [&](const planned_worker & worker) {
+                return worker.kind == worker_kind::remote &&
+                       worker.device.bootstrap.ssh_target == probe.bootstrap.ssh_target;
+            });
+        if (current == current_workers.end()) {
+            continue;
         }
-    } catch (const std::exception & exception) {
-        changed = true;
-        error = exception.what();
+        changed = changed ||
+            materially_changed(current->device.profile.free_bytes,
+                               probe.profile.free_bytes) ||
+            materially_changed(current->device.profile.host_free_bytes,
+                               probe.profile.host_free_bytes) ||
+            current->device.bootstrap.ssh_port != probe.bootstrap.ssh_port ||
+            current->device.bootstrap.ring_host != probe.bootstrap.ring_host ||
+            current->device.bootstrap.ring_port != probe.bootstrap.ring_port;
     }
 
     if (options.head_share == "auto") {
-        device_probe head = probe_local_worker(options.worker_path);
-        bool current_head = false;
+        const device_probe head = probe_local_pressure(options.worker_path);
+        if (!head.ok) {
+            error = "head pressure probe deferred: " + head.error;
+            return topology_refresh_result::unchanged;
+        }
         bool has_current_head = false;
-        uint64_t current_head_layers = 0;
+        potluck::device_profile current_profile;
         {
             std::lock_guard<std::mutex> lock(session.mutex);
-            current_head = session.head_participates;
             has_current_head = session.has_head_profile;
+            current_profile = session.head_profile;
         }
-        for (const potluck::ring_window & window : current_windows) {
-            if (window.owner < current_workers.size() &&
-                current_workers[window.owner].kind == worker_kind::local) {
-                current_head_layers += window.end - window.start;
-            }
-        }
-        if (!head.ok) {
-            error = "head reserve probe deferred: " + head.error;
-            return topology_refresh_result::unchanged;
-        } else {
-            const double load = host_cpu_load();
-            const uint64_t reserve = adaptive_head_reserve(head.profile, load);
-            const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
-            const uint64_t layer_cost = route_layer_cost(
-                options.n_layer, model_bytes, options.n_head_kv,
-                options.head_dim, options.n_ctx);
-            const head_participation_plan head_plan =
-                plan_head_participation(head, reserve, layer_cost);
-            head.placement_usable_limit = head_plan.budget;
-            const uint64_t budget = head_plan.budget;
-            const bool participating = head_plan.participates;
-            if (participating) {
-                replacement_devices.push_back(head);
-            }
-            changed = changed || head_placement_requires_refresh(
-                has_current_head, current_head, participating,
-                current_head_layers * layer_cost, budget);
-        }
+        changed = changed || !has_current_head ||
+            materially_changed(current_profile.free_bytes, head.profile.free_bytes) ||
+            materially_changed(current_profile.host_free_bytes,
+                               head.profile.host_free_bytes);
     }
-    const uint64_t model_bytes = std::filesystem::file_size(options.model_path);
-    const uint64_t layer_cost = route_layer_cost(
-        options.n_layer, model_bytes, options.n_head_kv, options.head_dim, options.n_ctx);
-    uint64_t feasible_layers = 0;
-    for (const device_probe & device : replacement_devices) {
-        const uint64_t device_layers = std::min<uint64_t>(
-            options.n_layer, device.usable_bytes() / layer_cost);
-        feasible_layers = std::min<uint64_t>(
-            options.n_layer, feasible_layers + device_layers);
-    }
-    if (feasible_layers < options.n_layer) {
-        error = "topology refresh deferred: replacement devices cannot cover the model";
-        return topology_refresh_result::unchanged;
-    }
-
-
     if (!changed) {
         return topology_refresh_result::unchanged;
     }
-    const std::string reason = error.empty()
-        ? "discovery, capacity, or head reserve changed" : error;
+
+    const std::string reason = "discovery or live memory pressure changed";
     std::string rebuild_error;
     if (!rebuild_ring(session, options, true, rebuild_error)) {
         bool restored = false;

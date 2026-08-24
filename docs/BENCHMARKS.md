@@ -4,119 +4,49 @@
 
 ## Integrated 27B product acceptance
 
-The following measurements came from a supervised 2026-08-23 run of the integrated direct-peer ZeroMQ PRP server. This is an operating point, not a speedup claim.
+The following measurements came from supervised 2026-08-23 and 2026-08-24 runs of the integrated direct-peer ZeroMQ PRP server. They are operating points, not speedup claims.
 
+- Model file: `/Users/carlstone/models/gemma-3-27b-it-Q4_K_M.gguf`
 - Model: Gemma 3 27B Q4_K_M, 62 layers
 - Devices: Apple M4 Mac, Apple M1 Mac, and Linux PC with NVIDIA GTX 1650 SUPER
 - Build: Release
-- Discovery and placement: automatic DNS-SD discovery, live probing, head participation, six repeated windows, and automatic window-shard distribution
-- Request: `The capital of France is`, greedy sampling, 32 streamed completion tokens
+- Server configuration: automatic DNS-SD discovery, live probing, head participation, `--launch ssh`, full-model distribution, per-window prefetch, and `--spec-type ngram-simple --spec-draft-n-max 4`
+- Request: `The capital of France is`, greedy sampling, streamed chat, 12 completion tokens
 
-The route used M4 windows `[0,12)` and `[31,43)` with 12 Metal layers each, M1 windows `[12,22)` and `[43,53)` with 10 Metal layers each, and PC windows `[22,31)` and `[53,62)` with 6 CUDA layers followed by a CPU tail.
+The successful three-device route assigned windows `[0,6)`, `[6,16)`, and `[16,62)` to the M4 head, M1, and Linux PC. The server logged three ring workers, three windows, startup prefetch, runtime PRP events, and HTTP status 200.
 
-Measured client-side results:
+Measured client-side results for two successful runs of this request:
 
 ```text
-TTFT                 38.943 s
-32-token total       57.159 s
-decode throughput     1.702 token/s
+run 1 TTFT             8.472 s
+run 1 total           11.918 s
+run 1 decode rate       3.482 tok/s
+run 2 TTFT             7.893 s
+run 2 total           11.310 s
+run 2 decode rate       3.511 tok/s
+mean decode rate        3.497 tok/s (2 runs)
 ```
+The decode rate is completion tokens divided by client time after TTFT.
 
-Two simultaneous 16-token conversations, one streaming and one non-streaming, both returned HTTP 200 in 46.874 s and 47.366 s. Killing the M1 worker during another request returned HTTP 503, the controller restored a ready three-device ring, and the next 16-token request returned HTTP 200 in 47.100 s.
+The usage record for a later clean three-device run reported 14 prompt tokens, 12 completion tokens, and 26 total tokens. It returned HTTP 200 with 13.400 s TTFT and 39.166 s total client time. The pre-fix n-gram configuration logged `drafted=0 accepted=0 accept-rate=0.000` because the server kept the default 12-token lookup pattern while limiting the draft window to 4 tokens.
+
+That short chat prompt had no repeated n-gram, so zero drafts was not a useful functional proof. The scheduler now keeps the n-gram lookup pattern no longer than the configured draft window. A post-fix targeted 27B completion with a repeated token sequence logged `drafted=12 accepted=12 accept-rate=1.000` through the same three-device ring.
+
+The separate 27B benchmark run logged two successful topology refresh rebuilds. Its initial three-worker assignment was `[0,12)`, `[12,16)`, `[16,62)`; subsequent rebuilds recorded `[0,18)`, `[18,62)` and `[0,19)`, `[19,62)` after the M1 was removed by live placement. This confirms assignment refresh behavior, but those refreshes used benchmark mode rather than the streaming request.
 
 These values include the current PRP route, network transfers of intermediate activations, per-window synchronization, and client-visible HTTP streaming. They do not isolate prefill, compare against another topology, or establish a regression threshold.
 
-## Historical component measurements
-
-The numbers below measure static, manually configured, coordinator-routed raw-TCP component paths that ADR 0006 and ADR 0007 required Potluck to remove. They remain only as dated evidence and must not guide product configuration or performance claims.
-
-All numbers below were measured on 2026-08-20.
-
-## Hardware and build
-
-- Host: Apple Mac16,1, Apple M4, 10 CPU cores
-- Memory: 16 GiB unified memory
-- OS: Darwin 25.5.0, arm64
-- Build: Release, local HiGHS enabled
-- Fixture: `models/Qwen3.5-0.8B-Q4_0.gguf` (526.50 MiB)
-- Workers: two local `potluck-worker` processes, CPU-only (`ngl=0`)
-
-Build command:
-
-```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DPOTLUCK_HIGHS=ON
-cmake --build build -j8 --target potluck-head potluck-server potluck-worker llama-cli
-```
-
-## `potluck-server --bench`
-
-Command:
-
-```sh
-build/bin/potluck-server \
-  -m models/Qwen3.5-0.8B-Q4_0.gguf \
-  --workers 2 --port 18081 --n-predict 8 --bench
-```
-
-Measured output:
-
-```text
-bench worker host window       weight-bytes gpu-layers decode-tok/s peak-rss-mb
-bench      0 127.0.0.1       [0,12)    281518032          0       286.31       847.0
-bench      1 127.0.0.1       [12,24)    281518032          0       152.52      1109.5
-bench cluster prefill-tok/s 129.01 decode-tok/s 81.11 aggregate-tok/s 58.23 ms/token 17.17 wire-bytes/token 75.0 coordinator-peak-rss-mb 126.6 worker-peak-rss-mb-max 1109.5
-```
-
-The benchmark request uses the fixed prompt `The capital of France is`, an eight-token decode, and greedy sampling. `decode-tok/s` in the worker table is measured inside each stage. `peak-rss-mb` is `getrusage(RUSAGE_SELF).ru_maxrss`; macOS values are converted from bytes to MiB.
-
-## `potluck-head --bench`
-
-Workers were started with:
-
-```sh
-build/bin/potluck-worker models/Qwen3.5-0.8B-Q4_0.gguf 127.0.0.1 18101
-build/bin/potluck-worker models/Qwen3.5-0.8B-Q4_0.gguf 127.0.0.1 18102
-printf '127.0.0.1:18101\n127.0.0.1:18102\n' >/tmp/potluck-head-workers.txt
-```
-
-Coordinator command:
-
-```sh
-build/bin/potluck-head models/Qwen3.5-0.8B-Q4_0.gguf \
-  /tmp/potluck-head-workers.txt 8 127.0.0.1 --bench
-```
-
-Measured output:
-
-```text
-bench worker host window       weight-bytes gpu-layers decode-tok/s peak-rss-mb
-bench      0 127.0.0.1       [0,12)    281518032          0       305.17       849.9
-bench      1 127.0.0.1       [12,24)    281518032          0       167.79      1112.5
-bench cluster prefill-tok/s 170.90 decode-tok/s 80.03 aggregate-tok/s 59.23 ms/token 16.88 wire-bytes/token 30.0 coordinator-peak-rss-mb 126.4 worker-peak-rss-mb-max 1112.5
-```
-
-The head benchmark proves the coordinator can request per-stage metrics without tearing down the live chain. A later HTTP request after `--bench` metrics returned successfully in the same smoke run.
-
-## Interpretation and limits
-
-The worker weight column is a resident-weight estimate for an unsplit GGUF:
-model file bytes multiplied by the stage's layer fraction. Sharded deployments
-should use the actual shard file size in deployment records. RSS includes
-runtime, KV, graph buffers, and touched mapped pages; it is not a pure weight
-measurement.
-
-These are single-machine fixture numbers. Local workers are a test harness:
-they do not create memory, and they are not evidence of cluster scaling. On one
-machine, all worker shards still consume the same physical RAM and memory
-bandwidth. Production capacity scaling requires separate machines, each holding
-and computing its own layer shard. Multiple local workers can be useful for
-protocol and correctness tests, or with multiple physical accelerators; this
-M4 run has one unified-memory accelerator.
-
-No pre-change batched-prefill measurement was captured in this run, so this
-file does not claim a speedup ratio. The post-change path sends one batched
-prefill message per prompt.
-
 ## Verification scope
 
-Exact token-parity checks use the Qwen3.5 0.8B fixture so a full-model reference fits one test host. The supervised Gemma 3 27B run establishes integrated three-device operation and a measured performance point; it does not claim reference-token parity or a speedup ratio.
+The local integrated suite exercises the direct adjacent-peer ZeroMQ ring,
+automatic placement, full-model window loading, per-window prefetch,
+speculative decoding, quantized inference, continuous batching, slots, and
+HTTP paths with the Qwen3.5 0.8B fixture.
+
+The supervised Gemma 3 27B run establishes integrated three-device operation
+and a measured performance point. It does not claim reference-token parity,
+scaling, or a speedup ratio. Broader model architectures and full
+llama-server API parity remain outside this release baseline.
+
+Build and fixture commands are engineering checks. They are documented in the
+repository quick start and test scripts, not as alternate Potluck runtimes.

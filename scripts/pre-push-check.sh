@@ -33,12 +33,11 @@ cmake -S "${REPO}" -B "${BUILD_DIR}" \
     -DLLAMA_BUILD_SERVER=ON \
     -DLLAMA_BUILD_EXAMPLES=OFF \
     -DLLAMA_BUILD_APP=OFF \
-    -DPOTLUCK_HIGHS=OFF \
-    -DGGML_NATIVE=OFF
+    -DGGML_NATIVE=OFF \
+    -DPOTLUCK_HIGHS=ON
 
 printf 'pre-push: building required binaries with %s jobs\n' "${JOBS}"
 potluck_build "${BUILD_DIR}" --config Release \
-    --target potluck-node potluck-worker potluck-server potluck-shard llama-cli test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run
-
+ --target potluck-node potluck-worker potluck-server potluck-cli llama-cli test-potluck-discovery test-potluck-protocol test-potluck-probe test-potluck-transport test-potluck-halda test-potluck-qwen35-stages test-potluck-run
 printf 'pre-push: running local component suite\n'
 bash "${REPO}/tests/potluck/run_all.sh"

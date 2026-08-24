@@ -5,11 +5,7 @@ endif()
 
 add_executable(potluck-server
     main.cpp
-    admission.cpp
-    ring.cpp
-    scheduler.cpp
-    http_api.cpp
-)
+    http_api.cpp)
 
 target_include_directories(potluck-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src
@@ -18,5 +14,4 @@ target_include_directories(potluck-server PRIVATE
 )
 target_compile_features(potluck-server PRIVATE cxx_std_17)
 
-target_link_libraries(potluck-server PRIVATE potluck-discovery potluck-distributed llama llama-common cpp-httplib)
-add_dependencies(potluck-server potluck-shard)
+target_link_libraries(potluck-server PRIVATE potluck-core)

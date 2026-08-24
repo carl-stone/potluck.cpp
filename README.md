@@ -20,26 +20,32 @@ product requires one integrated path with:
 - automatic discovery, live profiling, device selection, and
   heterogeneity-aware window assignment;
 - per-window prefetch and per-device CPU, CUDA, or Metal placement;
-- per-device GGUF shard loading, while allowing a complete model to exist on
-  disk;
+- HiGHS-solved heterogeneity-aware placement (prima's HALDA);
+- speculative decoding and quantized GGUF model support;
+- per-device complete GGUF files with window-bounded loading, while keeping
+  resident memory proportional to assigned layers;
 - continuous batching and isolated conversation slots;
 - an OpenAI-compatible server on the head;
+- a completion CLI beside the server, both driving one ring runtime;
+- macOS and Linux support now, with Windows on the roadmap;
 - head placement that reserves resources for the person using that machine.
 
-The direct server path now owns the implemented ring data plane. `potluck-server`
+The direct server path now owns the integrated ring data plane. `potluck-server`
 connects each worker directly to its cyclic next peer with ZeroMQ, sends
-ingress only to rank 0, and receives final results back at the head. The
-current route assigns two repeated disjoint windows per worker where the model
-layers permit. It can launch local workers, discover advertised LAN nodes with
-mDNS/DNS-SD, and launch discovered workers through SSH. Each worker reports its
-accelerator through the ring, and the head places window layers on Metal or
-CUDA automatically from that profile.
+ingress only to rank 0, and receives final results back at the head. HALDA
+uses the live device profiles and HiGHS to select repeated disjoint windows
+and per-window CPU, Metal, or CUDA placement. The route supports per-window
+prefetch, speculative decoding, continuous batching, isolated slots, and
+full-model window loading. It can launch local workers, discover advertised
+LAN nodes through mDNS/DNS-SD, and launch discovered workers through SSH.
 
-Local two-worker smoke passed with automatic placement: window layers fully on
-M4 Metal and on a GTX 1650 SUPER CUDA device. Live device selection and
-admission, heterogeneous window sizing, shard automation, batching, slots,
-recovery, security, and full API parity remain unfinished, so Potluck is not
-complete.
+The completion CLI uses the same ring lifecycle as the server. The local
+integrated suite verifies the direct ring, protocol, transport, HALDA,
+speculative decoding, model loading, and HTTP paths. The supervised 27B
+three-device operating point, assignment log, and measured streaming results
+are recorded in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md). The release gate
+still has open long-run recovery and broader model/API evidence; these are not
+alternate Potluck execution paths.
 
 Build and fixture commands in this repository are engineering checks only.
 They do not describe a supported deployment.
@@ -55,9 +61,9 @@ source.
 flowchart LR
     C[Clients and agent harnesses] --> H[Head<br/>OpenAI-compatible server]
     H --> R[Piped-ring scheduler]
-    R --> W0[Head worker when resources permit<br/>disjoint window shards]
-    W0 --> W1[Mac worker<br/>disjoint window shards]
-    W1 --> W2[Linux worker<br/>disjoint window shards]
+    R --> W0[Head worker when resources permit<br/>assigned model windows]
+    W0 --> W1[Mac worker<br/>assigned model windows]
+    W1 --> W2[Linux worker<br/>assigned model windows]
     W2 --> W0
 ```
 
@@ -70,45 +76,56 @@ The finished scheduler must choose devices, windows, prefetch, and accelerator
 placement from measured live capacity. It must account for current CPU and
 memory pressure on the head before assigning work there.
 
-Product workers must load only their assigned GGUF window shards. A full model
-may be downloaded or retained on a device, but no production worker may load
-the complete model.
+Product workers receive one complete GGUF per selected device and load only
+their assigned global layer windows. The controller may retain the source model,
+but no production worker may load the complete model into memory.
 
-Manual topology, bounds, and worker or shard selection are not supported
-product behavior. The direct server path is the only current ring path; any
-remaining static or disconnected implementation is a removal target, not a
-mode or fallback.
+Automatic operation is the default. Manual topology and worker selection are
+not supported product behavior; the optional expert workload override in
+[ADR 0010](dev/decisions/0010-prima-feature-parity-baseline.md) is the single
+exception. The direct server path is the only current ring
+path; any remaining static or disconnected implementation is a removal
+target, not a mode or fallback.
 
 ## Quick start
 
-One command prepares a macOS or Linux device. A source checkout builds the
-runtime, fetches the pinned fixture model on the head, and installs everything
-flat into `~/potluck`:
+Run the installer on every device. A source checkout builds the runtime and
+installs it flat into `~/potluck`:
 
 ```sh
 bash scripts/install.sh
 ```
 
-When a staged portable payload is available, a worker needs no compiler or
-model copy:
+On each worker device, run the installed Potluck node:
+
+```sh
+~/potluck/potluck-node
+```
+
+On the head device, start either front end. The server exposes the
+OpenAI-compatible endpoint:
+
+```sh
+~/potluck/potluck-server -hf ggml-org/Qwen3.5-0.8B-GGUF
+```
+
+The completion CLI uses the same ring runtime:
+
+```sh
+~/potluck/potluck-cli -hf ggml-org/Qwen3.5-0.8B-GGUF -p "The capital of France is"
+```
+
+When a staged portable payload is available, install it on a worker without a
+compiler or model copy:
 
 ```sh
 bash scripts/install.sh --payload dist/mac-arm64
 ```
 
 The payload must match the device platform. It includes the worker binaries,
-the matching libzmq runtime, and checksums, but never a GGUF model.
-
-Then:
-
-- Worker device: run `~/potluck/potluck-node`. It advertises the node over
-  DNS-SD until stopped. Keep the default prefix on workers; the head launches
-  workers there.
-- Head device: run
-  `~/potluck/potluck-server -m ~/potluck/Qwen3.5-0.8B-Q4_0.gguf`. The head
-  discovers advertised nodes, probes and admits them, stages the platform
-  payload, creates the route shards, and sends each worker only its assigned
-  windows over SSH.
+the matching libzmq runtime, and checksums, but never a GGUF model. The head
+fetches the selected model and ensures one digest-checked complete model file
+is available on each selected device.
 
 The server binds to `0.0.0.0` by default so trusted-LAN clients can connect.
 Use `--host 127.0.0.1` (or another explicit address) to restrict the HTTP
@@ -133,34 +150,27 @@ with `POTLUCK_MODEL_HF_REPO`, `POTLUCK_MODEL_FILE`, or point at a local file
 with `POTLUCK_TEST_MODEL`.
 
 ## Measured results
-These observations are functional smoke evidence for the unfinished direct
-server implementation. They are not product benchmarks and do not satisfy the
-resource-aware piped-ring server release gate.
 
-The fixture was `Qwen3.5-0.8B-Q4_0.gguf`. The local smoke ran on an Apple M4
-with two local CPU workers. The remote smoke used an M4 head as controller and
-one Linux CPU worker advertised with `potluck-node`; it did not exercise
-heterogeneous head computation or automatic placement.
+The local integrated suite exercises the direct adjacent-peer ZeroMQ ring,
+protocol, transport, HALDA, window loading, speculative decoding, and HTTP
+paths with the Qwen3.5 0.8B fixture. The supervised three-device Gemma 3 27B
+operating point is recorded in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-| Path | Hardware | Result |
-|---|---|---|
-| `potluck-server` local ring | M4, 2 local CPU workers | Direct adjacent-peer ZeroMQ ring; two repeated windows per worker; a two-token completion returned ` located in` |
-| `potluck-server` automatic discovery | M4 head, 1 Linux CPU worker | DNS-SD discovery, scoped SSH trust-on-first-use, SSH launch, and direct ring inference succeeded; the same two-token completion returned ` located in` |
-
-These smokes establish candidate discovery and the direct server transport and
-launch boundaries only. They do not establish live profiling or admission,
-heterogeneity-aware selection and placement, shard automation, continuous
-batching, slots, resilience, public-network security, or full API parity.
+The 27B result is a measured operating point, not a speedup claim or a
+regression threshold. It includes automatic placement, repeated windows,
+model distribution, per-window synchronization, and streamed HTTP output.
+Component checks and one operating point do not establish full llama-server
+API parity.
 
 Full benchmark commands and raw output: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ## Verification scope
 
-Component correctness is checked with small model files that fit the test host.
-The current fixture is Qwen3.5 0.8B; other small fixtures may exercise a
-supported primitive. Verifying 27B correctness, performance, or
-end-to-end execution is an explicit non-goal. 27B is a deployment target, not
-an acceptance target.
+Small fixture checks establish token parity and component behavior. The
+supervised Gemma 3 27B run establishes integrated three-device operation and a
+measured performance point; it does not claim reference-token parity or a
+speedup ratio. Broader model architectures and full llama-server API parity
+remain outside this release baseline.
 
 ## Relationship to prima.cpp
 
@@ -168,14 +178,16 @@ an acceptance target.
 progenitor for distributed inference. Potluck uses its direct peer-to-peer ring
 behavior and ZeroMQ communication model. Other unresolved technical
 distributed-runtime behavior also defers to prima.cpp's documented and coded
-behavior. Potluck uses modern llama.cpp and per-window GGUF shard loading; exact
-prima wire compatibility is not required.
+behavior. Potluck uses modern llama.cpp and complete-model window loading;
+exact prima wire compatibility is not required.
 
 Prima.cpp is not the user-flow template. Potluck's usability north star is one
 easy local server: select a model, let the controller discover and operate the
 available computers, and connect an ordinary OpenAI-compatible client or agent
-harness. Users do not manage ranks, workers, topology, windows, shards, bounds,
-weights, ports, or launch commands.
+harness. Users do not manage ranks, workers, topology, windows, model files,
+bounds, weights, ports, or launch commands. The optional expert workload
+[ADR 0010](dev/decisions/0010-prima-feature-parity-baseline.md) is the single
+exception; automatic scheduling stays the default.
 
 Any new technical departure from prima.cpp requires explicit user approval and
 an accepted ADR. The complete authority order is documented in
@@ -186,33 +198,22 @@ modern inference engine and backend base.
 
 ## Current implementation gaps
 
-The direct adjacent-peer ZeroMQ ring now runs inside `potluck-server`, but its
-bootstrap and scheduling are still explicit and incomplete:
+The integrated implementation now covers the ADR 0010 feature baseline:
 
-- The current route uses two repeated disjoint windows per worker where layers
-  permit; it does not yet select windows from live heterogeneous capability or
-  current resource pressure.
-- DNS-SD candidate discovery and automatic SSH launch work, but live profiling,
-  admission, selection, placement, and topology lifecycle do not.
-- Per-window prefetch and independent CPU, CUDA, or Metal placement are not
-  implemented.
-- Shard creation, transfer, validation, selection, and caching are not
-  automated.
-- The server still serializes HTTP work instead of providing continuous
-  batching and isolated conversation slots.
-- The HTTP surface is only an OpenAI-like subset; full request, response,
-  error, usage, streaming, and cancellation parity is unfinished.
-- Worker failure handling lacks reconnect, ring rebuild, slot migration, and
-  safe retry behavior.
-- Authentication, encryption, credential handling, and tenant or prompt
-  privacy controls are unfinished. The deployment boundary remains a trusted
-  LAN.
-- The distributed graph currently targets Qwen3.5 dense (`qwen35`).
+- HALDA uses live device profiles and HiGHS to solve heterogeneous windows,
+  accelerator layers, and device exclusion.
+- Per-window prefetch, full-model distribution, lazy window loading, CPU,
+  Metal, and CUDA placement, continuous batching, isolated slots, and
+  speculative decoding use the same ring runtime.
+- `potluck-server` and `potluck-cli` share the controller, worker, scheduler,
+  model, and recovery code.
+- CURVE protects direct ring peers, and the HTTP API supports the accepted
+  bearer-key and exact-origin controls for a trusted LAN.
 
-These are not acceptable product limitations or staged release modes. The
-product is unfinished until the complete
-[ADR 0006](dev/decisions/0006-piped-ring-server-product.md) contract passes as
-one server path.
+The remaining gaps are broader llama-server API parity, wider distributed
+model and modality coverage, adaptive token-state migration after a worker
+change, and additional long-running multi-device acceptance measurements.
+These are separate release work, not alternate execution paths.
 
 ## Verification
 
@@ -230,9 +231,9 @@ bash scripts/install-git-hooks.sh
 ```
 
 The hook runs `scripts/pre-push-check.sh`: it configures a release build with
-`POTLUCK_HIGHS=OFF`, builds the required binaries with two parallel jobs, and
-runs `tests/potluck/run_all.sh`. The test model is fetched automatically from
-the pinned Hugging Face source when missing; set `POTLUCK_TEST_MODEL` to use a
+HiGHS enabled, builds the required binaries, and runs
+`tests/potluck/run_all.sh`. The test model is fetched automatically from the
+pinned Hugging Face source when missing; set `POTLUCK_TEST_MODEL` to use a
 local copy. Run the check script directly to verify the same gate without
 pushing.
 

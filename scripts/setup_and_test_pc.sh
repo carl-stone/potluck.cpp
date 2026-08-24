@@ -2,7 +2,7 @@
 # One-shot build + integrated direct-ring suite on a Linux PC.
 #
 # Run this ON the PC (Linux), from inside a potluck.cpp checkout. It builds
-# the retained potluck worker, server, and shard tools, downloads the Qwen3.5
+# the retained potluck worker and server binaries, downloads the Qwen3.5
 # fixture, and runs the whole test suite.
 #
 # Env:
@@ -36,7 +36,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     potluck_require_disk "${REPO}/build" "${POTLUCK_MIN_DISK_GIB:-10}"
 
     echo "== configuring =="
-    cmake_opts=(-DCMAKE_BUILD_TYPE=Release -DGGML_CPU=ON -DLLAMA_BUILD_TESTS=ON)
+    cmake_opts=(-DCMAKE_BUILD_TYPE=Release -DGGML_CPU=ON -DLLAMA_BUILD_TESTS=ON -DPOTLUCK_HIGHS=ON)
     NVCC="$(command -v nvcc 2>/dev/null || true)"
     if [[ -z "${NVCC}" && -x /opt/cuda/bin/nvcc ]]; then
         NVCC=/opt/cuda/bin/nvcc # Arch installs CUDA off-PATH
@@ -55,7 +55,7 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
         tail -20 /tmp/potluck_pc_cmake.log >&2; exit 2; }
     echo "== building (${NPROC} jobs) =="
     POTLUCK_BUILD_JOBS="${NPROC}" potluck_build "${REPO}/build" \
-        --target potluck-node potluck-worker potluck-server potluck-shard llama-cli test-potluck-discovery test-potluck-protocol test-potluck-transport test-potluck-qwen35-stages test-potluck-run \
+        --target potluck-node potluck-worker potluck-server potluck-cli llama-cli test-potluck-discovery test-potluck-protocol test-potluck-probe test-potluck-transport test-potluck-halda test-potluck-qwen35-stages test-potluck-run \
         >/tmp/potluck_pc_build.log 2>&1 || {
         tail -20 /tmp/potluck_pc_build.log >&2; exit 2; }
     echo "build ok"
@@ -73,4 +73,4 @@ export REPO="${REPO}"
 export BIN="${REPO}/build/bin"
 export MODEL="${MODEL_PATH}"
 export N_PREDICT HOST
-bash "${REPO}/tests/potluck/run_all.sh" 2>&1 | tail -20
+bash "${REPO}/tests/potluck/run_all.sh"

@@ -75,7 +75,7 @@ cmake_opts=(
     -DLLAMA_BUILD_TESTS=OFF
     -DLLAMA_BUILD_EXAMPLES=OFF
     -DLLAMA_BUILD_APP=OFF
-    -DPOTLUCK_HIGHS=OFF
+    -DPOTLUCK_HIGHS=ON
     -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
     '-DCMAKE_INSTALL_RPATH=$ORIGIN'
 )
@@ -92,14 +92,12 @@ if command -v nvidia-smi >/dev/null 2>&1 && [[ -n "${nvcc}" ]]; then
 fi
 potluck_require_disk "${build_dir}" "${POTLUCK_MIN_DISK_GIB:-10}"
 cmake -S "${REPO}" -B "${build_dir}" "${cmake_opts[@]}"
-potluck_build "${build_dir}" --target potluck-node potluck-worker potluck-shard
+potluck_build "${build_dir}" --target potluck-node potluck-worker
 
 worker="${build_dir}/bin/potluck-worker"
 node="${build_dir}/bin/potluck-node"
-shard="${build_dir}/bin/potluck-shard"
 [[ -x "${worker}" ]] || die "missing worker binary: ${worker}"
 [[ -x "${node}" ]] || die "missing node binary: ${node}"
-[[ -x "${shard}" ]] || die "missing shard binary: ${shard}"
 
 readelf_tag() {
     readelf -d "$1" | awk -v tag="$2" '
@@ -160,11 +158,10 @@ trap cleanup EXIT
 
 cp "${node}" "${staging_dir}/potluck-node"
 cp "${worker}" "${staging_dir}/potluck-worker"
-cp "${shard}" "${staging_dir}/potluck-shard"
 cp "${zmq_path}" "${staging_dir}/libzmq.so.5"
-chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"
+chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"
 
-shipped_files=(potluck-node potluck-worker potluck-shard libzmq.so.5)
+shipped_files=(potluck-node potluck-worker libzmq.so.5)
 zmq_needs() {
     readelf_tag "$1" NEEDED
 }
@@ -195,14 +192,14 @@ if [[ -n "${sodium_path}" || -n "${sodium_soname}" ]]; then
     shipped_files+=("${sodium_name}")
 fi
 
-for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"; do
+for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"; do
     zmq_needed="$(zmq_needs "${binary}" | awk '/^libzmq\.so/ { print; exit }')"
     if [[ -n "${zmq_needed}" && "${zmq_needed}" != "libzmq.so.5" ]]; then
         die "binary expects ${zmq_needed}, payload ships libzmq.so.5: ${binary}"
     fi
 done
 for staged in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" \
-    "${staging_dir}/potluck-shard" "${staging_dir}/libzmq.so.5"; do
+    "${staging_dir}/libzmq.so.5"; do
     if (cd "${staging_dir}" &&
         LD_LIBRARY_PATH="${staging_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
             ldd "$(basename "${staged}")" | grep -q 'not found'); then
@@ -226,7 +223,7 @@ if [[ -e "${out_dir}" ]]; then
     for entry in "${out_dir}"/* "${out_dir}"/.[!.]*; do
         [[ -e "${entry}" || -L "${entry}" ]] || continue
         case "$(basename "${entry}")" in
-            potluck-node|potluck-worker|potluck-shard|libzmq.so.5|libsodium.so.*|potluck-build-id)
+            potluck-node|potluck-worker|libzmq.so.5|libsodium.so.*|potluck-build-id)
                 ;;
             *)
                 die "refusing to replace non-payload output directory: ${out_dir}"

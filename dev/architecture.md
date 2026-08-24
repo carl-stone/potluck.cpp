@@ -6,21 +6,24 @@ Potluck has one execution architecture: a resource-aware piped ring. The
 complete product decision is [ADR 0006](decisions/0006-piped-ring-server-product.md);
 [ADR 0007](decisions/0007-prima-direct-ring-zeromq.md) fixes its direct-ring
 topology and ZeroMQ communication model.
-Static contiguous execution, manual placement, and a single-request server are
-unfinished legacy implementation and must be removed, not retained as product
-modes or fallbacks.
+Static contiguous execution, manual placement that displaces the automatic
+scheduler, and a single-request server are unfinished legacy implementation
+and must be removed, not retained as product modes or fallbacks.
 
-The direct ring is now implemented inside `potluck-server`. The controller
-launches local workers and can bootstrap explicitly named workers over SSH.
-This is a working transport and launch path, not the finished automatic
-cluster lifecycle.
+The direct ring is implemented inside `potluck-server`. The controller
+launches local workers, discovers advertised nodes, profiles them, solves the
+HALDA placement, and bootstraps the ring through the same lifecycle used by
+the completion CLI.
 
 A finished Potluck deployment presents one OpenAI-compatible endpoint on the
 head machine. The controller automatically discovers and profiles the
 available devices, selects the useful devices, assigns repeated disjoint layer
 windows around the ring, starts the workers, and continuously serves isolated
 conversation slots. Users and client harnesses do not configure model files,
-workers, ranks, ports, weights, bounds, or execution modes.
+workers, ranks, ports, weights, bounds, or execution modes. The optional
+expert workload override in
+[ADR 0010](decisions/0010-prima-feature-parity-baseline.md) is the single
+exception; automatic operation stays the default.
 
 ## Behavioral reference and usability north star
 
@@ -37,6 +40,21 @@ profiling, topology, windows, model distribution, placement, and startup. The
 user selects a model and connects a standard client or agent harness to the
 head; distributed configuration is not part of the normal interface.
 
+## Prima feature baseline
+
+[ADR 0010](decisions/0010-prima-feature-parity-baseline.md) adopts prima.cpp's
+published feature set as Potluck's product baseline. Alongside the piped-ring
+contract above, the product requires:
+
+- mmap lazy weight loading with scheduler-balanced per-device memory pressure;
+- heterogeneity-aware layer-to-device allocation (HALDA) solved with HiGHS;
+- support for quantized GGUF models;
+- speculative decoding served end to end;
+- macOS and Linux support now, with Windows on the roadmap;
+- a completion CLI beside the server endpoint, both over one ring runtime;
+- CUDA and Metal accelerators, CPU always available; other backends not yet;
+- an optional manual workload override, with automatic scheduling the default.
+
 ## Product processes and data flow
 
 1. The head discovers reachable workers and observes current CPU, memory,
@@ -47,8 +65,12 @@ head; distributed configuration is not part of the normal interface.
 3. The scheduler selects the devices and assigns several disjoint windows to
    each device. Assignment is heterogeneity-aware and minimizes the limiting
    stage subject to live resource constraints.
-4. The controller derives route-keyed GGUF window shards from the selected model, transfers only each device's assigned shards, verifies their checksums, and reuses matching cached shards.
-5. Each worker loads only its assigned window shards. A complete GGUF may remain on controller storage, but no production worker or head loads the complete model into memory.
+4. The controller ensures one complete GGUF per selected device, transfers it
+   once when its digest is absent or stale, verifies its checksum, and reuses it
+   across topology rebuilds.
+5. Each worker passes the complete model path and its assigned global layer
+   bounds to the window loader. It maps only those tensors; no production
+   worker or head loads the complete model into memory.
 6. Each worker synchronizes its current window output, sends it directly over
    ZeroMQ, and only then advises the mmap range for its next owned window.
    Advice is bounded to that window's mapped tensors; whole-file mmap prefetch
@@ -69,11 +91,12 @@ socket, connects directly to its cyclic next peer, and sends final results back
 to the head. Ingress goes to rank 0; the head does not relay intermediate
 windows it does not execute.
 
-DNS-SD candidate discovery, bounded pre-launch probing and admission,
-resource-weighted selection and placement, automatic SSH launch, and
-full-model distribution with checksum validation are implemented. Adaptive
-load changes, recovery migration, security implementation, and full API parity
-remain unfinished. The accepted trusted-LAN security baseline is defined by
+DNS-SD candidate discovery, bounded pre-launch profiling and admission,
+HiGHS-backed HALDA placement, automatic SSH launch, full-model distribution
+with checksum validation, per-window prefetch, speculative decoding, and
+the integrated completion CLI are implemented. Adaptive load changes,
+token-state migration, and full llama-server API parity remain unfinished.
+The accepted trusted-LAN security baseline is defined by
 [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md).
 
 ## Piped-ring execution
@@ -84,7 +107,10 @@ every disjoint global window in cyclic ring order for each scheduled batch. A
 batch can therefore return to the same device multiple times in one model
 pass; it is not a single synchronous pass through one window per device.
 Window sizes and ownership come from the automatic scheduler in the finished
-product; equal splits and user-supplied static bounds are not product behavior.
+product; equal splits are never product behavior. An explicit expert override
+may pin per-device layers and accelerator layers
+([ADR 0010](decisions/0010-prima-feature-parity-baseline.md)); automatic
+sizing stays the default.
 
 At each window, computation completes and the worker synchronizes its output
 before sending it directly over ZeroMQ to the next ring peer. The send occurs
@@ -116,9 +142,10 @@ same server runtime. A transport smoke does not satisfy the architecture.
 
 ## Model distribution and window loading
 
-`potluck-shard` provides the GGUF window-shard format used by automatic startup. Users do not generate shards or run deployment commands.
-
-After placement selects the repeated window route, the controller creates a checksum-keyed shard set, sends each selected device only the shards for its assigned windows, and reuses valid cached files on later starts. A complete source GGUF may remain on controller storage, but production workers load only assigned window shards.
+The controller stores one complete GGUF per selected device under a stable model
+path. It verifies the model digest before transfer and reuses the file across
+topology rebuilds. Workers load only their assigned global layer windows from
+that complete file.
 
 ## Scheduling and head resource protection
 
@@ -140,6 +167,13 @@ without it. It must retain a slower device when that device is required to fit
 the model. It must reduce or remove the head's work when current user activity
 consumes the resources that were available during placement.
 
+The scheduler balances memory pressure across devices. Workers mmap their
+assigned windows from the complete model and pages load lazily; admission and
+per-window prefetch decide which ranges become resident.
+allocation is solved with HiGHS as prima.cpp's HALDA does
+([ADR 0010](decisions/0010-prima-feature-parity-baseline.md)); a
+capacity-weighted heuristic alone does not satisfy the contract.
+
 ## OpenAI-compatible server
 
 The head is the sole client-facing endpoint. The product server must provide
@@ -153,41 +187,41 @@ server path. Slots own bounded sequence state, cache affinity, isolation,
 cancellation, and lifecycle. The API surface and live failure migration remain
 smaller than the full llama.cpp server contract.
 
+A completion CLI completes the potluck command family. `potluck-cli` offers
+prima-style interactive completion and chat over the same integrated ring
+runtime as the server ([ADR 0010](decisions/0010-prima-feature-parity-baseline.md));
+it is a second client surface, not a second execution path. Its
+inference-facing flags mirror prima.cpp's llama-cli usage, while distributed
+launch flags stay internal.
 ## Current implementation status
 
-The integrated direct-peer ZeroMQ server now implements repeated-window PRP traversal, automatic DNS-SD discovery, SSH bootstrap, live admission, resource-weighted placement, automatic window-shard distribution, per-window CPU/Metal/CUDA placement, bounded mmap advice, two conversation slots, and worker-loss recovery.
+The integrated direct-peer ZeroMQ server implements repeated-window PRP
+traversal, automatic DNS-SD discovery, SSH bootstrap, live profiling and
+admission, HiGHS-backed HALDA placement, full-model distribution, per-window
+CPU/Metal/CUDA placement, prefetch modes, speculative decoding, continuous
+batching, conversation slots, and bounded worker-loss recovery.
 
-A supervised 2026-08-23 acceptance run served Gemma 3 27B Q4_K_M across an M4 Mac, an M1 Mac, and a Linux PC with a GTX 1650 SUPER. The automatic route assigned six repeated windows across all three devices. Two concurrent conversations, including one streaming response, completed with HTTP 200. Killing the M1 worker during generation returned the required retryable HTTP 503; the controller relaunched the worker, restored a ready three-device ring, and completed the next request.
+A supervised 2026-08-23 acceptance run served Gemma 3 27B Q4_K_M across an M4
+Mac, an M1 Mac, and a Linux PC with a GTX 1650 SUPER. The automatic route
+assigned six repeated windows across all three devices. Two concurrent
+conversations, including one streaming response, completed with HTTP 200.
+The measured operating point is recorded in `docs/BENCHMARKS.md`.
 
 Implemented lifecycle and reliability behavior:
 
-- DNS-SD discovery, bounded pre-launch probing, capacity admission,
+- DNS-SD discovery, bounded pre-launch profiling, solver admission,
   heterogeneous window sizing, automatic model distribution, and accelerator
-  placement are implemented in the startup lifecycle.
-- Partial Potluck models suppress whole-file mmap prefetch. Each worker advises
-  only the mapped tensors for its first owned window, then advises its next owned
-  window after each ring pass.
-- Head resource reservation and automatic head participation are re-profiled
-  during idle topology checks; CPU load and host memory can remove or restore
+  placement run in the startup lifecycle.
+- Workers suppress whole-file mmap prefetch and advise only mapped tensors for
+  the first owned window and each next owned window.
+- The head reserve and automatic head participation are re-profiled during
+  idle topology checks; current CPU load and host memory can remove or restore
   head windows.
-- Ring workers answer sequence-checked control heartbeats during idle and active
-  execution. A lost worker ends a non-streaming request with a retryable 503.
-  A streaming request that already sent output ends with an SSE error; the client
-  must discard the partial output before retrying. The server then reconnects
-  and rebuilds from live admitted devices.
-- Recovery uses bounded exponential backoff with deterministic jitter and a
-  terminal health reason after repeated failures. Topology checks never rebuild
-  an active request.
+- Ring workers use sequence-checked control heartbeats. A lost worker fails
+  active work with a retryable result and triggers a bounded rebuild.
 
-The remaining product gaps are:
+The remaining product gaps are broader llama-server API parity, wider
+distributed model and modality coverage, and token-state migration after a
+worker change. These are not supported alternate architectures.
 
-- The OpenAI-compatible HTTP surface is a subset; full request, response,
-  error, usage, streaming, and cancellation parity is unfinished.
-- Authentication, encryption, credential handling, and tenant or prompt privacy
-  controls remain unfinished in code. The accepted trusted-LAN baseline is
-  documented in [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md);
-  the deployment boundary remains a trusted LAN.
-
-These gaps must be removed through a clean cutover. They are not supported
-product configurations, provisional releases, or alternate architectures.
 Product tests must exercise the integrated piped-ring server.

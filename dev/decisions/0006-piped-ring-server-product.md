@@ -6,6 +6,10 @@
 - Supersedes: the download and storage restriction in ADR 0002
 - Transport and ring topology amended by:
   [ADR 0007](0007-prima-direct-ring-zeromq.md)
+- Manual workload controls and the client-surface boundary are amended by:
+  [ADR 0010](0010-prima-feature-parity-baseline.md)
+- Model storage and loading are amended by:
+  [ADR 0013](0013-full-model-per-device.md)
 
 ## Context
 

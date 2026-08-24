@@ -55,6 +55,12 @@ struct ring_window {
     int32_t n_gpu_layers = -1;
 };
 
+enum class prefetch_mode : uint8_t {
+    off = 0,
+    advise = 1,
+    force = 2,
+};
+
 struct node_config {
     uint32_t n_workers = 0;
     uint32_t index = 0;
@@ -62,9 +68,12 @@ struct node_config {
     uint32_t n_ctx = 0;
     uint32_t n_seq_max = 1;
     uint32_t n_ubatch = 512;
+    uint32_t n_rs_seq = 0;
     uint32_t seed = 0;
     float temp = 0.0f;
     float top_p = 0.0f;
+    prefetch_mode prefetch = prefetch_mode::advise;
+    uint32_t n_cycles = 1;
     std::vector<ring_window> windows;
 };
 
@@ -92,7 +101,7 @@ bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
                                  std::vector<worker_bench_metrics> & metrics,
                                  std::string & error);
 
-// Accelerator capability a worker reports before ring configuration.
+// Device capability a worker reports before ring configuration.
 enum class accel_kind : uint8_t {
     none = 0,
     metal = 1,
@@ -100,18 +109,32 @@ enum class accel_kind : uint8_t {
     other = 3,
 };
 
-struct accel_profile {
+enum class os_kind : uint8_t {
+    none = 0,
+    macos = 1,
+    linux_os = 2,
+};
+
+struct device_profile {
     uint32_t rank = 0;
     accel_kind kind = accel_kind::none;
     uint64_t free_bytes = 0;
     uint64_t total_bytes = 0;
     uint64_t host_free_bytes = 0;
     uint64_t host_total_bytes = 0;
+    os_kind os = os_kind::none;
+    std::vector<float> cpu_gflops;
+    std::vector<float> accel_gflops;
+    float mem_copy_delay_ms = 0.0f;
+    float accel_copy_delay_ms = 0.0f;
+    float disk_read_seq_gbps = 0.0f;
+    float disk_read_rnd_gbps = 0.0f;
+    uint32_t n_cpu_threads = 0;
 };
 
-bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & out);
-bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & profile,
-                          std::string & error);
+bool encode_device_profile(const device_profile & profile, std::vector<uint8_t> & out);
+bool decode_device_profile(const uint8_t * data, size_t size, device_profile & profile,
+                           std::string & error);
 
 struct slot_config {
     int32_t seq = 0;
@@ -145,10 +168,13 @@ bool decode_config(const uint8_t * data, size_t size, node_config & config, std:
 // A batch carries positions and sequence ids plus tokens or hidden states.
 // clear_seq clears one sequence (-2 clears all, -1 clears none); trim_to
 // truncates trim_seq when non-negative, and n_logits selects trailing rows.
+// Draft tokens and accepted_count are propagated with each hop.
 // A non-empty clear_seq batch may have zero entries for clear-only cleanup.
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
                           const std::vector<int32_t> & tokens,
+                          const std::vector<int32_t> & draft_tokens,
+                          uint32_t accepted_count,
                           const float * hidden, size_t n_embd,
                           int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
                           uint32_t n_logits,
@@ -162,6 +188,8 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
                           std::vector<int32_t> & pos,
                           std::vector<int32_t> & seq,
                           std::vector<int32_t> & tokens,
+                          std::vector<int32_t> & draft_tokens,
+                          uint32_t & accepted_count,
                           std::vector<float> & hidden,
                           std::string & error);
 

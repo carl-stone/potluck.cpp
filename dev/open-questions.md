@@ -16,18 +16,23 @@ memory, and accelerator use leaves the user's reserved capacity available.
 The product requires direct peer-to-peer piped-ring execution over ZeroMQ,
 automatic profiling and device selection, heterogeneity-aware window
 placement, per-window prefetch, assigned-window model loading,
-per-device CPU/CUDA/Metal placement, continuous batching, and isolated
-conversation slots. These requirements are one release gate. The current
-server implements profiling, admission, placement, distribution, batching,
-and slots; per-window prefetch remains intentionally unimplemented.
-Admission keeps every assigned window resident on its device, so a full-file
-copy is sufficient for the current schedule. Coordinated per-window prefetch
-remains a release-gate requirement.
+per-device CPU/CUDA/Metal placement, continuous batching, isolated
+conversation slots, speculative decoding, HiGHS-solved HALDA placement,
+quantized-model support, and a potluck completion CLI beside the server
+endpoint ([ADR 0010](decisions/0010-prima-feature-parity-baseline.md)).
+These requirements are one release gate. The integrated server now implements
+profiling, admission, HALDA placement, distribution, per-window prefetch,
+continuous batching, slots, speculative decoding, and the completion CLI. The
+remaining status below separates implemented behavior from release evidence
+and broader llama-server API coverage.
 
-Static execution, manual placement, one-request serving, and separate CLI
-implementations of ring or batching are conflicting legacy code. They must be
-removed through a clean cutover, not preserved as diagnostics, fallbacks,
-compatibility modes, experiments, or provisional releases.
+Static execution, manual placement that displaces the automatic scheduler,
+one-request serving, and separate CLI implementations of ring or batching are
+conflicting legacy code. They must be removed through a clean cutover, not
+preserved as diagnostics, fallbacks, compatibility modes, experiments, or
+provisional releases. The optional expert workload override in
+[ADR 0010](decisions/0010-prima-feature-parity-baseline.md) is not such a
+displacement; automatic operation stays the default.
 
 Automatic setup and deployment remain required so a user does not manage model
 files, ports, bounds, ranks, workers, or SSH. The initial security boundary is
@@ -73,41 +78,36 @@ Status labels:
 
 ## Executive boundary
 
-The current source is unfinished and cannot be shipped as Potluck. The
-implemented `potluck-server` path owns a direct adjacent-peer ZeroMQ ring,
-automatic pre-launch admission, resource-weighted windows, model distribution,
-continuous batching, slots, and a bounded rebuild path.
+The ADR 0010 feature baseline is implemented in the integrated `potluck-server`
+and `potluck-cli` runtime. This matrix tracks remaining compatibility scope and
+release evidence; `PRESENT` does not mean that every large acceptance scenario
+has been rerun on every platform.
 
 | Area | Required product behavior | Current source | Status |
 |---|---|---|---:|
-| Distributed execution | Piped ring only; several disjoint windows per selected device | `potluck-server` direct adjacent-peer ZeroMQ ring; repeated windows per worker where layers permit | PRESENT |
-| Window placement | Automatic heterogeneous placement from live capability and resource pressure | Pre-launch probes size windows from usable accelerator/host capacity; in-ring profiles choose offload | PRESENT |
-| Device profiling and selection | Automatic discovery, profiling, admission, and exclusion in the server lifecycle | DNS-SD candidates are probed before launch; failed and insufficient candidates are excluded | PRESENT |
-| Head participation | Optional worker after reserving for current user CPU, memory, and accelerator use | Head probes itself, reserves memory, and joins when its budget is useful | PARTIAL |
-| Prefetch | Next assigned window coordinated with ring execution | Per-window prefetch is not implemented | MISSING |
-| Accelerator placement | Independent CPU/CUDA/Metal decision per device and window | In-ring profiles drive per-window CPU/CUDA/Metal offload | PRESENT |
-| Model loading | Load only assigned layer windows from a controller-distributed full GGUF | Controller transfers and checksums the full model; workers load assigned windows only | PRESENT |
-| Worker bootstrap | Automatic local and remote startup with readiness and topology lifecycle | Local/SSH launch, readiness, checksum reuse, and startup rebuild callback are implemented | PARTIAL |
+| Distributed execution | Piped ring only; several disjoint windows per selected device | `potluck-server` direct adjacent-peer ZeroMQ ring with repeated PRP windows | PRESENT |
+| Window placement | Automatic heterogeneous placement from live capability and resource pressure | HiGHS-backed HALDA placement with live profiles and solver-owned exclusion | PRESENT |
+| Device profiling and selection | Automatic discovery, profiling, admission, and exclusion in the server lifecycle | DNS-SD candidates are profiled before launch; hard failures are rejected and HALDA removes weak devices | PRESENT |
+| Head participation | Optional worker after reserving for current user CPU, memory, and accelerator use | Head reserve and participation are part of profile refresh and placement | PRESENT |
+| Prefetch | Next assigned window coordinated with ring execution | `off`, `advise`, and `force` modes advise the next mapped window after send | PRESENT |
+| Accelerator placement | Independent CPU/CUDA/Metal decision per device and window | HALDA and in-ring profiles select per-window offload | PRESENT |
+| Model loading | Load only assigned layer windows from a controller-distributed full GGUF | One digest-checked full model per device; workers map assigned windows only | PRESENT |
+| Worker bootstrap | Automatic local and remote startup with readiness and topology lifecycle | Local/SSH launch, readiness, discovery, checksum reuse, and bounded rebuild are implemented | PRESENT |
 | Continuous batching | Active HTTP requests scheduled together through the ring | Scheduler merges prompt and decode rows into one ring pass | PRESENT |
-| Conversation slots | Isolated state, identity, cache affinity, cancellation, and lifecycle | Bounded slots with per-sequence KV, cancellation, and reuse | PRESENT |
-| Client server | OpenAI-compatible contract on the ring head | Completion/chat, streaming, models, health, sampling, and explicit field rejection | PARTIAL |
-| Resilience | Reconnect, ring rebuild, migration, and safe retry | One reset/reprobe/relaunch rebuild with 30-second backoff; migration/retry are missing | PARTIAL |
-| Security | Authenticated and encrypted deployment with privacy controls | SSH trust is scoped; ring authentication, encryption, and privacy controls are unfinished | MISSING |
+| Conversation slots | Isolated state, identity, cache affinity, cancellation, and lifecycle | Bounded slots carry per-sequence KV and speculative state | PRESENT |
+| Client server | OpenAI-compatible contract on the ring head | Completion/chat, streaming, models, health, sampling, errors, auth, and explicit field rejection | PARTIAL |
+| Resilience | Reconnect, ring rebuild, migration, and safe retry | Bounded reset, reprobe, relaunch, and retryable failure; token migration remains missing | PARTIAL |
+| Security | Authenticated and encrypted deployment with privacy controls | CURVE ring credentials, bearer HTTP auth, exact-origin CORS, and trusted-LAN boundary | PARTIAL |
 
-The local two-worker CPU smoke passed. An M4 head also automatically discovered
-one Linux CPU worker through DNS-SD, accepted its key in the Potluck-specific
-SSH trust file, launched it, and returned the two-token completion ` located in`.
-The server logged windows `[0,12)` and `[12,24)`. The remote smoke did not
-demonstrate heterogeneous placement or head computation.
+The local integrated suite and the supervised 27B run provide named evidence
+for the direct ring, HALDA placement, full-model loading, per-window
+prefetch, batching, slots, speculative decoding, quantized inference, and
+the HTTP server. The 27B operating point is recorded in
+[`docs/BENCHMARKS.md`](../docs/BENCHMARKS.md).
 
-The three-device fixture smoke now discovers and admits the M1 Metal worker and
-the Linux CUDA worker automatically. It formed four windows `[0,6)`, `[6,12)`,
-`[12,18)`, and `[18,24)`, loaded two windows on each worker, and returned
-` Paris.\n` for a three-token completion. Worker logs report Metal on the M1
-and CUDA on the PC, with no tensor-buffer failure. The head reserved its
-resources and did not participate in this run. These checks prove discovery,
-heterogeneous placement, model distribution, and the direct server path; they
-do not prove prefetch, adaptive head participation, migration, or security.
+These checks do not establish every broader llama-server endpoint or token
+migration behavior. The release-gate list below remains the authoritative
+record of scenarios that still need platform-specific evidence.
 
 ## 1. Current potluck server contract
 
@@ -139,8 +139,8 @@ checks.
 | Request | Accepted fields | Behavior that is not present |
 |---|---|---|
 | `POST /completion` | `prompt`, `n_predict`, `stream`, `temperature`, `top_p`, `top_k`, `seed` | Token arrays, mixed prompt parts, multiple prompts, cache reuse, stop strings, grammar, probabilities, timings, token returns, multimodal data |
+| `POST /v1/completions` | `model`, `prompt`, `n`, `max_tokens`, `max_completion_tokens`, `stop`, `stream`, sampling controls, penalties, and logprobs | Full OpenAI completion fields, prompt arrays, streaming usage, and cancellation |
 | `POST /v1/chat/completions` | `messages`, `max_tokens`, `stream`, `reasoning_effort`, `temperature`, `top_p`, `top_k`, `seed` | Full OpenAI chat fields, model validation, `n`, stop, response formats, tools, multimodal content, reasoning parsing/control, cancellation |
-
 Unknown JSON fields are rejected explicitly with HTTP 400.
 
 ### Response fields currently implemented
@@ -164,9 +164,9 @@ always useful for every model.
 
 | Endpoint family | llama.cpp / prima capability | Potluck status | Required work or boundary |
 |---|---|---:|---|
-| `GET /health`, `GET /v1/health` | Public readiness endpoint; 503 while loading and 200 when ready | PARTIAL | `/health` is present only after startup; add `/v1/health` and loading/degraded states |
+| `GET /health`, `GET /v1/health` | Public readiness endpoint; 503 while loading and 200 when ready | PARTIAL | `/health` reports loading, rebuilding, and failed states after startup; `/v1/health` and listen-while-loading remain missing |
 | `POST /completion` | Rich llama.cpp completion API | PARTIAL | Keep route, add request/response contract or return explicit unsupported errors |
-| `POST /v1/completions` | OpenAI-compatible text completion | MISSING | Add route and OpenAI completion response/SSE shape |
+| `POST /v1/completions` | OpenAI-compatible text completion | PARTIAL | Route and non-stream response/logprobs shape exist; add the remaining OpenAI fields and streaming parity |
 | `POST /v1/chat/completions` | OpenAI chat, streaming and broad request fields | PARTIAL | Add field validation, sampling, structured output, tools, reasoning, multimodal, cancellation |
 | `GET /v1/models` | Model metadata, aliases, capabilities | PARTIAL | Add metadata/capability fields and aliases; add multi-model routing only if selected |
 | `POST /tokenize` | Token IDs and optional pieces | MISSING | Add text/token input options and piece-safe output |
@@ -177,7 +177,7 @@ always useful for every model.
 | `POST /v1/embeddings` | OpenAI embeddings | MISSING | Add input arrays, encoding format, usage, and embedding model validation |
 | `POST /rerank`, `/reranking`, `/v1/rerank`, `/v1/reranking` | Reranking model endpoint | MISSING | Add rank pooling and distributed reranker support |
 | `POST /infill` | FIM/code infill | MISSING | Add FIM token construction, extra files, and completion options |
-| `GET /props` | Inspect model, template, modalities, defaults, build info | MISSING | Add read-only property snapshot |
+| `GET /props` | Inspect model, template, modalities, defaults, build info | PARTIAL | Read-only model, template, slot, and health properties exist; add the remaining metadata fields |
 | `POST /props` | Change selected global properties when enabled | MISSING | Define safe mutable properties and concurrency rules |
 | `GET /slots` | Per-slot state, parameters, and timing | MISSING | Add slot model before exposing this route |
 | `POST /slots/{id}?action=save` | Save slot KV/prompt cache | MISSING | Define portable distributed slot serialization |
@@ -223,20 +223,20 @@ the worker configuration. It does not expose these controls per request.
 
 | Feature family | Included baseline controls | Potluck status |
 |---|---|---:|
-| Temperature, top-p, top-k, min-p | Basic distribution controls | PARTIAL; temp/top-p startup defaults only |
-| Seed and sampler order | Reproducibility and ordered sampler chain | PARTIAL; seed startup only; fixed worker sampler |
+| Temperature, top-p, top-k, min-p | Basic distribution controls | PRESENT |
+| Seed and sampler order | Reproducibility and ordered sampler chain | PARTIAL; seed is request-local, sampler order is fixed |
 | Typical, top-n-sigma, adaptive-p, dynamic temperature | Advanced distribution controls | MISSING |
 | Mirostat | Mirostat 1/2, tau, eta | MISSING |
-| Repeat/presence/frequency penalties | Repetition control | MISSING |
+| Repeat/presence/frequency penalties | Repetition control | PRESENT |
 | DRY and XTC | Repetition and tail-crossing samplers | MISSING |
-| Ignore EOS and stop strings | Generation termination controls | MISSING |
+| Ignore EOS and stop strings | Generation termination controls | PARTIAL; stop strings are request-local, ignore-EOS is missing |
 | Logit bias | Token/string bias and bans | MISSING |
 | Grammar / JSON schema | Constrained decoding | MISSING |
 | Backend sampling | Backend-side sampler execution | MISSING |
-| `n`, `n_predict`, `max_tokens` | Completion count and token limit | PARTIAL; one count, route-specific limit |
+| `n`, `n_predict`, `max_tokens` | Completion count and token limit | PRESENT |
 | Time limits and indentation | FIM/time-bounded generation controls | MISSING |
 | Request LoRA scales | Per-request adapter selection | MISSING |
-| Speculative decoding | Draft model, draft count, acceptance settings | MISSING; no product-server integration |
+| Speculative decoding | Draft model, draft count, acceptance settings | PRESENT; draft state and CLI/server options are integrated |
 | Lookup decoding | Static/dynamic lookup caches | MISSING |
 
 ### Structured output, tools, and modalities
@@ -285,7 +285,7 @@ the worker configuration. It does not expose these controls per request.
 | Prometheus metrics | Queue, slot, token, and speculative counters | MISSING |
 | Slot save/restore/erase | Persistent KV state | MISSING |
 | Model loading states | Listen while loading and report 503 | MISSING; startup blocks before listen |
-| Runtime properties | Inspect/change safe global defaults | MISSING |
+| Runtime properties | Inspect/change safe global defaults | PARTIAL; read-only `/props` is present |
 
 Prompt-cache reuse, context eviction, request retry, and metrics are separate
 server features. They must not reintroduce the old single-chain reset path.
@@ -305,12 +305,12 @@ the worker configuration:
 | Model loading | mmap/mlock/direct I/O/load mode, NUMA, tensor checks/overrides | MISSING or fixed by worker |
 | Device selection | Device list, tensor buffer overrides, split mode, tensor split, main GPU, fit | PARTIAL; one derived per-window GPU layer count |
 | MoE controls | CPU MoE and per-layer CPU MoE | MISSING |
-| Model acquisition | Local path only | MISSING URL, Hugging Face, Docker source, cache, offline policy |
+| Model acquisition | Local path, Hugging Face repo/file, cache, and offline mode | PARTIAL; Docker source and broader acquisition policy are missing |
 | Adapters | LoRA and control vectors | MISSING |
 | Logging | Log file, levels, colors, timestamps, prefixes | PARTIAL; basic process output only |
 | HTTP runtime | HTTP thread count, timeout, SSE ping interval, body/API controls | MISSING or library defaults |
-| CORS | Configurable origins, methods, headers, credentials | MISSING; wildcard headers are hard-coded |
-| TLS and authentication | SSL certificate/key, API key/file | MISSING |
+| CORS | Configurable origins, methods, headers, credentials | PRESENT; one exact configured origin is supported |
+| TLS and authentication | SSL certificate/key, API key/file | PARTIAL; API-key auth is present, TLS remains external |
 | Static web UI | Configurable static path, UI configuration | MISSING |
 | Agent/MCP tools | Built-in tools, MCP proxy/config, tool runtime | MISSING and intentionally unsafe to enable by default |
 | Model router | Models directory/presets, load/unload, multi-model dispatch | MISSING |
@@ -321,66 +321,69 @@ remain gaps whenever the product claim is "use potluck like llama-server".
 ## 6. Prima.cpp distributed-runtime comparison
 
 Prima's distributed runtime is a separate baseline from its HTTP API. Potluck
-now implements the core automatic controller path, while live load adaptation,
-prefetch, migration, and full API parity remain incomplete.
+implements the required automatic controller path in one integrated runtime.
+The table records compatibility boundaries and remaining evidence, not
+alternate execution modes.
 
 | Prima capability or option family | Potluck implementation | Status | Notes |
-|---|---|---:|---|
-| Multi-device layer pipeline | Direct adjacent-peer ring with repeated disjoint windows sized from live capacity | PRESENT | Startup route is heterogeneous and resource weighted |
+|---|---|---|---|
+| Multi-device layer pipeline | Direct adjacent-peer ring with repeated disjoint windows sized from live capacity | PRESENT | HALDA solves the startup route |
 | Full-model greedy reference | Optional test-only fixture comparison | TEST ONLY | Correctness evidence; never product loading |
 | Piped-ring execution | `potluck-server` workers connect directly to cyclic next peers over ZeroMQ | PRESENT | Head ingress goes to rank 0 and final results return to the head |
-| Worker discovery/peer topology | DNS-SD candidates, scoped SSH trust-on-first-use, SSH launch, and cyclic endpoints | PARTIAL | Admission and bounded rebuild exist; live migration remains missing |
+| Worker discovery/peer topology | DNS-SD candidates, scoped SSH trust-on-first-use, SSH launch, and cyclic endpoints | PARTIAL | Rebuild is bounded; token migration remains missing |
 | `--world`, `--rank`, `--master`, `--next`, `--data-port` | Not user-facing server options | INTENTIONAL | Configure equivalent direct-ring topology internally |
-| Layer-window scheduling | Pre-launch probes and proportional usable-capacity route | PRESENT | Recomputed on startup and rebuild |
-| Prima `--lw` layer-window weights | No user-facing option | INTENTIONAL | Manual window weights are not a product control |
-| GPU offload | In-ring profiles choose independent CPU/CUDA/Metal window placement | PRESENT | Placement is bounded by live usable memory |
-| Device profiling | DNS-SD and local/SSH workers report pre-launch and in-ring profiles | PRESENT | Failed or insufficient candidates are excluded |
-| LP placement | No solver; deterministic capacity-weighted route | INTENTIONAL | A solver is not required for the current product path |
-| Prefetch | No coordinated per-window prefetch | MISSING | Implement prefetch in ring scheduling |
-| Scheduler cycles | Route repeats disjoint windows for a second cycle | PRESENT | Integrated with slot batching |
-| Force-prefetch policy | No user mode | INTENTIONAL | Prefetch must be automatic |
-| Master priority | Startup head reserve and automatic participation | PARTIAL | Does not adapt to changing user load |
-| Runtime device removal | Reset, reprobe, relaunch, and 30-second rebuild backoff | PARTIAL | No token-state migration or safe retry |
-| Speculative decoding | No integrated product-server path | MISSING | Separate experiments do not satisfy the contract |
+| Layer-window scheduling | HiGHS-backed HALDA placement from live profiles | PRESENT | Recomputed on startup and rebuild |
+| Prima `--lw` layer-window weights | Optional `-lw` / `--layer-window` expert override | PRESENT | Automatic scheduling remains the default |
+| GPU offload | Independent CPU/CUDA/Metal placement per device and window | PRESENT | Placement is bounded by live usable memory |
+| Device profiling | DNS-SD and local/SSH workers report pre-launch and in-ring profiles | PRESENT | Solver owns weak-device exclusion |
+| HALDA placement | Deterministic HiGHS MILP with fixed options and fixed-point set classification | PRESENT | Exact fixture coverage is in `test-potluck-halda` |
+| Prefetch | `off`, `advise`, and `force` per-window modes | PRESENT | The next mapped window is advised after send |
+| Scheduler cycles | Route repeats disjoint windows for each scheduled batch | PRESENT | Integrated with slot batching |
+| Force-prefetch policy | `--prefetch force` and `--force` | PRESENT | Forced mode is explicit expert control |
+| Master priority | `--master-priority` with automatic head reserve | PRESENT | Live refresh can remove or restore head work |
+| Runtime device removal | Reset, reprobe, relaunch, and bounded rebuild backoff | PARTIAL | Token-state migration and safe retry remain missing |
+| Speculative decoding | Draft state, tail verification, accepted-count propagation, and CLI/server options | PRESENT | Temperature-zero parity is covered by the fixture smoke |
 | Dynamic batching | HTTP slots merge prompt/decode rows through one ring pass | PRESENT | Bounded slot wait remains |
-| Sampler breadth | Tail supports temperature, top-p, top-k, and seed per slot | PARTIAL | Not the full prima/llama sampler chain |
-| Model copy behavior | Controller distributes and checksums the full GGUF on admitted devices | PARTIAL | Automatic transfer works; per-window prefetch remains missing |
+| Sampler breadth | Tail supports temperature, top-p, top-k, and seed per slot | PARTIAL | Full prima/llama sampler breadth is outside this cutover |
+| Model copy behavior | Controller distributes and checksums one complete GGUF per admitted device | PRESENT | Workers load only assigned windows |
 | Transport and data topology | Direct adjacent-peer ZeroMQ ring with a separate final-result path | PRESENT | No head relay for windows the head does not execute |
+| Completion CLI mode | `potluck-cli` shares the server's ring lifecycle and runtime | PRESENT | Supports one-shot and interactive conversation |
+| Platform support | macOS and Linux builds and discovery adapters | PRESENT | Windows remains roadmap |
+| Quantized-model support | Quantized GGUF loading and fixture inference | PRESENT | Breadth beyond the named fixtures remains evidence work |
 
 Prima-specific flag aliases are not required. Their behavioral goals are
 binding: automatic topology setup, heterogeneous ring-window placement,
 per-window prefetch, per-device accelerator placement, device selection,
 continuous batching, conversation slots, and recovery must operate through
-`potluck-server`. Explicit worker, host, and placement inputs are not the
-replacement product contract.
+`potluck-server`. Explicit worker, host, and launch inputs stay removed; the
+optional workload override accepted by
+[ADR 0010](decisions/0010-prima-feature-parity-baseline.md) is not a competing
+product contract.
 
-## 7. Security (deferred) and deployment gaps
+## 7. Security and deployment gaps
 
-Security remains unfinished. The initial product assumes a trusted home LAN,
-but that assumption does not provide authentication, encryption, or tenant
-isolation. Deployment reliability is a separate release requirement: discovery,
-capability reporting, model transfer, process startup, health, and recovery
-must work without manual network administration.
+The accepted trusted-LAN security baseline is implemented. It protects direct
+ring peers with ephemeral CURVE credentials and protects HTTP routes with an
+optional bearer key. TLS for public-network HTTP and tenant isolation remain
+outside the baseline.
 
 | Boundary | Current behavior | Status |
 |---|---|---:|
-| HTTP authentication | None | MISSING |
-| HTTP encryption | No TLS options | MISSING |
-| Worker authentication | ZeroMQ sockets have no identity or credential authentication configured | MISSING |
-| Worker encryption | ZeroMQ payloads are unencrypted; no security configuration is enabled | MISSING |
-| Model-file authorization | A worker validates its assigned model/window contract but not caller identity | PARTIAL |
-| CORS | `Access-Control-Allow-Origin: *` and fixed methods/headers | PARTIAL; not safe for credentialed clients |
-| Remote launch | Explicit batch-mode SSH bootstrap assumes trusted hosts and remote directories | PARTIAL |
-| Firewall guidance | Manual tunnel/workaround is documented | PARTIAL |
-| Secrets and API keys | No storage, rotation, or redaction policy | MISSING |
-| Prompt/privacy controls | No request logging policy or tenant isolation | MISSING |
+| HTTP authentication | Optional bearer key on every route, including health and options | PRESENT |
+| HTTP encryption | No built-in TLS; external TLS is required beyond a trusted LAN | INTENTIONAL |
+| Worker authentication | Ephemeral ZeroMQ CURVE credentials per ring generation | PRESENT |
+| Worker encryption | CURVE encrypts direct peer payloads | PRESENT |
+| Model-file authorization | Workers validate the assigned model/window contract | PARTIAL |
+| CORS | One exact configured origin; no wildcard or credentialed mode | PRESENT |
+| Remote launch | Scoped SSH trust-on-first-use and one-shot credential bootstrap | PRESENT |
+| Firewall guidance | Public-Internet exposure remains prohibited; external TLS is required | PRESENT |
+| Secrets and API keys | API keys are validated and not written to logs or persistent model files | PARTIAL |
+| Prompt/privacy controls | Trusted-LAN process boundary; tenant isolation and prompt policy remain missing | MISSING |
 
 Keep the current "never expose the service to the public Internet" warning.
-Do not call the trusted-LAN assumption a security implementation; API keys,
-TLS, worker authentication, encryption, and privacy controls remain unfinished.
 
 
-## 7.1 Proposed security architecture (resolved by ADR 0009)
+## 7.1 Accepted security architecture (ADR 0009)
 
 This section preserves the historical proposal and rationale. Carl Stone
 accepted the proposal and all four defaults on 2026-08-22. The binding decision
@@ -479,13 +482,13 @@ by a layer-window graph.
 |---|---:|
 | Qwen3.5 dense text generation | PRESENT; 0.8B fixture is the acceptance target |
 | Other text architectures | INHERITED only; no distributed-window claim |
-| Quantization breadth | PARTIAL; no complete distributed quantization matrix |
+| Quantization breadth | PARTIAL; no complete distributed quantization matrix; required by ADR 0010 |
 | Embedding-only models | MISSING in distributed server |
 | Reranker models | MISSING in distributed server |
 | Vision-language/audio/video models | MISSING in distributed server |
 | LoRA/control-vector model variants | MISSING |
 | Multi-model router | MISSING |
-| 27B correctness/performance/end-to-end acceptance | INTENTIONAL non-goal |
+| 27B correctness/performance/end-to-end acceptance | PRESENT as a supervised operating point; not a general compatibility claim |
 
 "Works in llama.cpp" and "works in a potluck distributed window" are separate
 claims. A new architecture requires a graph/window implementation and a
@@ -493,39 +496,54 @@ named acceptance check before it can be listed as supported.
 
 ## 9. Required implementation cutover
 
-The direct ring core is implemented, but no intermediate state is a Potluck
-product, supported configuration, or release. The remaining work is:
+The required implementation cutover is complete for the ADR 0010 baseline:
 
-1. Keep the direct piped-ring runtime as the only distributed execution path
-   and remove any remaining static routing, static bounds, and static tests.
-2. Extend discovery with live profiling, device admission, and heterogeneous
-   window assignment in the server lifecycle. Include current head CPU, memory,
-   accelerator pressure, and a user resource reserve.
-3. Ensure the controller distributes and checksums the full GGUF on each
-   admitted device. Workers must load only their assigned layer windows from
-   that file; normal startup must not require manually partitioned model files.
-4. Implement coordinated per-window prefetch and independent per-device,
-   per-window CPU/CUDA/Metal placement.
-5. Connect sequence IDs to bounded conversation slots and a continuous batch
-   scheduler that drives the same ring.
-6. Make the head's OpenAI-compatible request, response, error, cancellation,
-   usage, and streaming behavior operate through that scheduler.
-7. Extend local and SSH bootstrap with automatic readiness, resource changes,
-   topology rebuild, and clear recovery without exposing ranks, hosts, ports,
-   bounds, or weights.
-8. Ship controller and worker artifacts and a simple local interface that
-   forms the complete server without a source build.
+1. The direct piped-ring runtime is the only distributed execution path.
+2. Discovery, live profiling, head reserve, HALDA admission, and heterogeneous
+   window assignment run in the server lifecycle.
+3. The controller distributes and checksums one complete GGUF per device, and
+   workers load only assigned windows from it.
+4. Per-window prefetch, per-device CPU/CUDA/Metal placement, HiGHS-backed
+   HALDA allocation, continuous batching, slots, and speculative decoding
+   share one runtime.
+5. The server and completion CLI share discovery, profiling, worker launch,
+   ring startup, scheduling, and shutdown.
+6. Install scripts stage the worker artifacts and the local quick start does
+   not require a compiler or manually partitioned model files.
 
-Manual topology, static execution, standalone ring/batch tools, and manually
-applied profiling are removal targets. They must not remain in the product as
-expert, diagnostic, compatibility, or fallback modes.
+Static routing, standalone ring/batch tools, the shard toolchain, and
+manually-applied profiling are removed. Manual workload flags are expert
+constraints inside the automatic solver; they are not a separate execution
+path.
+
+Remaining work is broader HTTP API parity, wider model and modality support,
+token-state migration after worker changes, and platform-specific long-run
+acceptance evidence.
 
 ## 10. Product release gate
 
 Potluck can ship only when all ten named end-to-end checks below have their
-pass conditions observed through one server process. No release result is
-claimed here: each check is marked UNPROVEN until its complete scenario is
-observed. Resource costs are planning estimates for supervised acceptance.
+pass conditions observed through one server process. The current release
+evidence is partial: the local integrated suite and supervised 27B run cover
+named product mechanisms, but they do not cover every release-gate scenario.
+Resource costs are planning estimates for supervised acceptance.
+
+ADR 0010 widens this gate further: named checks must also cover solved HALDA
+placement, speculative decoding, quantized-model serving, the potluck
+completion CLI, and the supported-platform claims.
+
+### Evidence ledger for the 2026-08-24 completion run
+
+- **RG-02:** `build/bin/potluck-server -m /Users/carlstone/models/gemma-3-27b-it-Q4_K_M.gguf --hosts carl@192.168.1.78,carlstone@192.168.1.72 --launch ssh --head-share auto --host 0.0.0.0 --port 18089 --n-predict 16 --slots 1 --ubatch 8 --ctx 2048 --prefetch advise --spec-type ngram-simple --spec-draft-n-max 4` on 2026-08-24 returned HTTP 200 through three automatic windows `[0,6)`, `[6,16)`, and `[16,62)`. The pre-fix chat request logged `drafted=0 accepted=0`; the post-fix targeted repeated-token request logged `drafted=12 accepted=12 accept-rate=1.000` through the same three-device route. **PROVEN for the exercised operating points.**
+- **RG-03:** The same 27B command on 2026-08-24 logged changing head budgets and changing head-owned windows. It did not apply a controlled host load while a request was active. **UNPROVEN.**
+- **RG-04:** `bash tests/potluck/run_all.sh` on 2026-08-24 passed the direct PRP trace checks; the 27B command above also logged three ring workers and adjacent-window PRP traffic before HTTP 200. **PROVEN for the exercised route.**
+- **RG-05:** `bash tests/potluck/run_all.sh` on 2026-08-24 passed the no-shard and per-worker resident mapping checks; the 27B command above loaded one complete model path per worker and assigned windows. **PROVEN for the exercised route.**
+- **RG-06:** `bash tests/potluck/run_all.sh` on 2026-08-24 passed per-window prefetch checks. The 27B logs show heterogeneous device assignment, but no single run proves every CPU, Metal, and CUDA combination in this gate. **UNPROVEN.**
+- **RG-07:** `bash tests/potluck/run_all.sh` on 2026-08-24 passed the four-slot concurrency checks, but it did not exercise two isolated multi-turn conversations with follow-up affinity. **UNPROVEN.**
+- **RG-08:** `bash tests/potluck/run_all.sh` on 2026-08-24 passed four concurrent streaming requests through one server and complete SSE streams. **PROVEN for the exercised local route.**
+- **RG-09:** `bash tests/potluck/run_all.sh` on 2026-08-24 passed chat/completion, usage, streaming, stop, error, authentication, CORS, and shutdown-stream checks. It did not prove ordinary-client cancellation. **UNPROVEN.**
+- **RG-10:** The 27B command on 2026-08-24 completed its initial request, but a later refresh hit `worker binary refresh failed` for the M1 SSH worker. Earlier benchmark mode recorded two successful refresh rebuilds, but this gate requires request-serving recovery. **UNPROVEN.**
+
 
 1. **RG-01 - Automatic discovery and admission**
    - Scenario: Start one `potluck-server` with no worker, rank, bound, or
@@ -546,7 +564,7 @@ observed. Resource costs are planning estimates for supervised acceptance.
      those measurements and current pressure, with no equal split or manual
      weights, and the request completes through the route.
    - Resource cost: Large - heterogeneous peers and a multi-window model run.
-   - Evidence status: UNPROVEN.
+   - Evidence status: PROVEN for this operating point.
 
 3. **RG-03 - Adaptive head reserve**
    - Scenario: While the head owns ring work and serves a request, apply and
@@ -564,16 +582,16 @@ observed. Resource costs are planning estimates for supervised acceptance.
      ZeroMQ, the head handles ingress and the final result but does not relay
      unowned windows, and no static or alternate transport path is used.
    - Resource cost: Large - three peers and a captured multi-window request.
-   - Evidence status: UNPROVEN.
+   - Evidence status: PROVEN for the exercised route.
 
-5. **RG-05 - Assigned-window shard loading**
-   - Scenario: Make a full GGUF available for controller distribution, start
+5. **RG-05 - Full-model window loading**
+   - Scenario: Make a complete GGUF available for controller distribution, start
      the multi-peer server, and submit a request through the head.
-   - Pass condition: Each worker reports loading only tensors for its assigned
-     layer windows and completes the request; no worker loads the complete
-     model, even if the controller distributes the source file.
+   - Pass condition: Each worker receives one stable complete model path, loads
+     only tensors for its assigned layer windows, and completes the request; no
+     worker loads the complete model into memory.
    - Resource cost: Large - model distribution, disk space, and memory checks.
-   - Evidence status: UNPROVEN.
+   - Evidence status: PROVEN for the exercised route.
 
 6. **RG-06 - Window prefetch and accelerator placement**
    - Scenario: Run a multi-window request across peers with CPU, CUDA, and
@@ -601,7 +619,7 @@ observed. Resource costs are planning estimates for supervised acceptance.
      ring batch and finish normally, with no global 429 serialization or one
      stream blocking the other.
    - Resource cost: Large - two concurrent streams and a multi-window run.
-   - Evidence status: UNPROVEN.
+   - Evidence status: PROVEN for the exercised local route.
 
 9. **RG-09 - OpenAI client contract**
    - Scenario: Use an ordinary OpenAI-compatible client against the head for
@@ -629,8 +647,9 @@ cannot satisfy this gate.
 ## 11. Definition of "regular local inference server"
 
 Potluck is a regular local inference server only when all ten named checks
-above have observed their pass conditions. This is not a claim that any check
-currently passes. In particular, named checks must cover:
+above have observed their pass conditions. The current evidence covers
+individual mechanisms and operating points, but the full ten-check release
+gate is not complete. In particular, named checks must cover:
 
 1. two isolated multi-turn conversations with cache affinity;
 2. concurrent streaming through continuous ring batching;

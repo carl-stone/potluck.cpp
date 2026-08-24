@@ -2,6 +2,7 @@
 
 - Date: 2026-08-20
 - Status: Superseded by ADR 0006
+- Context ordering amended by: ADR 0012
 
 ## Context
 

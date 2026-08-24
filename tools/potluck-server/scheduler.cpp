@@ -32,6 +32,234 @@ size_t first_stop_offset(const std::string & text, const std::vector<std::string
 }
 
 }
+void slot_scheduler::ensure_speculator(const std::shared_ptr<scheduled_slot> & slot) {
+    if (!speculative_configured()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        if (slot->speculative != nullptr) {
+            return;
+        }
+    }
+
+    std::vector<std::string> type_names = speculative_config_.types;
+    if (type_names.empty()) {
+        if (speculative_config_.draft_model.empty()) {
+            throw std::runtime_error("speculative decoding requires a draft type or model");
+        }
+        type_names.push_back("draft-simple");
+    }
+
+    const uint32_t configured_draft = speculative_config_.n_draft == 0
+        ? 3 : speculative_config_.n_draft;
+    common_params params;
+    params.n_ctx = static_cast<int32_t>(std::max<uint32_t>(2, speculative_config_.n_ctx));
+    params.n_batch = static_cast<int32_t>(std::max<uint32_t>(
+        std::max<uint32_t>(32, speculative_config_.n_batch),
+        configured_draft + 1));
+    params.n_ubatch = static_cast<int32_t>(std::max<uint32_t>(
+        32, std::min(speculative_config_.n_ubatch,
+                      static_cast<uint32_t>(params.n_batch))));
+    params.n_sequences = 1;
+    params.n_outputs_max = static_cast<int32_t>(configured_draft + 1);
+    params.n_outputs_max_per_seq = params.n_outputs_max;
+    params.speculative.types = common_speculative_types_from_names(type_names);
+    params.speculative.draft.n_max = static_cast<int32_t>(configured_draft);
+    for (const common_speculative_type type : params.speculative.types) {
+        switch (type) {
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+            // ngram-simple needs a draft window at least as long as its lookup pattern.
+            params.speculative.ngram_simple.size_n =
+                static_cast<uint16_t>(std::min<uint32_t>(
+                    params.speculative.ngram_simple.size_n, configured_draft));
+            params.speculative.ngram_simple.size_m =
+                static_cast<uint16_t>(std::min<uint32_t>(configured_draft, UINT16_MAX));
+            break;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+            params.speculative.ngram_map_k.size_m =
+                static_cast<uint16_t>(std::min<uint32_t>(configured_draft, UINT16_MAX));
+            break;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+            params.speculative.ngram_map_k4v.size_m =
+                static_cast<uint16_t>(std::min<uint32_t>(configured_draft, UINT16_MAX));
+            break;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+            params.speculative.ngram_mod.n_max =
+                static_cast<int32_t>(std::min<uint32_t>(configured_draft, INT32_MAX));
+            params.speculative.ngram_mod.n_min = 0;
+            break;
+        default:
+            break;
+        }
+    }
+
+    const bool needs_draft_model = std::find(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != params.speculative.types.end();
+    common_speculative_init_result_ptr draft_init;
+    if (needs_draft_model) {
+        if (speculative_config_.draft_model.empty()) {
+            throw std::runtime_error("draft-simple requires --spec-draft-model");
+        }
+        if (target_model_ == nullptr) {
+            throw std::runtime_error(
+                "draft-simple requires the target model metadata on the head");
+        }
+        params.model.path = speculative_config_.draft_model;
+        params.speculative.draft.mparams.path = speculative_config_.draft_model;
+        if (speculative_target_context_ == nullptr) {
+            llama_context_params target_params = llama_context_default_params();
+            target_params.n_ctx = 2;
+            target_params.n_batch = 2;
+            target_params.n_ubatch = 2;
+            target_params.n_seq_max = 1;
+            target_params.n_outputs_max = 1;
+            target_params.n_threads = 1;
+            target_params.n_threads_batch = 1;
+            target_params.no_perf = true;
+            speculative_target_context_ = llama_init_from_model(
+                const_cast<llama_model *>(target_model_), target_params);
+            if (speculative_target_context_ == nullptr) {
+                throw std::runtime_error(
+                    "cannot create target metadata context for speculation");
+            }
+        }
+        params.speculative.draft.ctx_tgt = speculative_target_context_;
+        draft_init = common_speculative_init_from_params(
+            params, const_cast<llama_model *>(target_model_),
+            speculative_target_context_);
+        if (draft_init == nullptr || draft_init->model() == nullptr ||
+            draft_init->context() == nullptr) {
+            throw std::runtime_error("cannot initialize speculative draft model");
+        }
+        params.speculative.draft.ctx_dft = draft_init->context();
+    }
+
+    common_speculative_ptr spec(
+        common_speculative_init(params.speculative, 1));
+    if (spec == nullptr) {
+        throw std::runtime_error("cannot initialize speculative decoder");
+    }
+    {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        if (slot->speculative == nullptr) {
+            slot->speculative_init = std::move(draft_init);
+            slot->speculative = std::move(spec);
+            slot->speculative_started = false;
+        }
+    }
+}
+void slot_scheduler::prime_speculative_prompt_tail(
+        const std::shared_ptr<scheduled_slot> & slot) {
+    if (slot->speculative == nullptr) {
+        return;
+    }
+    llama_token token = 0;
+    int32_t position = -1;
+    {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        if (!slot->speculative_prompt_tail_pending) {
+            return;
+        }
+        token = slot->speculative_prompt_tail;
+        position = slot->speculative_prompt_tail_position;
+        if (position < 0 || slot->next_position != static_cast<uint32_t>(position + 1)) {
+            throw std::runtime_error("speculative prompt tail position is not next");
+        }
+    }
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    common_batch_add(batch, token, static_cast<llama_pos>(position), { 0 }, false);
+    const bool processed = common_speculative_process(slot->speculative.get(), batch);
+    llama_batch_free(batch);
+    if (!processed) {
+        throw std::runtime_error("speculative draft context failed to process prompt tail");
+    }
+    std::lock_guard<std::mutex> lock(slot->mutex);
+    slot->speculative_prompt_tail_pending = false;
+}
+
+
+void slot_scheduler::process_speculative_batch(
+        const std::shared_ptr<scheduled_slot> & slot,
+        const std::vector<int32_t> & positions,
+        const std::vector<int32_t> & tokens,
+        bool prompt_complete,
+        uint32_t accepted_count,
+        int32_t trim_to) {
+    if (slot->speculative == nullptr) {
+        return;
+    }
+    if (positions.empty() || positions.size() != tokens.size()) {
+        throw std::runtime_error("invalid speculative batch dimensions");
+    }
+    common_speculative * spec = slot->speculative.get();
+    std::vector<int32_t> process_positions = positions;
+    std::vector<int32_t> process_tokens = tokens;
+    std::vector<llama_token> begin_prompt;
+    bool begin_generation = false;
+    llama_token prompt_tail = 0;
+    int32_t prompt_tail_position = -1;
+    {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        begin_generation = prompt_complete && !slot->speculative_started;
+        if (begin_generation) {
+            if (slot->prompt.empty() ||
+                process_positions.back() != static_cast<int32_t>(slot->prompt.size() - 1) ||
+                process_tokens.back() != static_cast<int32_t>(slot->prompt.back())) {
+                throw std::runtime_error("speculative prompt tail does not match slot state");
+            }
+            begin_prompt.assign(slot->prompt.begin(), slot->prompt.end() - 1);
+            prompt_tail = static_cast<llama_token>(process_tokens.back());
+            prompt_tail_position = process_positions.back();
+            process_positions.pop_back();
+            process_tokens.pop_back();
+        } else if (slot->speculative_prompt_tail_pending) {
+            prompt_tail = slot->speculative_prompt_tail;
+            prompt_tail_position = slot->speculative_prompt_tail_position;
+            if (process_positions.front() != prompt_tail_position + 1 ||
+                slot->next_position != static_cast<uint32_t>(process_positions.front())) {
+                throw std::runtime_error("speculative draft context position is not contiguous");
+            }
+            process_positions.insert(process_positions.begin(), prompt_tail_position);
+            process_tokens.insert(process_tokens.begin(), static_cast<int32_t>(prompt_tail));
+            slot->speculative_prompt_tail_pending = false;
+        }
+    }
+    if (!process_positions.empty()) {
+        llama_batch batch = llama_batch_init(process_positions.size(), 0, 1);
+        for (size_t i = 0; i < process_positions.size(); ++i) {
+            common_batch_add(batch, static_cast<llama_token>(process_tokens[i]),
+                             static_cast<llama_pos>(process_positions[i]), { 0 }, false);
+        }
+        const bool processed = common_speculative_process(spec, batch);
+        llama_batch_free(batch);
+        if (!processed) {
+            throw std::runtime_error("speculative draft context failed to process ring batch");
+        }
+    }
+    if (begin_generation) {
+        common_speculative_begin(spec, 0, begin_prompt);
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        slot->speculative_started = true;
+        slot->speculative_prompt_tail_pending = true;
+        slot->speculative_prompt_tail = prompt_tail;
+        slot->speculative_prompt_tail_position = prompt_tail_position;
+    }
+    if (trim_to >= 0) {
+        if (accepted_count > std::numeric_limits<uint16_t>::max()) {
+            throw std::runtime_error("speculative acceptance count exceeds sampler limit");
+        }
+        common_speculative_accept(spec, 0, static_cast<uint16_t>(accepted_count));
+        if (slot->speculative_init != nullptr &&
+            slot->speculative_init->context() != nullptr &&
+            !llama_memory_seq_rm(
+                llama_get_memory(slot->speculative_init->context()), 0, trim_to, -1)) {
+            throw std::runtime_error("cannot trim speculative draft sequence");
+        }
+    }
+}
+
 
 void slot_scheduler::emit(const std::shared_ptr<scheduled_slot> & slot, llama_token token,
                           uint32_t position,
@@ -75,9 +303,15 @@ std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
                                       std::function<bool()> should_cancel,
                                       bool * batch_started,
                                       std::function<bool(std::string &)> heartbeat,
-                                      potluck::batch_logprobs * result_logprobs) {
+                                      potluck::batch_logprobs * result_logprobs,
+                                      const std::vector<int32_t> & draft_tokens,
+                                      uint32_t accepted_count,
+                                      uint32_t * result_accepted_count) {
     if (result_logprobs != nullptr) {
         result_logprobs->clear();
+    }
+    if (result_accepted_count != nullptr) {
+        *result_accepted_count = 0;
     }
     if (batch_started != nullptr) {
         *batch_started = false;
@@ -86,15 +320,18 @@ std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
         clear_seq != -1;
     if ((!clear_only && (positions.empty() || positions.size() != sequences.size() ||
                          positions.size() != tokens.size())) ||
-        (clear_only && (trim_seq >= 0 || trim_to >= 0 || n_logits != 0))) {
+        (clear_only && (trim_seq >= 0 || trim_to >= 0 || n_logits != 0 ||
+                        !draft_tokens.empty() || accepted_count != 0)) ||
+        accepted_count > draft_tokens.size()) {
         throw std::runtime_error("invalid batch dimensions");
     }
     potluck::message input;
     input.type = potluck::message_type::batch_decode;
     input.flags = 0;
     input.sequence = ++ring.batch_sequence;
-    if (!potluck::encode_batch_payload(positions, sequences, tokens, nullptr, 0,
-                                       clear_seq, trim_seq, trim_to, n_logits, input.payload)) {
+    if (!potluck::encode_batch_payload(positions, sequences, tokens, draft_tokens,
+                                       accepted_count, nullptr, 0, clear_seq, trim_seq,
+                                       trim_to, n_logits, input.payload)) {
         throw std::runtime_error("cannot encode ring batch");
     }
     const auto cancelled = [&]() {
@@ -193,13 +430,16 @@ std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
         base_payload_size = static_cast<size_t>(output.shape[0]);
     }
     std::vector<int32_t> result_positions, result_sequences, result_tokens;
+    std::vector<int32_t> result_draft_tokens;
     std::vector<float> result_hidden;
     int32_t ignored_clear = -1, ignored_trim_seq = -1, ignored_trim = -1;
     uint32_t ignored_logits = 0;
-    if (!potluck::decode_batch_payload(output.payload.data(), base_payload_size, 0,
-                                       ignored_clear, ignored_trim_seq, ignored_trim, ignored_logits,
-                                       result_positions, result_sequences, result_tokens,
-                                       result_hidden, ring.error)) {
+    uint32_t ignored_accepted = 0;
+    if (!potluck::decode_batch_payload(
+            output.payload.data(), base_payload_size, 0,
+            ignored_clear, ignored_trim_seq, ignored_trim, ignored_logits,
+            result_positions, result_sequences, result_tokens, result_draft_tokens,
+            ignored_accepted, result_hidden, ring.error)) {
         throw std::runtime_error("cannot decode ring result: " + ring.error);
     }
     if (has_logprobs) {
@@ -215,8 +455,13 @@ std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
         }
     }
     if (result_positions != positions || result_sequences != sequences ||
-        result_tokens.size() != positions.size()) {
+        result_tokens.size() != positions.size() ||
+        result_draft_tokens != draft_tokens ||
+        ignored_accepted > draft_tokens.size()) {
         throw std::runtime_error("ring result entries do not match the request");
+    }
+    if (result_accepted_count != nullptr) {
+        *result_accepted_count = ignored_accepted;
     }
     return result_tokens;
 }

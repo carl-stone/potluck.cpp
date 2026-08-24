@@ -1,5 +1,5 @@
-#include "../src/potluck-protocol.h"
 #include "../tools/potluck-server/internal.h"
+#include "../src/potluck-protocol.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -29,9 +29,11 @@ int main() {
     expected.n_ctx = 8192;
     expected.n_seq_max = 4;
     expected.n_ubatch = 256;
+    expected.n_rs_seq = 5;
     expected.seed = 42;
-    expected.temp = 0.7f;
     expected.top_p = 0.9f;
+    expected.prefetch = potluck::prefetch_mode::force;
+    expected.n_cycles = 3;
     expected.windows = {
         {0, 0, 4, 4},
         {1, 4, 10, 0},
@@ -48,9 +50,12 @@ int main() {
     CHECK(actual.n_ctx == expected.n_ctx);
     CHECK(actual.n_seq_max == expected.n_seq_max);
     CHECK(actual.n_ubatch == expected.n_ubatch);
+    CHECK(actual.n_rs_seq == expected.n_rs_seq);
     CHECK(actual.seed == expected.seed);
     CHECK(actual.temp == expected.temp);
     CHECK(actual.top_p == expected.top_p);
+    CHECK(actual.prefetch == expected.prefetch);
+    CHECK(actual.n_cycles == expected.n_cycles);
     CHECK(actual.windows.size() == expected.windows.size());
     for (size_t i = 0; i < expected.windows.size(); ++i) {
         CHECK(actual.windows[i].owner == expected.windows[i].owner);
@@ -60,7 +65,7 @@ int main() {
     }
 
     std::vector<uint8_t> bad_version = config_payload;
-    bad_version[0] = 2;
+    bad_version[0] = 1;
     CHECK(!potluck::decode_config(bad_version.data(), bad_version.size(), actual, error));
     CHECK(error == "unsupported ring config version");
 
@@ -72,27 +77,41 @@ int main() {
     config_payload.push_back(0);
     CHECK(!potluck::decode_config(config_payload.data(), config_payload.size(), actual, error));
     CHECK(error == "trailing ring config bytes");
+    potluck::node_config invalid_config = expected;
+    invalid_config.prefetch = static_cast<potluck::prefetch_mode>(99);
+    CHECK(!potluck::encode_config(invalid_config, config_payload));
+    invalid_config = expected;
+    invalid_config.n_cycles = 0;
+    CHECK(!potluck::encode_config(invalid_config, config_payload));
 
     const std::vector<int32_t> expected_pos = {0, 7};
     const std::vector<int32_t> expected_seq = {2, 3};
     const std::vector<int32_t> expected_tokens = {11, 13};
+    const std::vector<int32_t> expected_drafts = {17, 19, 23};
     std::vector<uint8_t> batch_payload;
     CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
-                                        nullptr, 0, 1, 2, 7, 2, batch_payload));
-    CHECK(batch_payload.size() == 44);
-    CHECK(batch_payload[0] == 2 && batch_payload[4] == 1 &&
-          batch_payload[8] == 2 && batch_payload[12] == 7 && batch_payload[16] == 2);
+                                        expected_drafts, 2, nullptr, 0,
+                                        1, 2, 7, 2, batch_payload));
+    CHECK(batch_payload[0] == 'B' && batch_payload[1] == 'T' &&
+          batch_payload[2] == 'P' && batch_payload[3] == '1');
+    CHECK(batch_payload[4] == 1 && batch_payload[8] == 2 &&
+          batch_payload[12] == 1 && batch_payload[16] == 2 &&
+          batch_payload[20] == 7 && batch_payload[24] == 2 &&
+          batch_payload[28] == 3 && batch_payload[32] == 2);
     int32_t clear_seq = 0;
     int32_t trim_seq = 0;
     int32_t trim_to = 0;
     uint32_t n_logits = 0;
+    uint32_t accepted_count = 0;
     std::vector<int32_t> pos;
     std::vector<int32_t> seq;
     std::vector<int32_t> tokens;
+    std::vector<int32_t> drafts;
     std::vector<float> hidden;
     CHECK(potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
                                         clear_seq, trim_seq, trim_to, n_logits,
-                                        pos, seq, tokens, hidden, error));
+                                        pos, seq, tokens, drafts, accepted_count,
+                                        hidden, error));
     CHECK(clear_seq == 1);
     CHECK(trim_seq == 2);
     CHECK(trim_to == 7);
@@ -100,70 +119,114 @@ int main() {
     CHECK(pos == expected_pos);
     CHECK(seq == expected_seq);
     CHECK(tokens == expected_tokens);
+    CHECK(drafts == expected_drafts);
+    CHECK(accepted_count == 2);
     CHECK(hidden.empty());
+    {
+        const std::vector<int32_t> partial_pos = {5, 12};
+        const std::vector<int32_t> partial_seq = {1, 0};
+        const std::vector<int32_t> partial_tokens = {29, 31};
+        const std::vector<int32_t> partial_drafts = {37, 41, 43, 47};
+        const uint32_t partial_accepted = 2;
+        CHECK(partial_accepted > 0 && partial_accepted < partial_drafts.size());
+        CHECK(potluck::encode_batch_payload(
+            partial_pos, partial_seq, partial_tokens, partial_drafts,
+            partial_accepted, nullptr, 0, 4, 5, 6, 2, batch_payload));
+        CHECK(potluck::decode_batch_payload(
+            batch_payload.data(), batch_payload.size(), 0,
+            clear_seq, trim_seq, trim_to, n_logits, pos, seq, tokens, drafts,
+            accepted_count, hidden, error));
+        CHECK(clear_seq == 4 && trim_seq == 5 && trim_to == 6 && n_logits == 2);
+        CHECK(pos == partial_pos);
+        CHECK(seq == partial_seq);
+        CHECK(tokens == partial_tokens);
+        CHECK(drafts == partial_drafts);
+        CHECK(accepted_count == partial_accepted);
+    }
+    CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
+                                        expected_drafts, 2, nullptr, 0,
+                                        1, 2, 7, 2, batch_payload));
+    batch_payload[0] = 0;
+    CHECK(!potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
+                                         clear_seq, trim_seq, trim_to, n_logits,
+                                         pos, seq, tokens, drafts, accepted_count,
+                                         hidden, error));
+    CHECK(error == "invalid batch payload magic");
+    CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
+                                        expected_drafts, 2, nullptr, 0,
+                                        1, 2, 7, 2, batch_payload));
+    batch_payload[4] = 2;
+    CHECK(!potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
+                                         clear_seq, trim_seq, trim_to, n_logits,
+                                         pos, seq, tokens, drafts, accepted_count,
+                                         hidden, error));
+    CHECK(error == "unsupported batch payload version");
+    CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
+                                        expected_drafts, 2, nullptr, 0,
+                                        1, 2, 7, 2, batch_payload));
     batch_payload.push_back(0);
     CHECK(!potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
                                          clear_seq, trim_seq, trim_to, n_logits,
-                                         pos, seq, tokens, hidden, error));
+                                         pos, seq, tokens, drafts, accepted_count,
+                                         hidden, error));
     batch_payload.pop_back();
-    batch_payload[4] = 0xfd;
-    batch_payload[5] = 0xff;
-    batch_payload[6] = 0xff;
-    batch_payload[7] = 0xff;
-    CHECK(!potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
-                                         clear_seq, trim_seq, trim_to, n_logits,
-                                         pos, seq, tokens, hidden, error));
     CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
-                                        nullptr, 0, -2, -1, -1, 0, batch_payload));
-    CHECK(batch_payload.size() == 44);
+                                        expected_drafts, 2, nullptr, 0,
+                                        -2, -1, -1, 0, batch_payload));
     CHECK(potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
                                         clear_seq, trim_seq, trim_to, n_logits,
-                                        pos, seq, tokens, hidden, error));
+                                        pos, seq, tokens, drafts, accepted_count,
+                                        hidden, error));
     CHECK(clear_seq == -2);
     CHECK(trim_seq == -1);
     CHECK(trim_to == -1);
     CHECK(n_logits == 0);
-    CHECK(potluck::encode_batch_payload({}, {}, {}, nullptr, 0, 3, -1, -1, 0,
-                                        batch_payload));
-    CHECK(batch_payload.size() == 20);
+    CHECK(drafts == expected_drafts && accepted_count == 2);
+    CHECK(potluck::encode_batch_payload({}, {}, {}, {}, 0, nullptr, 0,
+                                        3, -1, -1, 0, batch_payload));
+    CHECK(batch_payload.size() == 36);
     CHECK(potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
                                         clear_seq, trim_seq, trim_to, n_logits,
-                                        pos, seq, tokens, hidden, error));
+                                        pos, seq, tokens, drafts, accepted_count,
+                                        hidden, error));
     CHECK(clear_seq == 3);
     CHECK(trim_seq == -1);
     CHECK(trim_to == -1);
-    CHECK(n_logits == 0);
-    CHECK(pos.empty() && seq.empty() && tokens.empty() && hidden.empty());
-    batch_payload[8] = 0xfe;
-    batch_payload[9] = 0xff;
-    batch_payload[10] = 0xff;
-    batch_payload[11] = 0xff;
+    CHECK(n_logits == 0 && accepted_count == 0);
+    CHECK(pos.empty() && seq.empty() && tokens.empty() && drafts.empty() && hidden.empty());
+    batch_payload[20] = 0xfe;
+    batch_payload[21] = 0xff;
+    batch_payload[22] = 0xff;
+    batch_payload[23] = 0xff;
     CHECK(!potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
                                          clear_seq, trim_seq, trim_to, n_logits,
-                                         pos, seq, tokens, hidden, error));
+                                         pos, seq, tokens, drafts, accepted_count,
+                                         hidden, error));
     CHECK(error == "invalid batch clear or trim controls");
+    CHECK(!potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
+                                         expected_drafts, 4, nullptr, 0,
+                                         1, 2, 7, 2, batch_payload));
     CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, expected_tokens,
-                                        nullptr, 0, 1, 2, 7, 2, batch_payload));
-    batch_payload[16] = 3;
+                                        expected_drafts, 2, nullptr, 0,
+                                        1, 2, 7, 2, batch_payload));
+    batch_payload[8] = 3;
     CHECK(!potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 0,
                                          clear_seq, trim_seq, trim_to, n_logits,
-                                         pos, seq, tokens, hidden, error));
-    CHECK(error == "invalid batch entry count");
+                                         pos, seq, tokens, drafts, accepted_count,
+                                         hidden, error));
+    CHECK(error == "batch token payload size mismatch");
     {
         const float expected_hidden[] = {1.0f, 2.0f, 3.0f, 4.0f};
         CHECK(potluck::encode_batch_payload(expected_pos, expected_seq, {},
-                                            expected_hidden, 2, -1, -1, -1, 1, batch_payload));
-        CHECK(batch_payload.size() == 52);
+                                            {}, 0, expected_hidden, 2,
+                                            -1, -1, -1, 1, batch_payload));
         CHECK(potluck::decode_batch_payload(batch_payload.data(), batch_payload.size(), 2,
                                             clear_seq, trim_seq, trim_to, n_logits,
-                                            pos, seq, tokens, hidden, error));
-        CHECK(clear_seq == -1);
-        CHECK(trim_seq == -1);
-        CHECK(trim_to == -1);
-        CHECK(n_logits == 1);
+                                            pos, seq, tokens, drafts, accepted_count,
+                                            hidden, error));
         CHECK(pos == expected_pos);
         CHECK(seq == expected_seq);
-        CHECK(tokens.empty());
+        CHECK(tokens.empty() && drafts.empty() && accepted_count == 0);
         CHECK(hidden.size() == 4);
         for (size_t i = 0; i < hidden.size(); ++i) {
             CHECK(hidden[i] == expected_hidden[i]);
@@ -186,52 +249,79 @@ int main() {
             CHECK(actual[i].end == expected[i].end);
             CHECK(actual[i].decode_tok_s == expected[i].decode_tok_s);
             CHECK(actual[i].peak_rss_mb == expected[i].peak_rss_mb);
-            CHECK(actual[i].decoded_positions == expected[i].decoded_positions);
         }
         payload.push_back(0);
         CHECK(!potluck::decode_worker_bench_metrics(payload.data(), payload.size(), actual, error));
     }
 
-    // Accelerator profiles round-trip and reject damaged payloads.
+    // Device profiles round-trip and reject damaged payloads.
     {
-        const potluck::accel_profile expected = {
-            3, potluck::accel_kind::cuda, 2147483648, 4294967296, 8589934592, 17179869184
-        };
+        potluck::device_profile expected;
+        expected.rank = 3;
+        expected.kind = potluck::accel_kind::cuda;
+        expected.os = potluck::os_kind::linux_os;
+        expected.free_bytes = 2147483648;
+        expected.total_bytes = 4294967296;
+        expected.host_free_bytes = 8589934592;
+        expected.host_total_bytes = 17179869184;
+        expected.cpu_gflops = {1.5f, 2.5f};
+        expected.accel_gflops = {10.0f, 20.0f, 30.0f};
+        expected.mem_copy_delay_ms = 0.25f;
+        expected.accel_copy_delay_ms = 0.5f;
+        expected.disk_read_seq_gbps = 3.0f;
+        expected.disk_read_rnd_gbps = 1.25f;
+        expected.n_cpu_threads = 12;
         std::vector<uint8_t> payload;
-        CHECK(potluck::encode_accel_profile(expected, payload));
-        CHECK(payload.size() == 41);
-        potluck::accel_profile actual;
-        CHECK(potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(potluck::encode_device_profile(expected, payload));
+        CHECK(payload.size() == 90);
+        potluck::device_profile actual;
+        CHECK(potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
         CHECK(actual.rank == expected.rank);
         CHECK(actual.kind == expected.kind);
+        CHECK(actual.os == expected.os);
         CHECK(actual.free_bytes == expected.free_bytes);
         CHECK(actual.total_bytes == expected.total_bytes);
         CHECK(actual.host_free_bytes == expected.host_free_bytes);
         CHECK(actual.host_total_bytes == expected.host_total_bytes);
-
-        const potluck::accel_profile metal = {0, potluck::accel_kind::metal, 1, 2, 3, 4};
-        CHECK(potluck::encode_accel_profile(metal, payload));
-        CHECK(potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
-        CHECK(actual.kind == potluck::accel_kind::metal);
-        CHECK(actual.host_free_bytes == 3);
-        CHECK(actual.host_total_bytes == 4);
+        CHECK(actual.cpu_gflops == expected.cpu_gflops);
+        CHECK(actual.accel_gflops == expected.accel_gflops);
+        CHECK(actual.mem_copy_delay_ms == expected.mem_copy_delay_ms);
+        CHECK(actual.accel_copy_delay_ms == expected.accel_copy_delay_ms);
+        CHECK(actual.disk_read_seq_gbps == expected.disk_read_seq_gbps);
+        CHECK(actual.disk_read_rnd_gbps == expected.disk_read_rnd_gbps);
+        CHECK(actual.n_cpu_threads == expected.n_cpu_threads);
 
         payload.push_back(0);
-        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
-        CHECK(error == "accelerator profile size mismatch");
+        CHECK(!potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "device profile size mismatch");
         payload.resize(25);
-        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
-        CHECK(error == "accelerator profile size mismatch");
-        CHECK(potluck::encode_accel_profile(metal, payload));
-        payload[0] = 0;
-        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
-        CHECK(error == "invalid accelerator profile magic");
-        payload[0] = 0x45;
+        CHECK(!potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "device profile size mismatch");
+        CHECK(potluck::encode_device_profile(expected, payload));
+        payload[0] = 'E';
+        payload[1] = 'A';
+        payload[2] = 'P';
+        payload[3] = '2';
+        CHECK(!potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "invalid device profile magic");
+        CHECK(potluck::encode_device_profile(expected, payload));
         payload[8] = 9;
-        CHECK(!potluck::decode_accel_profile(payload.data(), payload.size(), actual, error));
+        CHECK(!potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
         CHECK(error == "unknown accelerator kind");
-        CHECK(!potluck::decode_accel_profile(nullptr, payload.size(), actual, error));
-        CHECK(error == "truncated u32");
+        CHECK(potluck::encode_device_profile(expected, payload));
+        payload[9] = 9;
+        CHECK(!potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "unknown operating system kind");
+        CHECK(potluck::encode_device_profile(expected, payload));
+        payload[42] = 0xff;
+        payload[43] = 0xff;
+        payload[44] = 0xff;
+        payload[45] = 0xff;
+        CHECK(!potluck::decode_device_profile(payload.data(), payload.size(), actual, error));
+        CHECK(error == "invalid device profile vector count");
+        potluck::device_profile invalid = expected;
+        invalid.cpu_gflops[0] = -1.0f;
+        CHECK(!potluck::encode_device_profile(invalid, payload));
     }
     {
         potluck::slot_config expected;
@@ -343,119 +433,6 @@ int main() {
         CHECK(reserve_excluded.budget == 1ull * gib);
         CHECK(!reserve_excluded.participates);
 
-        CHECK(!head_placement_requires_refresh(true, true, true,
-                                               3ull * gib, 8ull * gib));
-        CHECK(head_placement_requires_refresh(true, true, true,
-                                              9ull * gib, 8ull * gib));
-        CHECK(head_placement_requires_refresh(true, true, false,
-                                              3ull * gib, 1ull * gib));
-        CHECK(head_placement_requires_refresh(true, false, true,
-                                              0, 8ull * gib));
-    }
-    {
-        constexpr uint64_t mib = 1024ull * 1024ull;
-        const auto make_device = [](uint64_t usable, const char * host) {
-            device_probe device;
-            device.host = host;
-            device.ok = true;
-            device.profile.host_total_bytes = 128ull * 1024ull * mib;
-            device.profile.host_free_bytes = 128ull * 1024ull * mib;
-            device.placement_usable_limit = usable;
-            return device;
-        };
-        const auto check_route = [](const std::vector<device_probe> & devices,
-                                    uint32_t n_layer,
-                                    const std::vector<potluck::ring_window> & route) {
-            CHECK(route.size() > devices.size());
-            uint32_t next_layer = 0;
-            for (const potluck::ring_window & window : route) {
-                CHECK(window.owner < devices.size());
-                CHECK(window.start == next_layer);
-                CHECK(window.start < window.end);
-                CHECK(window.end <= n_layer);
-                next_layer = window.end;
-            }
-            CHECK(next_layer == n_layer);
-        };
-
-        const uint32_t layers = 62;
-        const uint64_t model_bytes = layers * mib;
-        const std::vector<device_probe> heterogeneous = {
-            make_device(64ull * mib, "large"),
-            make_device(32ull * mib, "medium"),
-            make_device(16ull * mib, "small"),
-        };
-        const std::vector<potluck::ring_window> first =
-            build_ring_route(heterogeneous, layers, model_bytes, 0, 0, 0);
-        const std::vector<potluck::ring_window> second =
-            build_ring_route(heterogeneous, layers, model_bytes, 0, 0, 0);
-        check_route(heterogeneous, layers, first);
-        CHECK(first.size() == 6);
-        CHECK(first[0].owner == 0 && first[1].owner == 1 && first[2].owner == 2);
-        CHECK(first[3].owner == 0 && first[4].owner == 1 && first[5].owner == 2);
-        CHECK(first[0].end - first[0].start == first[3].end - first[3].start);
-        CHECK(first[1].end - first[1].start == first[4].end - first[4].start);
-        CHECK(first[2].end - first[2].start == first[5].end - first[5].start);
-        CHECK(first.size() == second.size());
-        for (size_t i = 0; i < first.size(); ++i) {
-            CHECK(first[i].owner == second[i].owner);
-            CHECK(first[i].start == second[i].start);
-            CHECK(first[i].end == second[i].end);
-        }
-
-        const uint32_t prime_layers = 13;
-        const std::vector<device_probe> prime_devices = {
-            make_device(4ull * mib, "prime-large"),
-            make_device(2ull * mib, "prime-medium"),
-            make_device(2ull * mib, "prime-small"),
-        };
-        const std::vector<potluck::ring_window> prime_route =
-            build_ring_route(prime_devices, prime_layers, prime_layers * mib, 0, 0, 0);
-        check_route(prime_devices, prime_layers, prime_route);
-        CHECK(prime_route.size() == 6);
-        CHECK(prime_route[0].owner == prime_route[3].owner);
-        CHECK(prime_route[1].owner == prime_route[4].owner);
-        CHECK(prime_route[2].owner == prime_route[5].owner);
-        CHECK(prime_route[2].end == 7);
-
-        const uint32_t resident_layers = 12;
-        const std::vector<device_probe> resident_devices = {
-            make_device(3ull * mib, "resident-large"),
-            make_device(2ull * mib, "resident-medium"),
-            make_device(1ull * mib, "resident-small"),
-        };
-        const std::vector<device_probe> admitted =
-            admit_devices(resident_devices, resident_layers, resident_layers * mib,
-                          0, 0, 0);
-        CHECK(admitted.size() == 3);
-        const std::vector<device_probe> max_owner_devices = {
-            make_device(1ull * mib, "remote-0"),
-            make_device(1ull * mib, "remote-1"),
-            make_device(1ull * mib, "remote-2"),
-            make_device(1ull * mib, "remote-3"),
-            make_device(1ull * mib, "remote-4"),
-            make_device(1ull * mib, "remote-5"),
-        };
-        const std::vector<device_probe> admitted_with_head =
-            admit_devices(max_owner_devices, resident_layers, resident_layers * mib,
-                          0, 0, 0, true);
-        CHECK(admitted_with_head.size() == 5);
-        std::vector<device_probe> devices_with_head = admitted_with_head;
-        devices_with_head.push_back(make_device(1ull * mib, "head"));
-        const std::vector<potluck::ring_window> route_with_head =
-            build_ring_route(devices_with_head, resident_layers, resident_layers * mib,
-                             0, 0, 0);
-        check_route(devices_with_head, resident_layers, route_with_head);
-        const std::vector<potluck::ring_window> resident_route =
-            build_ring_route(admitted, resident_layers, resident_layers * mib, 0, 0, 0);
-        check_route(admitted, resident_layers, resident_route);
-        CHECK(resident_route.size() == 6);
-        CHECK(resident_route[0].end - resident_route[0].start == 3);
-        CHECK(resident_route[1].end - resident_route[1].start == 2);
-        CHECK(resident_route[2].end - resident_route[2].start == 1);
-        CHECK(resident_route[3].end - resident_route[3].start == 3);
-        CHECK(resident_route[4].end - resident_route[4].start == 2);
-        CHECK(resident_route[5].end - resident_route[5].start == 1);
     }
 
     return 0;

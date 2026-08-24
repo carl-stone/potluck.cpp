@@ -1,17 +1,22 @@
 #pragma once
 
 #include "llama.h"
+#include "gguf.h"
 #include "chat.h"
 #include "nlohmann/json.hpp"
+#include <cpp-httplib/httplib.h>
 #include "potluck-discovery.h"
 #include "potluck-transport.h"
+#include "ggml.h"
 #include "potluck_runtime.h"
-#include <cpp-httplib/httplib.h>
+#include "halda.h"
+#include "speculative.h"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -47,7 +52,7 @@ struct bootstrap_node {
 struct device_probe {
     std::string host;
     bootstrap_node bootstrap;
-    potluck::accel_profile profile;
+    potluck::device_profile profile;
     bool ok = false;
     std::string error;
     uint64_t placement_usable_limit = std::numeric_limits<uint64_t>::max();
@@ -69,6 +74,27 @@ struct device_probe {
     }
 };
 
+struct halda_model_metadata {
+    uint32_t n_layer = 0;
+    uint32_t n_embd = 0;
+    uint32_t n_ff = 0;
+    uint32_t n_head = 0;
+    uint32_t n_head_kv = 0;
+    uint32_t n_vocab = 0;
+    uint32_t n_ctx = 0;
+    uint32_t head_dim = 0;
+    uint64_t b = 0;
+    uint64_t bi = 0;
+    uint64_t bo = 0;
+    uint64_t kv_per_layer = 0;
+    uint64_t b_prime = 0;
+    std::vector<ggml_type> ordered_types;
+    std::vector<uint64_t> flops_per_type;
+};
+
+inline constexpr uint32_t potluck_probe_protocol_version = 3;
+inline constexpr const char * potluck_probe_build_id = "potluck";
+
 struct head_participation_plan {
     uint64_t budget = 0;
     bool participates = false;
@@ -86,15 +112,6 @@ inline head_participation_plan plan_head_participation(const device_probe & head
     };
 }
 
-inline bool head_placement_requires_refresh(bool has_profile,
-                                            bool current_participates,
-                                            bool proposed_participates,
-                                            uint64_t assigned_bytes,
-                                            uint64_t proposed_budget) {
-    return !has_profile ||
-           current_participates != proposed_participates ||
-           (current_participates && assigned_bytes > proposed_budget);
-}
 
 enum class worker_kind {
     local,
@@ -137,7 +154,7 @@ struct ring_session {
     uint64_t head_budget = 0;
     uint64_t head_reserve = 0;
     double head_cpu_load = 0.0;
-    potluck::accel_profile head_profile;
+    potluck::device_profile head_profile;
     std::chrono::steady_clock::time_point last_heartbeat{};
     std::atomic<bool> stopping { false };
     mutable std::mutex mutex;
@@ -160,6 +177,10 @@ struct model_digest_cache {
 struct ring_startup_options {
     std::string hosts_spec;
     std::string model_path;
+    std::string hf_repo;
+    std::string hf_file;
+    std::string hf_token;
+    bool hf_offline = false;
     std::string model_name;
     std::string worker_path;
     std::string host;
@@ -176,35 +197,112 @@ struct ring_startup_options {
     uint32_t head_dim = 0;
     uint32_t n_head_kv = 0;
     uint32_t n_ctx = 0;
-    uint32_t n_seq_max = 0;
+    uint32_t n_seq_max = 1;
     uint32_t n_ubatch = 0;
+    uint32_t speculative_n_rs_seq = 0;
+    uint64_t speculative_head_reserve = 0;
     uint32_t seed = 0;
     float temp = 0.0f;
     float top_p = 0.0f;
+    potluck::prefetch_mode prefetch = potluck::prefetch_mode::advise;
+    std::vector<uint32_t> layer_window;
+    double gpu_mem_gib = 0.0;
+    int32_t k_override = -1;
+    double master_priority = 1.01;
 };
+inline uint64_t potluck_speculative_head_reserve(
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t n_ctx,
+        uint32_t n_layer,
+        uint32_t n_seq_max,
+        const std::vector<std::string> & spec_types,
+        const std::string & spec_draft_model) {
+    const std::vector<common_speculative_type> parsed_spec_types =
+        common_speculative_types_from_names(spec_types);
+    const bool speculative_context = !spec_types.empty()
+        ? std::any_of(parsed_spec_types.begin(), parsed_spec_types.end(),
+                      [](common_speculative_type type) {
+                          return type != COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE &&
+                                 type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K &&
+                                 type != COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V &&
+                                 type != COMMON_SPECULATIVE_TYPE_NGRAM_MOD &&
+                                 type != COMMON_SPECULATIVE_TYPE_NGRAM_CACHE;
+                      })
+        : !spec_draft_model.empty();
+    if (!speculative_context) {
+        return 0;
+    }
+    uint64_t draft_context_bytes = 1;
+    const uint64_t factors[] = {
+        static_cast<uint64_t>(n_head_kv),
+        static_cast<uint64_t>(head_dim),
+        4,
+        static_cast<uint64_t>(n_ctx),
+        static_cast<uint64_t>(n_layer),
+        static_cast<uint64_t>(n_seq_max),
+    };
+    for (const uint64_t factor : factors) {
+        if (factor == 0 ||
+            draft_context_bytes > std::numeric_limits<uint64_t>::max() / factor) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        draft_context_bytes *= factor;
+    }
+    return draft_context_bytes;
+}
+inline uint32_t potluck_speculative_n_rs_seq(
+        const std::vector<std::string> & spec_types,
+        const std::string & spec_draft_model,
+        uint32_t n_draft) {
+    std::vector<std::string> effective_types = spec_types;
+    if (effective_types.empty() && !spec_draft_model.empty()) {
+        effective_types.push_back("draft-simple");
+    }
+    common_params_speculative speculative;
+    speculative.types = common_speculative_types_from_names(effective_types);
+    speculative.draft.n_max = static_cast<int32_t>(n_draft == 0 ? 3 : n_draft);
+    return speculative.need_n_rs_seq();
+}
 
 std::string shell_quote(const std::string & value);
 void validate_ssh_target(const std::string & target);
 std::string ssh_options(const bootstrap_node & bootstrap);
 std::vector<bootstrap_node> discover_bootstrap_nodes();
 
-device_probe probe_local_worker(const std::string & worker_path);
-device_probe probe_remote_worker(const bootstrap_node & bootstrap);
+device_probe probe_local_worker(
+    const std::string & worker_path,
+    const std::vector<ggml_type> & probe_types = {},
+    uint64_t probe_bytes = 0);
+device_probe probe_remote_worker(
+    const bootstrap_node & bootstrap,
+    const std::vector<ggml_type> & probe_types = {},
+    uint64_t probe_bytes = 0);
 std::vector<device_probe> probe_remote_candidates(
+    const std::vector<bootstrap_node> & candidates,
+    const std::vector<ggml_type> & probe_types = {},
+    uint64_t probe_bytes = 0);
+device_probe probe_local_pressure(const std::string & worker_path);
+device_probe probe_remote_pressure(const bootstrap_node & bootstrap);
+std::vector<device_probe> probe_remote_pressure_candidates(
     const std::vector<bootstrap_node> & candidates);
+bool merge_pressure_profile(potluck::device_profile & target,
+                            const potluck::device_profile & pressure,
+                            std::string & error);
 
-uint64_t route_layer_cost(uint32_t n_layer, uint64_t model_bytes, uint32_t n_head_kv,
-                          uint32_t head_dim, uint32_t n_ctx);
-uint64_t route_needed_bytes(uint32_t n_layer, uint64_t model_bytes, uint32_t n_head_kv,
-                            uint32_t head_dim, uint32_t n_ctx);
-std::vector<device_probe> admit_devices(std::vector<device_probe> candidates,
-                                         uint32_t n_layer, uint64_t model_bytes,
-                                         uint32_t n_head_kv, uint32_t head_dim,
-                                         uint32_t n_ctx, bool reserve_owner_slot = false);
-std::vector<potluck::ring_window> build_ring_route(const std::vector<device_probe> & devices,
-                                                   uint32_t n_layer, uint64_t model_bytes,
-                                                   uint32_t n_head_kv, uint32_t head_dim,
-                                                   uint32_t n_ctx);
+bool extract_halda_model_metadata(const std::filesystem::path & model_path,
+                                  uint32_t n_ctx,
+                                  halda_model_metadata & metadata,
+                                  std::string & error);
+bool solve_ring_placement(const std::vector<device_probe> & candidates,
+                          const halda_model_metadata & metadata,
+                          uint32_t n_ubatch, bool head_participates,
+                          const std::vector<uint32_t> & fixed_w,
+                          int32_t k_override, double master_priority,
+                          double gpu_mem_gib,
+                          std::vector<device_probe> & active_devices,
+                          std::vector<potluck::ring_window> & windows,
+                          halda_solution * solution, std::string & error);
 
 std::string first_command_line(const std::string & command);
 bool refresh_remote_binaries(const bootstrap_node & bootstrap,
@@ -214,14 +312,17 @@ bool ensure_remote_artifact(const bootstrap_node & bootstrap,
                             const std::filesystem::path & local_path,
                             const std::filesystem::path & remote_path,
                             const std::string & digest, std::string & error);
+bool ensure_remote_hf_artifact(const bootstrap_node & bootstrap,
+                               const std::filesystem::path & remote_path,
+                               const std::string & hf_repo,
+                               const std::string & hf_file,
+                               const std::string & hf_token,
+                               const std::string & digest, bool offline,
+                               std::string & error);
 std::string pinned_model_digest(const std::filesystem::path & model_path,
                                 const std::filesystem::path & repo_root);
 
-std::vector<potluck::accel_profile> collect_accel_profiles(ServerRing & ring, uint32_t n_workers);
-void assign_gpu_layers(std::vector<potluck::ring_window> & windows,
-                       const std::vector<potluck::accel_profile> & profiles,
-                       uint32_t n_workers, uint64_t model_bytes, uint32_t n_layer,
-                       uint32_t n_head_kv, uint32_t head_dim, uint32_t n_ctx);
+std::vector<potluck::device_profile> collect_device_profiles(ServerRing & ring, uint32_t n_workers);
 const char * accel_kind_name(potluck::accel_kind kind);
 
 std::filesystem::path canonical_model_path(const std::filesystem::path & model_path);
@@ -240,13 +341,10 @@ pid_t launch_local_worker(const std::string & worker_path, const std::string & m
                           const ring_worker & worker, const std::string & result_endpoint,
                           uint32_t index,
                           const potluck::curve_bootstrap_credentials & credentials);
-bool stop_remote_workers(const bootstrap_node & bootstrap);
-void terminate_child_process(pid_t pid);
 void stop_planned_workers(const std::vector<planned_worker> & planned);
-
 void configure_ring(ServerRing & ring, uint32_t n_layer, uint32_t n_ctx,
-                    uint32_t n_seq_max, uint32_t n_ubatch, uint32_t seed,
-                    float temp, float top_p,
+                    uint32_t n_seq_max, uint32_t n_ubatch, uint32_t n_rs_seq,
+                    uint32_t seed, float temp, float top_p, potluck::prefetch_mode prefetch,
                     const potluck::curve_client_credentials & controller_credentials);
 bool reset_ring_workers(ServerRing & ring, std::string & error);
 
@@ -281,7 +379,10 @@ std::vector<int32_t> drive_ring_cycle(ServerRing & ring,
                                  std::function<bool()> should_cancel = {},
                                  bool * batch_started = nullptr,
                                  std::function<bool(std::string &)> heartbeat = {},
-                                 potluck::batch_logprobs * result_logprobs = nullptr);
+                                 potluck::batch_logprobs * result_logprobs = nullptr,
+                                 const std::vector<int32_t> & draft_tokens = {},
+                                 uint32_t accepted_count = 0,
+                                 uint32_t * result_accepted_count = nullptr);
 
 std::vector<llama_token> tokenize_prompt(const llama_vocab * vocab, const std::string & text);
 std::string token_piece(const llama_vocab * vocab, llama_token token);
@@ -308,6 +409,15 @@ inline const char * slot_state_name(slot_state state) {
     }
     return "free";
 }
+struct slot_speculative_config {
+    std::string draft_model;
+    std::vector<std::string> types;
+    uint32_t n_draft = 0;
+    uint32_t n_ctx = 4096;
+    uint32_t n_batch = 2048;
+    uint32_t n_ubatch = 512;
+};
+
 
 struct scheduled_slot {
     uint32_t index = 0;
@@ -324,6 +434,14 @@ struct scheduled_slot {
     bool configured = false;
     bool ever_used = false;
     bool needs_clear = false;
+    bool needs_trim = false;
+    int32_t trim_to = -1;
+    bool speculative_started = false;
+    bool speculative_prompt_tail_pending = false;
+    llama_token speculative_prompt_tail = 0;
+    int32_t speculative_prompt_tail_position = -1;
+    common_speculative_init_result_ptr speculative_init;
+    common_speculative_ptr speculative;
     bool stream = false;
     bool chat = false;
     std::string id;
@@ -354,13 +472,15 @@ public:
     slot_scheduler(ServerRing & ring, const llama_vocab * vocab, uint32_t n_slots,
                    uint32_t prefill_batch, std::function<bool(std::string &)> rebuild = {},
                    std::function<bool(std::string &)> heartbeat = {},
-                   std::function<topology_refresh_result(std::string &)> refresh = {})
-        : ring_(ring), vocab_(vocab),
+                   std::function<topology_refresh_result(std::string &)> refresh = {},
+                   const llama_model * target_model = nullptr,
+                   slot_speculative_config speculative = {})
+        : ring_(ring), vocab_(vocab), target_model_(target_model),
+          speculative_config_(std::move(speculative)),
           prefill_batch_(std::max<uint32_t>(1, prefill_batch)),
           rebuild_(std::move(rebuild)),
           heartbeat_(std::move(heartbeat)),
-          refresh_(std::move(refresh)),
-          next_topology_check_(std::chrono::steady_clock::now() + std::chrono::seconds(30)) {
+          refresh_(std::move(refresh)) {
         slots_.reserve(std::max<uint32_t>(1, n_slots));
         for (uint32_t i = 0; i < std::max<uint32_t>(1, n_slots); ++i) {
             auto slot = std::make_shared<scheduled_slot>();
@@ -373,6 +493,8 @@ public:
     void start() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!thread_.joinable()) {
+            next_topology_check_ = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(30);
             thread_ = std::thread([this] { run(); });
         }
     }
@@ -404,6 +526,21 @@ public:
 
     ~slot_scheduler() {
         stop();
+        if (speculative_target_context_ != nullptr) {
+            llama_free(speculative_target_context_);
+            speculative_target_context_ = nullptr;
+        }
+        if (speculative_configured()) {
+            const double accept_rate = speculative_drafted_ == 0
+                ? 0.0
+                : static_cast<double>(speculative_accepted_) /
+                      static_cast<double>(speculative_drafted_);
+            std::printf("potluck-server: speculative drafted=%llu accepted=%llu accept-rate=%.3f\n",
+                        static_cast<unsigned long long>(speculative_drafted_),
+                        static_cast<unsigned long long>(speculative_accepted_),
+                        accept_rate);
+            std::fflush(stdout);
+        }
     }
 
     std::vector<std::shared_ptr<scheduled_slot>> acquire_many(
@@ -545,6 +682,14 @@ public:
             slot->piece_logprobs.clear();
             slot->generated_logprobs.clear();
             slot->generated.clear();
+            slot->speculative.reset();
+            slot->speculative_init.reset();
+            slot->speculative_started = false;
+            slot->speculative_prompt_tail_pending = false;
+            slot->speculative_prompt_tail = 0;
+            slot->speculative_prompt_tail_position = -1;
+            slot->needs_trim = false;
+            slot->trim_to = -1;
             slot->n_decoded = 0;
             slot->cancelled = false;
             slot->release_when_finished = false;
@@ -577,6 +722,19 @@ public:
     }
 
 private:
+    bool speculative_configured() const {
+        return speculative_config_.n_draft != 0 ||
+               !speculative_config_.draft_model.empty() ||
+               !speculative_config_.types.empty();
+    }
+    void ensure_speculator(const std::shared_ptr<scheduled_slot> & slot);
+    void process_speculative_batch(const std::shared_ptr<scheduled_slot> & slot,
+                                   const std::vector<int32_t> & positions,
+                                   const std::vector<int32_t> & tokens,
+                                   bool prompt_complete,
+                                   uint32_t accepted_count,
+                                   int32_t trim_to);
+    void prime_speculative_prompt_tail(const std::shared_ptr<scheduled_slot> & slot);
     void reap_cancelled() {
         std::vector<std::shared_ptr<scheduled_slot>> ready;
         for (const auto & slot : slots_) {
@@ -676,10 +834,18 @@ private:
             std::lock_guard<std::mutex> lock(configuration.first->mutex);
             configuration.first->configured = true;
         }
+        if (speculative_configured()) {
+            for (const auto & slot : selected) {
+                ensure_speculator(slot);
+            }
+        }
 
         std::vector<batch_item> prefill_body;
         std::vector<batch_item> prefill_logits;
         std::vector<batch_item> decode;
+        std::shared_ptr<scheduled_slot> speculative_slot;
+        std::vector<int32_t> speculative_draft;
+        std::vector<batch_item> speculative_items;
         std::vector<std::pair<std::shared_ptr<scheduled_slot>, size_t>> prefill_offsets;
         size_t prefill_count = 0;
         for (const auto & slot : selected) {
@@ -723,12 +889,97 @@ private:
                 static_cast<int32_t>(slot->last)
             });
         }
+        if (speculative_configured()) {
+            for (const auto & item : decode) {
+                prime_speculative_prompt_tail(item.slot);
+            }
+        }
+        if (speculative_configured() && !decode.empty()) {
+            const uint32_t configured_draft = speculative_config_.n_draft == 0
+                ? 3 : speculative_config_.n_draft;
+            for (size_t index = 0; index < decode.size(); ++index) {
+                const size_t normal_count = decode.size() - 1;
+                if (prefill_count + normal_count + configured_draft + 1 > prefill_batch_) {
+                    continue;
+                }
+                const auto & candidate = decode[index];
+                std::vector<llama_token> history;
+                llama_token last = 0;
+                uint32_t position = 0;
+                {
+                    std::lock_guard<std::mutex> lock(candidate.slot->mutex);
+                    history = candidate.slot->prompt;
+                    if (!candidate.slot->generated.empty()) {
+                        history.insert(history.end(), candidate.slot->generated.begin(),
+                                       candidate.slot->generated.end() - 1);
+                    }
+                    last = candidate.slot->last;
+                    position = candidate.slot->next_position;
+                }
+                std::vector<llama_token> draft;
+                auto & draft_params = common_speculative_get_draft_params(
+                    candidate.slot->speculative.get(), 0);
+                draft_params = {
+                    true,
+                    static_cast<int32_t>(configured_draft),
+                    static_cast<llama_pos>(position),
+                    last,
+                    &history,
+                    &draft,
+                };
+                common_speculative_draft(candidate.slot->speculative.get());
+                if (candidate.slot->speculative_init != nullptr &&
+                    candidate.slot->speculative_init->context() != nullptr &&
+                    !llama_memory_seq_rm(
+                        llama_get_memory(candidate.slot->speculative_init->context()),
+                        0, static_cast<int32_t>(position), -1)) {
+                    throw std::runtime_error(
+                        "cannot reset speculative draft context for verification");
+                }
+                if (draft.size() > configured_draft) {
+                    draft.resize(configured_draft);
+                }
+                if (draft.empty()) {
+                    continue;
+                }
+                speculative_slot = candidate.slot;
+                decode.erase(decode.begin() + static_cast<std::ptrdiff_t>(index));
+                speculative_draft.reserve(draft.size());
+                for (const llama_token token : draft) {
+                    speculative_draft.push_back(static_cast<int32_t>(token));
+                }
+                speculative_items.push_back(candidate);
+                for (size_t draft_index = 0; draft_index < draft.size(); ++draft_index) {
+                    speculative_items.push_back({
+                        candidate.slot,
+                        static_cast<int32_t>(position + draft_index + 1),
+                        static_cast<int32_t>(draft[draft_index]),
+                    });
+                }
+                break;
+            }
+        }
+
+        std::shared_ptr<scheduled_slot> trim_slot;
+        int32_t trim_seq = -1;
+        int32_t trim_to = -1;
+        for (const auto & slot : selected) {
+            std::lock_guard<std::mutex> lock(slot->mutex);
+            if (slot->needs_trim) {
+                trim_slot = slot;
+                trim_seq = slot->seq;
+                trim_to = slot->trim_to;
+                break;
+            }
+        }
 
         std::vector<batch_item> items;
-        items.reserve(prefill_body.size() + decode.size() + prefill_logits.size());
+        items.reserve(prefill_body.size() + decode.size() + prefill_logits.size() +
+                      speculative_items.size());
         items.insert(items.end(), prefill_body.begin(), prefill_body.end());
         items.insert(items.end(), decode.begin(), decode.end());
         items.insert(items.end(), prefill_logits.begin(), prefill_logits.end());
+        items.insert(items.end(), speculative_items.begin(), speculative_items.end());
         if (items.empty()) {
             return;
         }
@@ -743,7 +994,8 @@ private:
             sequences.push_back(item.slot->seq);
             tokens.push_back(item.token);
         }
-        const uint32_t n_logits = static_cast<uint32_t>(decode.size() + prefill_logits.size());
+        const uint32_t n_logits = static_cast<uint32_t>(
+            decode.size() + prefill_logits.size() + speculative_items.size());
         const int32_t clear_seq = clear_slot ? clear_slot->seq : -1;
         const auto batch_cancelled = [&]() {
             if (is_stopping()) {
@@ -773,10 +1025,12 @@ private:
         };
         std::vector<int32_t> result;
         potluck::batch_logprobs result_logprobs;
+        uint32_t accepted_count_result = 0;
         try {
             result = drive_ring_cycle(
-                ring_, positions, sequences, tokens, clear_seq, -1, -1, n_logits,
-                batch_cancelled, &batch_started, heartbeat_, &result_logprobs);
+                ring_, positions, sequences, tokens, clear_seq, trim_seq, trim_to, n_logits,
+                batch_cancelled, &batch_started, heartbeat_, &result_logprobs,
+                speculative_draft, 0, &accepted_count_result);
         } catch (const request_cancelled &) {
             if (batch_started) {
                 fail_selected();
@@ -823,6 +1077,47 @@ private:
                 slot->needs_clear = true;
             }
         }
+        if (trim_slot != nullptr) {
+            std::lock_guard<std::mutex> lock(trim_slot->mutex);
+            trim_slot->needs_trim = false;
+            trim_slot->trim_to = -1;
+        }
+        for (const auto & slot : selected) {
+            std::vector<int32_t> slot_positions;
+            std::vector<int32_t> slot_tokens;
+            for (const batch_item & item : items) {
+                if (item.slot == slot) {
+                    slot_positions.push_back(item.position);
+                    slot_tokens.push_back(item.token);
+                }
+            }
+            if (slot_positions.empty()) {
+                continue;
+            }
+            bool prompt_complete = false;
+            {
+                std::lock_guard<std::mutex> lock(slot->mutex);
+                prompt_complete = slot->state == slot_state::prefill &&
+                    slot->prefill_offset == slot->prompt.size();
+            }
+            if (slot->speculative != nullptr) {
+                const bool is_speculative = slot == speculative_slot;
+                const int32_t next_trim = is_speculative
+                    ? static_cast<int32_t>(
+                        speculative_items.front().position + accepted_count_result + 1)
+                    : -1;
+                process_speculative_batch(
+                    slot, slot_positions, slot_tokens, prompt_complete,
+                    is_speculative ? accepted_count_result : 0, next_trim);
+                if (is_speculative) {
+                    std::lock_guard<std::mutex> lock(slot->mutex);
+                    slot->needs_trim = true;
+                    slot->trim_to = next_trim;
+                    speculative_drafted_ += speculative_draft.size();
+                    speculative_accepted_ += accepted_count_result;
+                }
+            }
+        }
         const size_t result_start = items.size() - n_logits;
         const auto logprobs_at = [&](size_t index)
             -> const std::vector<potluck::token_logprob> & {
@@ -838,6 +1133,18 @@ private:
                  static_cast<llama_token>(result[result_start + decode.size() + i]),
                  static_cast<uint32_t>(prefill_logits[i].position),
                  logprobs_at(decode.size() + i));
+        }
+        if (speculative_slot != nullptr) {
+            const size_t spec_start = decode.size() + prefill_logits.size();
+            const size_t spec_count = std::min(
+                speculative_items.size(),
+                static_cast<size_t>(accepted_count_result) + 1);
+            for (size_t i = 0; i < spec_count; ++i) {
+                emit(speculative_slot,
+                     static_cast<llama_token>(result[result_start + spec_start + i]),
+                     static_cast<uint32_t>(speculative_items[i].position),
+                     logprobs_at(spec_start + i));
+            }
         }
         for (const auto & slot : cancelled) {
             std::lock_guard<std::mutex> lock(slot->mutex);
@@ -1143,6 +1450,11 @@ private:
 
     ServerRing & ring_;
     const llama_vocab * vocab_;
+    const llama_model * target_model_;
+    slot_speculative_config speculative_config_;
+    llama_context * speculative_target_context_ = nullptr;
+    uint64_t speculative_drafted_ = 0;
+    uint64_t speculative_accepted_ = 0;
     uint32_t prefill_batch_;
     std::function<bool(std::string &)> rebuild_;
     std::function<bool(std::string &)> heartbeat_;
@@ -1159,6 +1471,7 @@ private:
     std::vector<std::shared_ptr<scheduled_slot>> slots_;
     std::thread thread_;
     bool stopping_ = false;
+
 };
 
 void setup_http_routes(httplib::Server & server, ring_session & session,

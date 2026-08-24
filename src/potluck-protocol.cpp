@@ -70,10 +70,13 @@ bool read_f32(const uint8_t * data, size_t size, size_t & offset, float & value,
 }
 } // namespace
 bool encode_config(const node_config & config, std::vector<uint8_t> & out) {
-    constexpr uint32_t config_version = 1;
+    constexpr uint32_t config_version = 3;
     if (config.n_workers == 0 || config.index >= config.n_workers ||
         config.n_layer == 0 || config.windows.empty() ||
-        config.windows.size() > config.n_layer) {
+        config.windows.size() > config.n_layer ||
+        static_cast<uint32_t>(config.prefetch) >
+            static_cast<uint32_t>(prefetch_mode::force) ||
+        config.n_cycles == 0) {
         return false;
     }
     uint32_t next_layer = 0;
@@ -96,9 +99,12 @@ bool encode_config(const node_config & config, std::vector<uint8_t> & out) {
     append_u32(out, config.n_ctx);
     append_u32(out, config.n_seq_max);
     append_u32(out, config.n_ubatch);
+    append_u32(out, config.n_rs_seq);
     append_u32(out, config.seed);
     append_f32(out, config.temp);
     append_f32(out, config.top_p);
+    append_u32(out, static_cast<uint32_t>(config.prefetch));
+    append_u32(out, config.n_cycles);
     append_u32(out, static_cast<uint32_t>(config.windows.size()));
     for (const ring_window & window : config.windows) {
         append_u32(out, window.owner);
@@ -110,7 +116,7 @@ bool encode_config(const node_config & config, std::vector<uint8_t> & out) {
 }
 
 bool decode_config(const uint8_t * data, size_t size, node_config & config, std::string & error) {
-    constexpr uint32_t config_version = 1;
+    constexpr uint32_t config_version = 3;
     error.clear();
     config = node_config{};
     size_t offset = 0;
@@ -122,21 +128,28 @@ bool decode_config(const uint8_t * data, size_t size, node_config & config, std:
         error = "unsupported ring config version";
         return false;
     }
+    uint32_t raw_prefetch = 0;
     if (!read_u32(data, size, offset, config.n_workers, error) ||
         !read_u32(data, size, offset, config.index, error) ||
         !read_u32(data, size, offset, config.n_layer, error) ||
         !read_u32(data, size, offset, config.n_ctx, error) ||
         !read_u32(data, size, offset, config.n_seq_max, error) ||
         !read_u32(data, size, offset, config.n_ubatch, error) ||
+        !read_u32(data, size, offset, config.n_rs_seq, error) ||
         !read_u32(data, size, offset, config.seed, error) ||
         !read_f32(data, size, offset, config.temp, error) ||
-        !read_f32(data, size, offset, config.top_p, error)) {
+        !read_f32(data, size, offset, config.top_p, error) ||
+        !read_u32(data, size, offset, raw_prefetch, error) ||
+        !read_u32(data, size, offset, config.n_cycles, error)) {
         return false;
     }
-    if (config.n_workers == 0 || config.index >= config.n_workers || config.n_layer == 0) {
+    if (config.n_workers == 0 || config.index >= config.n_workers || config.n_layer == 0 ||
+        raw_prefetch > static_cast<uint32_t>(prefetch_mode::force) ||
+        config.n_cycles == 0) {
         error = "invalid ring config dimensions";
         return false;
     }
+    config.prefetch = static_cast<prefetch_mode>(raw_prefetch);
 
     uint32_t n_windows = 0;
     if (!read_u32(data, size, offset, n_windows, error)) {
@@ -231,74 +244,152 @@ bool decode_worker_bench_metrics(const uint8_t * data, size_t size,
     return offset == size;
 }
 
-bool encode_accel_profile(const accel_profile & profile, std::vector<uint8_t> & out) {
-    constexpr uint32_t profile_magic = 0x32504145; // "EAP2"
-    if (static_cast<uint32_t>(profile.kind) > static_cast<uint32_t>(accel_kind::other)) {
+bool encode_device_profile(const device_profile & profile, std::vector<uint8_t> & out) {
+    constexpr uint32_t profile_magic = 0x33504445; // "EDP3"
+    constexpr uint32_t max_profile_vector_count = 4096;
+    constexpr size_t profile_fixed_bytes = 70;
+    const auto valid_vector = [](const std::vector<float> & values) {
+        if (values.size() > max_profile_vector_count) {
+            return false;
+        }
+        for (const float value : values) {
+            if (!std::isfinite(value) || value < 0.0f) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (static_cast<uint32_t>(profile.kind) > static_cast<uint32_t>(accel_kind::other) ||
+        static_cast<uint32_t>(profile.os) > static_cast<uint32_t>(os_kind::linux_os) ||
+        !valid_vector(profile.cpu_gflops) || !valid_vector(profile.accel_gflops) ||
+        !std::isfinite(profile.mem_copy_delay_ms) || profile.mem_copy_delay_ms < 0.0f ||
+        !std::isfinite(profile.accel_copy_delay_ms) || profile.accel_copy_delay_ms < 0.0f ||
+        !std::isfinite(profile.disk_read_seq_gbps) || profile.disk_read_seq_gbps < 0.0f ||
+        !std::isfinite(profile.disk_read_rnd_gbps) || profile.disk_read_rnd_gbps < 0.0f) {
+        return false;
+    }
+    const size_t vector_bytes =
+        (profile.cpu_gflops.size() + profile.accel_gflops.size()) * sizeof(float);
+    const size_t bytes = profile_fixed_bytes + vector_bytes;
+    if (bytes > max_payload_bytes) {
         return false;
     }
     out.clear();
+    out.reserve(bytes);
     append_u32(out, profile_magic);
     append_u32(out, profile.rank);
     out.push_back(static_cast<uint8_t>(profile.kind));
+    out.push_back(static_cast<uint8_t>(profile.os));
     append_u64(out, profile.free_bytes);
     append_u64(out, profile.total_bytes);
     append_u64(out, profile.host_free_bytes);
     append_u64(out, profile.host_total_bytes);
+    append_u32(out, static_cast<uint32_t>(profile.cpu_gflops.size()));
+    for (const float value : profile.cpu_gflops) {
+        append_f32(out, value);
+    }
+    append_u32(out, static_cast<uint32_t>(profile.accel_gflops.size()));
+    for (const float value : profile.accel_gflops) {
+        append_f32(out, value);
+    }
+    append_f32(out, profile.mem_copy_delay_ms);
+    append_f32(out, profile.accel_copy_delay_ms);
+    append_f32(out, profile.disk_read_seq_gbps);
+    append_f32(out, profile.disk_read_rnd_gbps);
+    append_u32(out, profile.n_cpu_threads);
     return true;
 }
 
-bool decode_accel_profile(const uint8_t * data, size_t size, accel_profile & profile,
-                          std::string & error) {
-    constexpr uint32_t profile_magic = 0x32504145; // "EAP2"
-    constexpr size_t profile_bytes = 41;
-    profile = accel_profile{};
+bool decode_device_profile(const uint8_t * data, size_t size, device_profile & profile,
+                           std::string & error) {
+    constexpr uint32_t profile_magic = 0x33504445; // "EDP3"
+    constexpr uint32_t max_profile_vector_count = 4096;
+    constexpr size_t profile_fixed_bytes = 70;
+    profile = device_profile{};
     error.clear();
-    if (size != profile_bytes) {
-        error = "accelerator profile size mismatch";
+    if (size > max_payload_bytes) {
+        error = "device profile size mismatch";
         return false;
     }
     size_t offset = 0;
     uint32_t magic = 0;
-    uint32_t rank = 0;
-    uint64_t free_bytes = 0;
-    uint64_t total_bytes = 0;
-    uint64_t host_free_bytes = 0;
-    uint64_t host_total_bytes = 0;
     if (!read_u32(data, size, offset, magic, error)) {
         return false;
     }
     if (magic != profile_magic) {
-        error = "invalid accelerator profile magic";
+        error = "invalid device profile magic";
         return false;
     }
-    if (!read_u32(data, size, offset, rank, error)) {
+    if (size < profile_fixed_bytes) {
+        error = "device profile size mismatch";
         return false;
     }
-    if (data == nullptr || offset >= size) {
-        error = "truncated accelerator profile kind";
+    if (!read_u32(data, size, offset, profile.rank, error)) {
         return false;
     }
-    const uint8_t kind = data[offset++];
-    if (kind > static_cast<uint8_t>(accel_kind::other)) {
+    if (data == nullptr || offset + 2 > size) {
+        error = "truncated device profile kinds";
+        return false;
+    }
+    const uint32_t raw_kind = data[offset++];
+    const uint32_t raw_os = data[offset++];
+    if (raw_kind > static_cast<uint32_t>(accel_kind::other)) {
         error = "unknown accelerator kind";
         return false;
     }
-    if (!read_u64(data, size, offset, free_bytes, error) ||
-        !read_u64(data, size, offset, total_bytes, error) ||
-        !read_u64(data, size, offset, host_free_bytes, error) ||
-        !read_u64(data, size, offset, host_total_bytes, error)) {
+    if (raw_os > static_cast<uint32_t>(os_kind::linux_os)) {
+        error = "unknown operating system kind";
+        return false;
+    }
+    profile.kind = static_cast<accel_kind>(raw_kind);
+    profile.os = static_cast<os_kind>(raw_os);
+    if (!read_u64(data, size, offset, profile.free_bytes, error) ||
+        !read_u64(data, size, offset, profile.total_bytes, error) ||
+        !read_u64(data, size, offset, profile.host_free_bytes, error) ||
+        !read_u64(data, size, offset, profile.host_total_bytes, error)) {
+        return false;
+    }
+    const auto read_vector = [&](std::vector<float> & values) {
+        uint32_t count = 0;
+        if (!read_u32(data, size, offset, count, error)) {
+            return false;
+        }
+        if (count > max_profile_vector_count || offset > size ||
+            count > (size - offset) / sizeof(float)) {
+            error = "invalid device profile vector count";
+            return false;
+        }
+        values.resize(count);
+        for (float & value : values) {
+            if (!read_f32(data, size, offset, value, error)) {
+                return false;
+            }
+            if (!std::isfinite(value) || value < 0.0f) {
+                error = "invalid device profile vector value";
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!read_vector(profile.cpu_gflops) || !read_vector(profile.accel_gflops) ||
+        !read_f32(data, size, offset, profile.mem_copy_delay_ms, error) ||
+        !read_f32(data, size, offset, profile.accel_copy_delay_ms, error) ||
+        !read_f32(data, size, offset, profile.disk_read_seq_gbps, error) ||
+        !read_f32(data, size, offset, profile.disk_read_rnd_gbps, error) ||
+        !read_u32(data, size, offset, profile.n_cpu_threads, error)) {
+        return false;
+    }
+    if (!std::isfinite(profile.mem_copy_delay_ms) || profile.mem_copy_delay_ms < 0.0f ||
+        !std::isfinite(profile.accel_copy_delay_ms) || profile.accel_copy_delay_ms < 0.0f ||
+        !std::isfinite(profile.disk_read_seq_gbps) || profile.disk_read_seq_gbps < 0.0f ||
+        !std::isfinite(profile.disk_read_rnd_gbps) || profile.disk_read_rnd_gbps < 0.0f) {
+        error = "invalid device profile metrics";
         return false;
     }
     if (offset != size) {
-        error = "accelerator profile size mismatch";
+        error = "device profile size mismatch";
         return false;
     }
-    profile.rank = rank;
-    profile.kind = static_cast<accel_kind>(kind);
-    profile.free_bytes = free_bytes;
-    profile.total_bytes = total_bytes;
-    profile.host_free_bytes = host_free_bytes;
-    profile.host_total_bytes = host_total_bytes;
     return true;
 }
 bool encode_slot_config(const slot_config & config, std::vector<uint8_t> & out) {
@@ -475,26 +566,35 @@ bool decode_batch_logprobs(const uint8_t * data, size_t size, batch_logprobs & v
 bool encode_batch_payload(const std::vector<int32_t> & pos,
                           const std::vector<int32_t> & seq,
                           const std::vector<int32_t> & tokens,
+                          const std::vector<int32_t> & draft_tokens,
+                          uint32_t accepted_count,
                           const float * hidden, size_t n_embd,
                           int32_t clear_seq, int32_t trim_seq, int32_t trim_to,
                           uint32_t n_logits,
                           std::vector<uint8_t> & out) {
+    constexpr uint32_t batch_magic = 0x31505442; // "BTP1"
+    constexpr uint32_t batch_version = 1;
+    constexpr size_t batch_header_bytes = 36;
+    const size_t n = pos.size();
+    const size_t n_draft = draft_tokens.size();
     const bool has_tokens = !tokens.empty();
     const bool has_hidden = hidden != nullptr && n_embd > 0;
-    const bool clear_only = pos.empty() && seq.empty() && tokens.empty() &&
-        !has_hidden && clear_seq != -1 && trim_seq == -1 && trim_to == -1 &&
-        n_logits == 0;
-    if ((!clear_only && has_tokens == has_hidden) ||
-        (!clear_only && (pos.empty() || seq.size() != pos.size() ||
-                         n_logits > pos.size() ||
-                         (has_tokens && tokens.size() != pos.size()))) ||
+    const bool clear_only = n == 0 && seq.empty() && tokens.empty() &&
+        draft_tokens.empty() && !has_hidden && accepted_count == 0 &&
+        clear_seq != -1 && trim_seq == -1 && trim_to == -1 && n_logits == 0;
+    if (accepted_count > n_draft ||
+        (!clear_only && has_tokens == has_hidden) ||
+        (!clear_only && (n == 0 || seq.size() != n ||
+                         n_logits > n ||
+                         (has_tokens && tokens.size() != n))) ||
         (clear_only && (clear_seq < -2 || clear_seq == -1)) ||
         clear_seq < -2 || trim_seq < -1 || trim_to < -1 ||
         (trim_to >= 0 && trim_seq < 0)) {
         return false;
     }
-    const size_t n = pos.size();
-    if (n > (max_payload_bytes - 20) / 8) {
+    if (n > UINT32_MAX || n_draft > 4096 ||
+        n > (max_payload_bytes - batch_header_bytes) / 8 ||
+        n_draft > (max_payload_bytes - batch_header_bytes) / sizeof(int32_t)) {
         return false;
     }
     size_t n_data = 0;
@@ -509,31 +609,41 @@ bool encode_batch_payload(const std::vector<int32_t> & pos,
         }
         n_data = n * n_embd;
     }
-    if (n_data > (max_payload_bytes - 20 - 8 * n) / sizeof(float)) {
+    const size_t base_bytes = batch_header_bytes + 8 * n + 4 * n_draft;
+    if (base_bytes > max_payload_bytes ||
+        n_data > (max_payload_bytes - base_bytes) / sizeof(float)) {
         return false;
     }
+    const size_t payload_bytes = base_bytes + sizeof(float) * n_data;
     out.clear();
-    out.reserve(20 + 8 * n + sizeof(float) * n_data);
+    out.reserve(payload_bytes);
+    append_u32(out, batch_magic);
+    append_u32(out, batch_version);
     append_u32(out, static_cast<uint32_t>(n));
     append_u32(out, static_cast<uint32_t>(clear_seq));
     append_u32(out, static_cast<uint32_t>(trim_seq));
     append_u32(out, static_cast<uint32_t>(trim_to));
     append_u32(out, n_logits);
-    for (int32_t v : pos) {
-        append_u32(out, static_cast<uint32_t>(v));
+    append_u32(out, static_cast<uint32_t>(n_draft));
+    append_u32(out, accepted_count);
+    for (const int32_t value : pos) {
+        append_u32(out, static_cast<uint32_t>(value));
     }
-    for (int32_t v : seq) {
-        append_u32(out, static_cast<uint32_t>(v));
+    for (const int32_t value : seq) {
+        append_u32(out, static_cast<uint32_t>(value));
+    }
+    for (const int32_t value : draft_tokens) {
+        append_u32(out, static_cast<uint32_t>(value));
     }
     if (has_tokens) {
-        for (int32_t v : tokens) {
-            append_u32(out, static_cast<uint32_t>(v));
+        for (const int32_t value : tokens) {
+            append_u32(out, static_cast<uint32_t>(value));
         }
-    } else {
+    } else if (has_hidden) {
         const uint8_t * bytes = reinterpret_cast<const uint8_t *>(hidden);
         out.insert(out.end(), bytes, bytes + n_data * sizeof(float));
     }
-    return true;
+    return out.size() == payload_bytes;
 }
 
 bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
@@ -542,34 +652,60 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
                           std::vector<int32_t> & pos,
                           std::vector<int32_t> & seq,
                           std::vector<int32_t> & tokens,
+                          std::vector<int32_t> & draft_tokens,
+                          uint32_t & accepted_count,
                           std::vector<float> & hidden,
                           std::string & error) {
+    constexpr uint32_t batch_magic = 0x31505442; // "BTP1"
+    constexpr uint32_t batch_version = 1;
+    constexpr uint32_t max_batch_draft_count = 4096;
+    constexpr size_t batch_header_bytes = 36;
     pos.clear();
     seq.clear();
     tokens.clear();
+    draft_tokens.clear();
     hidden.clear();
     clear_seq = -1;
     trim_seq = -1;
     trim_to = -1;
     n_logits = 0;
+    accepted_count = 0;
     error.clear();
-    if (data == nullptr || size > max_payload_bytes || size < 20) {
+    if (data == nullptr || size > max_payload_bytes || size < sizeof(uint32_t)) {
         error = "batch payload size mismatch";
         return false;
     }
     size_t offset = 0;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    if (!read_u32(data, size, offset, magic, error)) {
+        return false;
+    }
+    if (magic != batch_magic) {
+        error = "invalid batch payload magic";
+        return false;
+    }
+    if (!read_u32(data, size, offset, version, error)) {
+        return false;
+    }
+    if (version != batch_version) {
+        error = "unsupported batch payload version";
+        return false;
+    }
     uint32_t n = 0;
     uint32_t raw_clear_seq = 0;
     uint32_t raw_trim_seq = 0;
     uint32_t raw_trim_to = 0;
+    uint32_t n_draft = 0;
     if (!read_u32(data, size, offset, n, error) ||
         !read_u32(data, size, offset, raw_clear_seq, error) ||
         !read_u32(data, size, offset, raw_trim_seq, error) ||
         !read_u32(data, size, offset, raw_trim_to, error) ||
-        !read_u32(data, size, offset, n_logits, error)) {
+        !read_u32(data, size, offset, n_logits, error) ||
+        !read_u32(data, size, offset, n_draft, error) ||
+        !read_u32(data, size, offset, accepted_count, error)) {
         return false;
     }
-    const size_t n_entries = n;
     clear_seq = static_cast<int32_t>(raw_clear_seq);
     trim_seq = static_cast<int32_t>(raw_trim_seq);
     trim_to = static_cast<int32_t>(raw_trim_to);
@@ -578,71 +714,85 @@ bool decode_batch_payload(const uint8_t * data, size_t size, size_t n_embd,
         error = "invalid batch clear or trim controls";
         return false;
     }
+    if (n_draft > max_batch_draft_count || accepted_count > n_draft) {
+        error = accepted_count > n_draft
+            ? "invalid batch accepted count" : "invalid batch draft count";
+        return false;
+    }
     if (n == 0) {
         if (clear_seq == -1 || trim_seq != -1 || trim_to != -1 || n_logits != 0 ||
-            offset != size) {
+            n_draft != 0 || accepted_count != 0 || offset != size) {
             error = "invalid clear-only batch";
             return false;
         }
         return true;
     }
-    if (n_logits > n_entries || n_entries > (max_payload_bytes - 20) / 8) {
+    if (n_logits > n || n > (max_payload_bytes - batch_header_bytes) / 8) {
         error = "invalid batch entry count";
         return false;
     }
-    const size_t fixed_bytes = 20 + 8 * n_entries;
+    const size_t fixed_bytes = batch_header_bytes + 8 * static_cast<size_t>(n) +
+        4 * static_cast<size_t>(n_draft);
     if (size < fixed_bytes) {
         error = "truncated batch entries";
         return false;
     }
-    pos.resize(n_entries);
-    seq.resize(n_entries);
-    for (size_t i = 0; i < n_entries; ++i) {
-        uint32_t v = 0;
-        if (!read_u32(data, size, offset, v, error)) {
+    pos.resize(n);
+    seq.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t value = 0;
+        if (!read_u32(data, size, offset, value, error)) {
             return false;
         }
-        pos[i] = static_cast<int32_t>(v);
+        pos[i] = static_cast<int32_t>(value);
     }
-    for (size_t i = 0; i < n_entries; ++i) {
-        uint32_t v = 0;
-        if (!read_u32(data, size, offset, v, error)) {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t value = 0;
+        if (!read_u32(data, size, offset, value, error)) {
             return false;
         }
-        seq[i] = static_cast<int32_t>(v);
+        seq[i] = static_cast<int32_t>(value);
+    }
+    draft_tokens.resize(n_draft);
+    for (int32_t & value : draft_tokens) {
+        uint32_t raw_value = 0;
+        if (!read_u32(data, size, offset, raw_value, error)) {
+            return false;
+        }
+        value = static_cast<int32_t>(raw_value);
     }
     const size_t data_bytes = size - offset;
     size_t expected_bytes = 0;
     if (n_embd == 0) {
-        if (n_entries > max_payload_bytes / sizeof(int32_t)) {
+        if (n > max_payload_bytes / sizeof(int32_t)) {
             error = "batch token payload size mismatch";
             return false;
         }
-        expected_bytes = n_entries * sizeof(int32_t);
+        expected_bytes = static_cast<size_t>(n) * sizeof(int32_t);
         if (data_bytes != expected_bytes) {
             error = "batch token payload size mismatch";
             return false;
         }
-        tokens.resize(n_entries);
-        for (size_t i = 0; i < n_entries; ++i) {
-            uint32_t v = 0;
-            if (!read_u32(data, size, offset, v, error)) {
+        tokens.resize(n);
+        for (int32_t & value : tokens) {
+            uint32_t raw_value = 0;
+            if (!read_u32(data, size, offset, raw_value, error)) {
                 return false;
             }
-            tokens[i] = static_cast<int32_t>(v);
+            value = static_cast<int32_t>(raw_value);
         }
     } else {
         if (n_embd > max_payload_bytes / sizeof(float) ||
-            n_entries > max_payload_bytes / (sizeof(float) * n_embd)) {
+            n > max_payload_bytes / (sizeof(float) * n_embd)) {
             error = "batch hidden payload size mismatch";
             return false;
         }
-        expected_bytes = n_entries * n_embd * sizeof(float);
+        expected_bytes = static_cast<size_t>(n) * n_embd * sizeof(float);
         if (data_bytes != expected_bytes) {
             error = "batch hidden payload size mismatch";
             return false;
         }
-        hidden.resize(n_entries * n_embd);
+        hidden.resize(static_cast<size_t>(n) * n_embd);
         std::memcpy(hidden.data(), data + offset, data_bytes);
         offset += data_bytes;
     }

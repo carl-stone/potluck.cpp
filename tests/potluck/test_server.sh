@@ -16,8 +16,8 @@ MODEL="${MODEL:-$(potluck_model_path)}"
 
 source "${REPO}/tests/potluck/test_helpers.sh"
 if [[ ! -x "${BIN}/potluck-server" || ! -x "${BIN}/potluck-worker" ||
-      ! -x "${BIN}/potluck-shard" || ! -x "${BIN}/llama-cli" ]]; then
-    printf 'missing binaries (build potluck-server, potluck-worker, potluck-shard, llama-cli first): %s\n' "${BIN}" >&2
+      ! -x "${BIN}/llama-cli" ]]; then
+    printf 'missing binaries (build potluck-server, potluck-worker, llama-cli first): %s\n' "${BIN}" >&2
     exit 2
 fi
 if [[ ! -f "${MODEL}" ]]; then
@@ -27,6 +27,7 @@ fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/potluck-server.XXXXXX")
 SRV=""
+FIXED_SPLIT_ACTIVE=0
 SHUTDOWN_CURL_PID=""
 SHUTDOWN_READER_PID=""
 
@@ -109,7 +110,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-POTLUCK_TRACE_PRP=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 2 --ubatch 1 --port "${PORT}" \
+"${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 4 --ubatch 1 --prefetch advise --port "${PORT}" \
     >"${WORK}/server.log" 2>&1 &
 SRV=$!
 for _ in $(seq 1 120); do
@@ -131,6 +132,156 @@ grep -q 'listening on http' "${WORK}/server.log" || {
     printf 'server never became ready\n' >&2
     exit 1
 }
+
+collect_worker_pids() {
+    WORKER_PIDS=()
+    for child_pid in $(pgrep -P "${SRV}" 2>/dev/null || true); do
+        worker_name="$(ps -o comm= -p "${child_pid}" 2>/dev/null || true)"
+        if [[ "${worker_name}" == *potluck-worker* ]]; then
+            WORKER_PIDS+=("${child_pid}")
+        fi
+    done
+}
+
+collect_worker_pids
+if (( N_WORKERS > 1 && ${#WORKER_PIDS[@]} < 2 )); then
+    FIXED_SPLIT_ACTIVE=1
+    LAYER_WINDOW="$(python3 - "${WORK}/server.log" "${N_WORKERS}" <<'PY'
+import re
+import sys
+
+log_path, worker_count = sys.argv[1], int(sys.argv[2])
+ends = []
+with open(log_path, encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+        match = re.search(r"layers=\[\d+,(\d+)\)", line)
+        if match:
+            ends.append(int(match.group(1)))
+if not ends:
+    raise SystemExit("cannot derive model layer count from server log")
+layer_count = max(ends)
+if layer_count < worker_count or layer_count % worker_count:
+    raise SystemExit(
+        f"model layer count {layer_count} cannot split across {worker_count} workers"
+    )
+print(",".join([str(layer_count // worker_count)] * worker_count))
+PY
+)"
+    stop_server
+    "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" --slots 4 --ubatch 1 \
+        --prefetch advise --layer-window "${LAYER_WINDOW}" --port "${PORT}" \
+        >"${WORK}/server.log" 2>&1 &
+    SRV=$!
+    for _ in $(seq 1 120); do
+        grep -q 'listening on http' "${WORK}/server.log" 2>/dev/null && break
+        if ! kill -0 "${SRV}" 2>/dev/null; then
+            sed -n '$p' "${WORK}/server.log" >&2
+            printf 'server exited during split startup\n' >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    grep -q "HTTP bound while loading ring at http://0.0.0.0:${PORT}" "${WORK}/server.log" || {
+        sed -n '$p' "${WORK}/server.log" >&2
+        printf 'split server did not use the default LAN-visible bind address\n' >&2
+        exit 1
+    }
+    grep -q 'listening on http' "${WORK}/server.log" || {
+        sed -n '$p' "${WORK}/server.log" >&2
+        printf 'split server never became ready\n' >&2
+        exit 1
+    }
+    collect_worker_pids
+fi
+
+INSTALL_PREFIX="$(cd "${BIN}/.." && pwd)"
+for root in "${INSTALL_PREFIX}" "${REPO}"; do
+    SHARD_DIR="$(find "${root}" -type d -name '.potluck-shards' -print -quit)"
+    if [[ -n "${SHARD_DIR}" ]]; then
+        printf 'unexpected shard directory: %s\n' "${SHARD_DIR}" >&2
+        exit 1
+    fi
+done
+
+if (( ${#WORKER_PIDS[@]} == 0 )); then
+    printf 'ring startup found no direct potluck-worker child\n' >&2
+    exit 1
+fi
+if (( ${#WORKER_PIDS[@]} < 2 )); then
+    printf 'ring startup found fewer than two potluck-worker children: %s\n' \
+        "${#WORKER_PIDS[@]}" >&2
+    exit 1
+fi
+case "$(uname -s)" in
+    Darwin)
+        MODEL_BYTES="$(stat -f %z "${MODEL}")"
+        ;;
+    *)
+        MODEL_BYTES="$(stat -c %s "${MODEL}")"
+        ;;
+esac
+[[ "${MODEL_BYTES}" =~ ^[0-9]+$ && "${MODEL_BYTES}" -gt 0 ]] || {
+    printf 'could not read model size: %s\n' "${MODEL}" >&2
+    exit 1
+}
+
+for worker_pid in "${WORKER_PIDS[@]}"; do
+    MODEL_RESIDENT_BYTES="$(python3 - "${worker_pid}" "${MODEL}" <<'PY'
+import re
+import subprocess
+import sys
+
+pid, model = sys.argv[1], sys.argv[2]
+
+
+def bytes_from(value, unit):
+    scale = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+    return int(float(value) * scale[unit])
+
+
+if sys.platform == "darwin":
+    output = subprocess.check_output(
+        ["vmmap", pid],
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    total = 0
+    for line in output.splitlines():
+        if model not in line:
+            continue
+        match = re.search(r"\[\s*[0-9.]+[KMG]\s+([0-9.]+)([KMG])", line)
+        if match:
+            total += bytes_from(match.group(1), match.group(2))
+else:
+    header = re.compile(r"^[0-9a-f]+-[0-9a-f]+")
+    total = 0
+    in_model = False
+    with open(f"/proc/{pid}/smaps", encoding="ascii") as stream:
+        for line in stream:
+            if header.match(line):
+                in_model = line.rstrip().endswith(model)
+            elif in_model:
+                match = re.match(r"Rss:\s+([0-9]+)\s+kB", line)
+                if match:
+                    total += int(match.group(1)) * 1024
+
+if total == 0:
+    raise SystemExit(f"could not measure resident model mapping for worker {pid}")
+print(total)
+PY
+)"
+    [[ "${MODEL_RESIDENT_BYTES}" =~ ^[0-9]+$ ]] || {
+        printf 'could not read resident model mapping for potluck-worker %s\n' \
+            "${worker_pid}" >&2
+        exit 1
+    }
+    if (( MODEL_RESIDENT_BYTES * 100 >= MODEL_BYTES * 75 )); then
+        printf 'potluck-worker %s resident model mapping %s bytes is not below 75%% of model %s bytes\n' \
+            "${worker_pid}" "${MODEL_RESIDENT_BYTES}" "${MODEL_BYTES}" >&2
+        exit 1
+    fi
+done
+
 
 auth_header=(-H 'Content-Type: application/json')
 FRANCE=$(curl -fsS "${auth_header[@]}" -d '{"prompt":"The capital of France is","n_predict":8}' \
@@ -211,7 +362,7 @@ props = json.loads(sys.argv[1])
 assert props["model"]
 assert props["ready"] is True
 assert props["rebuilding"] is False
-assert props["slot_count"] == 2
+assert props["slot_count"] == 4
 PY
 
 TOOL_CHAT=$(curl -fsS "${auth_header[@]}" -d \
@@ -400,27 +551,48 @@ STREAM_LOGPROBS_STATUS=$(curl -sS -o "${WORK}/stream-logprobs.json" -w '%{http_c
     "http://${HOST}:${PORT}/v1/completions")
 [[ "${STREAM_LOGPROBS_STATUS}" == 400 ]]
 
-curl -fsS "${auth_header[@]}" \
-    -d '{"messages":[{"role":"user","content":"A short fact about the Moon is"}],"max_tokens":4,"temperature":0,"seed":1,"reasoning_effort":"none"}' \
-    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-a.json" &
+curl -fsS -N "${auth_header[@]}" \
+    -d '{"messages":[{"role":"user","content":"A short fact about the Moon is"}],"max_tokens":4,"temperature":0,"seed":1,"stream":true,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-a.sse" &
 CONCURRENT_A=$!
-curl -fsS "${auth_header[@]}" \
-    -d '{"messages":[{"role":"user","content":"A short fact about Mars is"}],"max_tokens":4,"temperature":1,"seed":2,"reasoning_effort":"none"}' \
-    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-b.json" &
+curl -fsS -N "${auth_header[@]}" \
+    -d '{"messages":[{"role":"user","content":"A short fact about Mars is"}],"max_tokens":4,"temperature":1,"seed":2,"stream":true,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-b.sse" &
 CONCURRENT_B=$!
+curl -fsS -N "${auth_header[@]}" \
+    -d '{"messages":[{"role":"user","content":"A short fact about Jupiter is"}],"max_tokens":4,"temperature":0,"seed":3,"stream":true,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-c.sse" &
+CONCURRENT_C=$!
+curl -fsS -N "${auth_header[@]}" \
+    -d '{"messages":[{"role":"user","content":"A short fact about Venus is"}],"max_tokens":4,"temperature":1,"seed":4,"stream":true,"reasoning_effort":"none"}' \
+    "http://${HOST}:${PORT}/v1/chat/completions" >"${WORK}/concurrent-d.sse" &
+CONCURRENT_D=$!
 wait "${CONCURRENT_A}"
 wait "${CONCURRENT_B}"
-python3 - "${WORK}/concurrent-a.json" "${WORK}/concurrent-b.json" <<'PY'
+wait "${CONCURRENT_C}"
+wait "${CONCURRENT_D}"
+python3 - "${WORK}/concurrent-a.sse" "${WORK}/concurrent-b.sse" \
+    "${WORK}/concurrent-c.sse" "${WORK}/concurrent-d.sse" <<'PY'
 import json, sys
 for path in sys.argv[1:]:
-    result = json.load(open(path))
-    assert result["object"] == "chat.completion"
-    choice = result["choices"][0]
-    assert choice["message"]["role"] == "assistant"
-    assert choice["message"]["content"]
-    assert choice["finish_reason"] in {"stop", "length"}
-    usage = result["usage"]
-    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    lines = [
+        line[6:]
+        for line in open(path, encoding="utf-8").read().splitlines()
+        if line.startswith("data: ")
+    ]
+    assert lines and lines[-1] == "[DONE]", path
+    chunks = [json.loads(line) for line in lines[:-1]]
+    assert chunks, path
+    assert chunks[0]["choices"][0]["delta"].get("role") == "assistant", path
+    content = "".join(
+        chunk["choices"][0]["delta"].get("content", "")
+        for chunk in chunks if chunk["choices"]
+    )
+    assert content, path
+    assert any(
+        chunk["choices"][0]["finish_reason"] in {"stop", "length"}
+        for chunk in chunks if chunk["choices"]
+    ), path
 PY
 
 MISSING_STATUS=$(curl -sS -o "${WORK}/missing.json" -w '%{http_code}' \
@@ -499,18 +671,19 @@ PY
 OPTIONS_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -X OPTIONS \
     "${auth_header[@]}" "http://${HOST}:${PORT}/completion")
 [[ "${OPTIONS_STATUS}" == 204 ]]
-
 HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
-python3 - "${HEALTH}" "${N_WORKERS}" <<'PY'
+python3 - "${HEALTH}" "${N_WORKERS}" "${FIXED_SPLIT_ACTIVE}" <<'PY'
 import json, sys
-health, expected = json.loads(sys.argv[1]), int(sys.argv[2])
+health, expected, fixed_split = (
+    json.loads(sys.argv[1]), int(sys.argv[2]), bool(int(sys.argv[3]))
+)
 assert health["status"] == "ok"
 assert health["loading"] is False
 assert health["ready"] is True
 assert health["rebuilding"] is False
 actual = health["workers"]
 assert 1 <= actual <= expected
-assert len(health["slots"]) == 2
+assert len(health["slots"]) == 4
 windows = sorted(health["windows"], key=lambda w: w["index"])
 assert windows and windows[0]["start"] == 0
 assert [w["index"] for w in windows] == list(range(len(windows)))
@@ -520,7 +693,7 @@ assert all(w["start"] < w["end"] for w in windows)
 assert all(0 <= w["owner"] < actual for w in windows)
 assert len(windows) % actual == 0
 round_count = len(windows) // actual
-assert round_count >= 2
+assert round_count >= (1 if fixed_split else 2)
 owners_by_round = []
 for round_index in range(round_count):
     group = windows[round_index * actual:(round_index + 1) * actual]
@@ -531,7 +704,7 @@ for round_index in range(round_count):
     assert sorted(owners) == list(range(actual))
     owners_by_round.append(owners)
 assert all(owners == owners_by_round[0] for owners in owners_by_round[1:])
-assert len(windows) > actual
+assert len(windows) > actual or fixed_split
 PY
 
 MODELS=$(curl -fsS "http://${HOST}:${PORT}/v1/models")
@@ -541,13 +714,14 @@ models, model = json.loads(sys.argv[1]), sys.argv[2]
 assert models["object"] == "list"
 assert models["data"] and models["data"][0]["id"] == model
 PY
-python3 - "${WORK}/server.log" "${HEALTH}" <<'PY'
+python3 - "${WORK}/server.log" "${HEALTH}" "${FIXED_SPLIT_ACTIVE}" <<'PY'
 import json
 import re
 import sys
 
-log_path, health_text = sys.argv[1:]
+log_path, health_text, fixed_split_text = sys.argv[1:]
 health = json.loads(health_text)
+fixed_split = bool(int(fixed_split_text))
 worker_count = int(health["workers"])
 windows = sorted(health["windows"], key=lambda w: w["index"])
 assert worker_count > 0
@@ -559,7 +733,7 @@ assert all(w["start"] < w["end"] for w in windows)
 assert all(0 <= w["owner"] < worker_count for w in windows)
 assert len(windows) % worker_count == 0
 round_count = len(windows) // worker_count
-assert round_count >= 2
+assert round_count >= (1 if fixed_split else 2)
 
 round_for_window = {}
 owners_by_round = []
@@ -817,7 +991,7 @@ AUTH_HOST="${POTLUCK_TEST_AUTH_HOST:-127.0.0.1}"
 AUTH_KEY="${POTLUCK_TEST_API_KEY:-potluck-smoke-key}"
 AUTH_ORIGIN="${POTLUCK_TEST_CORS_ORIGIN:-https://potluck.test}"
 AUTH_BASE="http://${AUTH_HOST}:${AUTH_PORT}"
-POTLUCK_TRACE_PRP=1 "${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" \
+"${BIN}/potluck-server" -m "${MODEL}" --workers "${N_WORKERS}" \
     --slots 2 --ubatch 1 --host "${AUTH_HOST}" --port "${AUTH_PORT}" \
     --api-key "${AUTH_KEY}" --cors-origin "${AUTH_ORIGIN}" \
     >"${WORK}/auth-server.log" 2>&1 &

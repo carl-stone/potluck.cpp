@@ -9,15 +9,20 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <cstring>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
+#include <unordered_map>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <poll.h>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,259 +36,337 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 
-static uint64_t saturating_add(uint64_t left, uint64_t right) {
-    if (left > std::numeric_limits<uint64_t>::max() - right) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return left + right;
-}
+static std::once_flag local_backend_once;
 
-static uint64_t saturating_mul(uint64_t left, uint64_t right) {
-    if (left != 0 && right > std::numeric_limits<uint64_t>::max() / left) {
-        return std::numeric_limits<uint64_t>::max();
-    }
-    return left * right;
-}
-
-uint64_t route_layer_cost(uint32_t n_layer, uint64_t model_bytes, uint32_t n_head_kv,
-                          uint32_t head_dim, uint32_t n_ctx) {
-    if (n_layer == 0) {
-        return 0;
-    }
-    const uint64_t weights_per_layer = std::max<uint64_t>(1, model_bytes / n_layer);
-    const uint64_t kv_per_layer = saturating_mul(
-        saturating_mul(saturating_mul(n_head_kv, head_dim), n_ctx), 4);
-    return std::max<uint64_t>(1, saturating_add(weights_per_layer, kv_per_layer));
-}
-
-uint64_t route_needed_bytes(uint32_t n_layer, uint64_t model_bytes, uint32_t n_head_kv,
-                            uint32_t head_dim, uint32_t n_ctx) {
-    return saturating_mul(static_cast<uint64_t>(n_layer),
-                          route_layer_cost(n_layer, model_bytes, n_head_kv, head_dim, n_ctx));
-}
-
-static bool allocate_round_spans(uint32_t total_layers, const std::vector<size_t> & owners,
-                          const std::vector<uint64_t> & usable,
-                          const std::vector<uint32_t> & max_layers,
-                          std::vector<uint32_t> & spans) {
-    if (owners.empty() || total_layers < owners.size() ||
-        usable.size() != max_layers.size()) {
-        return false;
-    }
-    uint64_t capacity = 0;
-    for (const size_t owner : owners) {
-        if (owner >= usable.size() || max_layers[owner] == 0) {
-            return false;
-        }
-        capacity = saturating_add(capacity, max_layers[owner]);
-    }
-    if (capacity < total_layers) {
-        return false;
-    }
-
-    spans.assign(usable.size(), 0);
-    for (const size_t owner : owners) {
-        spans[owner] = 1;
-    }
-    uint64_t remaining = total_layers - owners.size();
-    std::vector<long double> fractional(owners.size(), 0.0L);
-    while (remaining != 0) {
-        long double weight_sum = 0.0L;
-        for (const size_t owner : owners) {
-            if (spans[owner] < max_layers[owner]) {
-                weight_sum += static_cast<long double>(usable[owner]);
+static void ensure_local_backend() {
+    std::call_once(local_backend_once, [] {
+        llama_backend_init();
+        const enum ggml_backend_dev_type wanted[] = {
+            GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_ACCEL
+        };
+        for (const enum ggml_backend_dev_type type : wanted) {
+            for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(index);
+                if (dev != nullptr && ggml_backend_dev_type(dev) == type) {
+                    size_t free_bytes = 0;
+                    size_t total_bytes = 0;
+                    ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+                }
             }
         }
-        if (weight_sum <= 0.0L) {
-            return false;
-        }
+    });
+}
 
-        uint64_t assigned = 0;
-        for (size_t index = 0; index < owners.size(); ++index) {
-            const size_t owner = owners[index];
-            if (spans[owner] >= max_layers[owner]) {
-                fractional[index] = -1.0L;
+static void read_local_host_memory(uint64_t & free_bytes, uint64_t & total_bytes) {
+    size_t free_size = 0;
+    size_t total_size = 0;
+    const ggml_backend_dev_t cpu =
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu != nullptr) {
+        ggml_backend_dev_memory(cpu, &free_size, &total_size);
+    }
+#if !defined(_WIN32)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    const long total_pages = sysconf(_SC_PHYS_PAGES);
+    if (page_size > 0 && total_pages > 0) {
+        const size_t system_total = static_cast<size_t>(page_size) *
+                                    static_cast<size_t>(total_pages);
+        if (total_size == 0) {
+            total_size = system_total;
+        }
+#if defined(_SC_AVPHYS_PAGES)
+        const long available_pages = sysconf(_SC_AVPHYS_PAGES);
+        if (available_pages > 0) {
+            free_size = static_cast<size_t>(page_size) *
+                        static_cast<size_t>(available_pages);
+        }
+#endif
+    }
+#if defined(__linux__)
+    std::ifstream meminfo("/proc/meminfo");
+    std::string name;
+    uint64_t value = 0;
+    std::string unit;
+    while (meminfo >> name >> value >> unit) {
+        if (name == "MemAvailable:" &&
+            value <= std::numeric_limits<uint64_t>::max() / 1024u) {
+            free_size = static_cast<size_t>(value * 1024u);
+            break;
+        }
+    }
+#endif
+#if defined(__APPLE__)
+    mach_port_t host = mach_host_self();
+    vm_size_t mach_page_size = 0;
+    if (host_page_size(host, &mach_page_size) == KERN_SUCCESS && mach_page_size > 0) {
+        vm_statistics64_data_t statistics = {};
+        mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+        if (host_statistics64(host, HOST_VM_INFO64,
+                              reinterpret_cast<host_info64_t>(&statistics),
+                              &count) == KERN_SUCCESS) {
+            const uint64_t available_pages =
+                static_cast<uint64_t>(statistics.free_count) +
+                static_cast<uint64_t>(statistics.inactive_count) +
+                static_cast<uint64_t>(statistics.speculative_count);
+            free_size = static_cast<size_t>(available_pages) *
+                        static_cast<size_t>(mach_page_size);
+        }
+    }
+    mach_port_deallocate(mach_task_self(), host);
+#endif
+#endif
+    free_bytes = static_cast<uint64_t>(free_size);
+    total_bytes = static_cast<uint64_t>(total_size);
+}
+
+static device_probe probe_local_pressure_fast() {
+    device_probe result;
+    result.host = "127.0.0.1";
+    result.profile.rank = 0;
+#if defined(__APPLE__)
+    result.profile.os = potluck::os_kind::macos;
+#elif defined(__linux__)
+    result.profile.os = potluck::os_kind::linux_os;
+#else
+    result.error = "unsupported operating system for local pressure probe";
+    return result;
+#endif
+    ensure_local_backend();
+    read_local_host_memory(result.profile.host_free_bytes,
+                           result.profile.host_total_bytes);
+    const enum ggml_backend_dev_type wanted[] = {
+        GGML_BACKEND_DEVICE_TYPE_GPU, GGML_BACKEND_DEVICE_TYPE_ACCEL
+    };
+    for (const enum ggml_backend_dev_type type : wanted) {
+        for (size_t index = 0; index < ggml_backend_dev_count(); ++index) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(index);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != type) {
                 continue;
             }
-            const long double ideal = static_cast<long double>(remaining) *
-                                      static_cast<long double>(usable[owner]) / weight_sum;
-            const uint64_t floor_extra = ideal >= static_cast<long double>(
-                std::numeric_limits<uint64_t>::max())
-                ? remaining : static_cast<uint64_t>(ideal);
-            const uint64_t room = max_layers[owner] - spans[owner];
-            const uint64_t extra = std::min({ floor_extra, room, remaining - assigned });
-            spans[owner] += static_cast<uint32_t>(extra);
-            assigned += extra;
-            fractional[index] = std::max<long double>(
-                0.0L, ideal - static_cast<long double>(floor_extra));
-        }
-        if (assigned != 0) {
-            remaining -= assigned;
-            continue;
-        }
-
-        size_t best = owners.size();
-        for (size_t index = 0; index < owners.size(); ++index) {
-            const size_t owner = owners[index];
-            if (spans[owner] >= max_layers[owner]) {
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            if (total_bytes == 0) {
                 continue;
             }
-            if (best == owners.size() || fractional[index] > fractional[best] ||
-                (fractional[index] == fractional[best] && owner < owners[best])) {
-                best = index;
+            result.profile.free_bytes = free_bytes;
+            result.profile.total_bytes = total_bytes;
+            const std::string name = ggml_backend_dev_name(dev);
+            const std::string description = ggml_backend_dev_description(dev);
+            if (name.rfind("MTL", 0) == 0 ||
+                description.find("Metal") != std::string::npos) {
+                result.profile.kind = potluck::accel_kind::metal;
+            } else if (name.rfind("CUDA", 0) == 0 ||
+                       name.rfind("ROCm", 0) == 0 ||
+                       name.rfind("MUSA", 0) == 0 ||
+                       description.find("CUDA") != std::string::npos) {
+                result.profile.kind = potluck::accel_kind::cuda;
+            } else {
+                result.profile.kind = potluck::accel_kind::other;
             }
+            result.ok = true;
+            return result;
         }
-        if (best == owners.size()) {
+    }
+    result.ok = true;
+    return result;
+}
+
+
+
+bool solve_ring_placement(const std::vector<device_probe> & candidates,
+                          const halda_model_metadata & metadata,
+                          uint32_t n_ubatch, bool head_participates,
+                          const std::vector<uint32_t> & fixed_w,
+                          int32_t k_override, double master_priority,
+                          double gpu_mem_gib,
+                          std::vector<device_probe> & active_devices,
+                          std::vector<potluck::ring_window> & windows,
+                          halda_solution * solution, std::string & error) {
+    active_devices.clear();
+    windows.clear();
+    if (solution != nullptr) {
+        *solution = {};
+    }
+    error.clear();
+    if (candidates.empty()) {
+        error = "HALDA has no reachable devices";
+        return false;
+    }
+    if (metadata.n_layer < 2 || metadata.n_embd == 0 || metadata.n_ff == 0 ||
+        metadata.n_head == 0 || metadata.n_head_kv == 0 || metadata.n_vocab == 0 ||
+        metadata.n_ctx == 0 || n_ubatch == 0 || metadata.b == 0 ||
+        metadata.ordered_types.empty() ||
+        metadata.ordered_types.size() != metadata.flops_per_type.size()) {
+        error = "HALDA model metadata is incomplete";
+        return false;
+    }
+    if (!std::isfinite(gpu_mem_gib) || gpu_mem_gib < 0.0) {
+        error = "HALDA GPU memory override is invalid";
+        return false;
+    }
+
+    halda_options options;
+    options.model.n_layer = metadata.n_layer;
+    options.model.n_embd = metadata.n_embd;
+    options.model.n_ff = metadata.n_ff;
+    options.model.n_head = metadata.n_head;
+    options.model.n_head_kv = metadata.n_head_kv;
+    options.model.n_vocab = metadata.n_vocab;
+    options.model.n_ctx = metadata.n_ctx;
+    options.model.n_ubatch = n_ubatch;
+    options.model.b = metadata.b;
+    options.model.bi = metadata.bi;
+    options.model.bo = metadata.bo;
+    options.model.kv_per_layer = metadata.kv_per_layer;
+    options.model.types.reserve(metadata.ordered_types.size());
+    options.model.layer_flops.reserve(metadata.flops_per_type.size());
+    for (size_t index = 0; index < metadata.ordered_types.size(); ++index) {
+        options.model.types.push_back(
+            static_cast<uint32_t>(metadata.ordered_types[index]));
+        options.model.layer_flops.push_back(
+            static_cast<double>(metadata.flops_per_type[index]));
+    }
+    options.k_override = k_override;
+    options.master_priority = master_priority;
+    options.fixed_w = fixed_w;
+    options.head_participates = head_participates;
+
+    constexpr long double gib_bytes = 1024.0L * 1024.0L * 1024.0L;
+    if (static_cast<long double>(gpu_mem_gib) >
+        static_cast<long double>(std::numeric_limits<uint64_t>::max()) / gib_bytes) {
+        error = "HALDA GPU memory override is too large";
+        return false;
+    }
+    const uint64_t gpu_cap = gpu_mem_gib == 0.0
+        ? 0 : static_cast<uint64_t>(static_cast<long double>(gpu_mem_gib) * gib_bytes);
+    options.devices.reserve(candidates.size());
+    for (size_t index = 0; index < candidates.size(); ++index) {
+        const device_probe & candidate = candidates[index];
+        if (!candidate.ok) {
+            error = "HALDA candidate " + candidate.host + " was not profiled";
             return false;
         }
-        ++spans[owners[best]];
-        --remaining;
+        halda_device device;
+        device.original_rank = static_cast<uint32_t>(index);
+        device.name = candidate.host.empty()
+            ? "device " + std::to_string(index) : candidate.host;
+        device.head = head_participates && index == 0;
+        switch (candidate.profile.os) {
+        case potluck::os_kind::macos:
+            device.profile.os = halda_os_kind::macos;
+            break;
+        case potluck::os_kind::linux_os:
+            device.profile.os = halda_os_kind::linux_os;
+            break;
+        default:
+            error = "HALDA candidate " + candidate.host + " has an unsupported operating system";
+            return false;
+        }
+        switch (candidate.profile.kind) {
+        case potluck::accel_kind::none:
+            device.profile.accel = halda_accel_kind::none;
+            break;
+        case potluck::accel_kind::metal:
+            device.profile.accel = halda_accel_kind::metal;
+            break;
+        case potluck::accel_kind::cuda:
+            device.profile.accel = halda_accel_kind::cuda;
+            break;
+        case potluck::accel_kind::other:
+            device.profile.accel = halda_accel_kind::none;
+            std::fprintf(stderr,
+                         "potluck-server: device %s has an unsupported accelerator; using CPU only\n",
+                         candidate.host.c_str());
+            break;
+        default:
+            error = "HALDA candidate " + candidate.host + " has an unsupported accelerator";
+            return false;
+        }
+        device.profile.free_bytes = candidate.profile.free_bytes;
+        device.profile.total_bytes = candidate.profile.total_bytes;
+        device.profile.host_free_bytes = candidate.profile.host_free_bytes;
+        device.profile.host_total_bytes = candidate.profile.host_total_bytes;
+        device.profile.cpu_gflops.assign(candidate.profile.cpu_gflops.begin(),
+                                         candidate.profile.cpu_gflops.end());
+        if (device.profile.accel != halda_accel_kind::none) {
+            device.profile.accel_gflops.assign(candidate.profile.accel_gflops.begin(),
+                                               candidate.profile.accel_gflops.end());
+        }
+        device.profile.mem_copy_delay_ms = candidate.profile.mem_copy_delay_ms;
+        device.profile.accel_copy_delay_ms = candidate.profile.accel_copy_delay_ms;
+        device.profile.disk_read_seq_gbps = candidate.profile.disk_read_seq_gbps;
+        device.profile.disk_read_rnd_gbps = candidate.profile.disk_read_rnd_gbps;
+        device.profile.n_cpu_threads = candidate.profile.n_cpu_threads;
+
+        if (candidate.placement_usable_limit != std::numeric_limits<uint64_t>::max()) {
+            device.profile.free_bytes = std::min(
+                device.profile.free_bytes, candidate.placement_usable_limit);
+            device.profile.host_free_bytes = std::min(
+                device.profile.host_free_bytes, candidate.placement_usable_limit);
+        }
+        if (gpu_cap != 0 && device.profile.accel != halda_accel_kind::none) {
+            device.profile.free_bytes = std::min(device.profile.free_bytes, gpu_cap);
+        }
+        if (device.profile.accel == halda_accel_kind::none) {
+            device.profile.free_bytes = 0;
+            device.profile.total_bytes = 0;
+        }
+        options.devices.push_back(std::move(device));
+    }
+
+    halda_solution solved;
+    std::string solve_error;
+    if (!solve_halda(options, solved, solve_error)) {
+        error = "HALDA solve failed: " +
+            (solve_error.empty() ? std::string("no feasible placement") : solve_error);
+        return false;
+    }
+    std::vector<halda_route_window> solved_route;
+    if (!build_halda_route(solved, options.devices, solved_route, solve_error)) {
+        error = "HALDA route failed: " +
+            (solve_error.empty() ? std::string("invalid solution") : solve_error);
+        return false;
+    }
+
+    std::unordered_map<uint32_t, uint32_t> active_index;
+    active_index.reserve(solved.active_original_ranks.size());
+    for (const uint32_t rank : solved.active_original_ranks) {
+        if (rank >= candidates.size() ||
+            active_index.emplace(rank, static_cast<uint32_t>(active_devices.size())).second == false) {
+            error = "HALDA returned an invalid active device rank";
+            active_devices.clear();
+            return false;
+        }
+        active_devices.push_back(candidates[rank]);
+    }
+    windows.reserve(solved_route.size());
+    for (const halda_route_window & source : solved_route) {
+        const auto found = active_index.find(source.owner);
+        if (found == active_index.end()) {
+            error = "HALDA route references an excluded device";
+            active_devices.clear();
+            windows.clear();
+            return false;
+        }
+        windows.push_back({ found->second, source.start, source.end,
+                            source.n_gpu_layers });
+    }
+    if (windows.empty()) {
+        error = "HALDA returned an empty ring route";
+        active_devices.clear();
+        return false;
+    }
+    if (solution != nullptr) {
+        *solution = std::move(solved);
     }
     return true;
 }
-std::vector<device_probe> admit_devices(std::vector<device_probe> candidates,
-                                         uint32_t n_layer, uint64_t model_bytes,
-                                         uint32_t n_head_kv, uint32_t head_dim,
-                                         uint32_t n_ctx, bool reserve_owner_slot) {
-    const uint64_t layer_cost = route_layer_cost(n_layer, model_bytes, n_head_kv,
-                                                 head_dim, n_ctx);
-    const uint64_t needed = route_needed_bytes(n_layer, model_bytes, n_head_kv,
-                                               head_dim, n_ctx);
-    std::stable_sort(candidates.begin(), candidates.end(),
-                     [](const device_probe & left, const device_probe & right) {
-                         return left.usable_bytes() > right.usable_bytes();
-                     });
-    std::vector<device_probe> positive;
-    positive.reserve(candidates.size());
-    for (device_probe & candidate : candidates) {
-        if (!candidate.ok) {
-            continue;
-        }
-        if (candidate.usable_bytes() < layer_cost) {
-            std::fprintf(stderr,
-                         "potluck-server: excluding %s: insufficient memory for one layer\n",
-                         candidate.host.c_str());
-            continue;
-        }
-        positive.push_back(std::move(candidate));
-    }
-    if (positive.empty()) {
-        throw std::runtime_error(
-            "cluster has no device able to hold one active layer (need " +
-            std::to_string(layer_cost / (1024ull * 1024ull)) + " MiB)");
-    }
 
-    // At least two rounds are required for every multi-layer model. Reserve
-    // one owner position when the head will be appended after remote admission.
-    const size_t max_owners = n_layer == 1
-        ? 1 : std::max<size_t>(1, n_layer / 2);
-    const size_t reserved_owners = reserve_owner_slot && max_owners > 1 ? 1 : 0;
-    const size_t admitted_count =
-        std::min(max_owners - reserved_owners, positive.size());
-    for (size_t i = admitted_count; i < positive.size(); ++i) {
-        std::fprintf(stderr, "potluck-server: excluding %s: no layer slot remains\n",
-                     positive[i].host.c_str());
-    }
-    positive.resize(admitted_count);
-
-    uint64_t capacity = 0;
-    for (const device_probe & candidate : positive) {
-        capacity = saturating_add(capacity, candidate.usable_bytes());
-    }
-    std::printf("potluck-server: admitted %zu devices (%llu MiB usable, need %llu MiB)\n",
-                positive.size(), static_cast<unsigned long long>(capacity / (1024ull * 1024ull)),
-                static_cast<unsigned long long>(needed / (1024ull * 1024ull)));
-    return positive;
-}
-
-std::vector<potluck::ring_window> build_ring_route(const std::vector<device_probe> & devices,
-                                                   uint32_t n_layer, uint64_t model_bytes,
-                                                   uint32_t n_head_kv, uint32_t head_dim,
-                                                   uint32_t n_ctx) {
-    if (devices.empty()) {
-        throw std::runtime_error("ring needs at least one admitted device");
-    }
-    if (n_layer == 0) {
-        throw std::runtime_error("model reports zero layers");
-    }
-    const uint64_t layer_cost = route_layer_cost(n_layer, model_bytes, n_head_kv,
-                                                 head_dim, n_ctx);
-    std::vector<uint64_t> usable;
-    std::vector<uint32_t> max_layers;
-    usable.reserve(devices.size());
-    max_layers.reserve(devices.size());
-    for (const device_probe & device : devices) {
-        const uint64_t bytes = device.usable_bytes();
-        if (bytes < layer_cost) {
-            throw std::runtime_error("ring device cannot hold one active layer");
-        }
-        usable.push_back(bytes);
-        max_layers.push_back(static_cast<uint32_t>(std::min<uint64_t>(
-            n_layer, bytes / layer_cost)));
-    }
-    if (n_layer > 1 && devices.size() > n_layer / 2) {
-        throw std::runtime_error("ring has too many owners for repeated windows");
-    }
-
-    std::vector<size_t> owners;
-    owners.reserve(devices.size());
-    for (size_t i = 0; i < devices.size(); ++i) {
-        owners.push_back(i);
-    }
-
-    uint32_t selected_rounds = 0;
-    uint32_t larger_rounds = 0;
-    std::vector<uint32_t> smaller_spans;
-    std::vector<uint32_t> larger_spans;
-    for (uint32_t rounds = n_layer == 1 ? 1 : 2; rounds <= n_layer; ++rounds) {
-        const uint32_t smaller_layers = n_layer / rounds;
-        const uint32_t remainder = n_layer % rounds;
-        if (smaller_layers < owners.size()) {
-            continue;
-        }
-        std::vector<uint32_t> candidate_smaller;
-        if (!allocate_round_spans(smaller_layers, owners, usable, max_layers,
-                                  candidate_smaller)) {
-            continue;
-        }
-        std::vector<uint32_t> candidate_larger = candidate_smaller;
-        if (remainder != 0 &&
-            !allocate_round_spans(smaller_layers + 1, owners, usable, max_layers,
-                                  candidate_larger)) {
-            continue;
-        }
-        selected_rounds = rounds;
-        larger_rounds = remainder;
-        smaller_spans = std::move(candidate_smaller);
-        larger_spans = std::move(candidate_larger);
-        break;
-    }
-    if (selected_rounds == 0) {
-        throw std::runtime_error("no repeated ring route fits admitted device memory");
-    }
-
-    std::vector<potluck::ring_window> windows;
-    windows.reserve(static_cast<size_t>(selected_rounds) * devices.size());
-    uint32_t next_layer = 0;
-    for (uint32_t round = 0; round < selected_rounds; ++round) {
-        const std::vector<uint32_t> & spans =
-            round < larger_rounds ? larger_spans : smaller_spans;
-        for (size_t i = 0; i < owners.size(); ++i) {
-            const uint32_t span = spans[owners[i]];
-            if (span == 0) {
-                throw std::runtime_error("ring route contains a zero-width owner");
-            }
-            windows.push_back({ static_cast<uint32_t>(owners[i]), next_layer,
-                                next_layer + span, 0 });
-            next_layer += span;
-        }
-    }
-    if (next_layer != n_layer) {
-        throw std::runtime_error("capability route does not cover the model");
-    }
-    return windows;
-}
 
 static std::string basename_of(const std::string & path) {
     const size_t slash = path.find_last_of("/\\");
@@ -378,7 +461,9 @@ std::vector<bootstrap_node> discover_bootstrap_nodes() {
     const std::vector<potluck::discovered_node> discovered =
         potluck::discover_nodes(3000, discovery_error);
     if (!discovery_error.empty()) {
-        throw std::runtime_error("mDNS discovery failed: " + discovery_error);
+        std::fprintf(stderr, "potluck-server: mDNS discovery unavailable: %s\n",
+                     discovery_error.c_str());
+        return {};
     }
     const std::string known_hosts_file = discovery_known_hosts_file();
     std::vector<bootstrap_node> result;
@@ -429,45 +514,305 @@ std::vector<bootstrap_node> discover_bootstrap_nodes() {
         }
         result.push_back(std::move(bootstrap));
     }
-    if (result.empty()) {
-        throw std::runtime_error("mDNS discovery returned no eligible nodes");
+    return result;
+}
+
+static std::vector<ggml_type> default_probe_types() {
+    return { GGML_TYPE_F32 };
+}
+
+static bool parse_probe_u64(const std::map<std::string, std::string> & fields,
+                            const char * key, uint64_t & value, std::string & error) {
+    const auto it = fields.find(key);
+    if (it == fields.end() || it->second.empty() ||
+        !std::all_of(it->second.begin(), it->second.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+        })) {
+        error = std::string("probe is missing or invalid ") + key;
+        return false;
+    }
+    size_t used = 0;
+    try {
+        const unsigned long long parsed = std::stoull(it->second, &used, 10);
+        if (used != it->second.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        value = static_cast<uint64_t>(parsed);
+        return true;
+    } catch (const std::exception &) {
+        error = std::string("probe has invalid ") + key;
+        return false;
+    }
+}
+
+static bool parse_probe_f32(const std::map<std::string, std::string> & fields,
+                            const char * key, float & value, std::string & error) {
+    const auto it = fields.find(key);
+    if (it == fields.end() || it->second.empty()) {
+        error = std::string("probe is missing ") + key;
+        return false;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const float parsed = std::strtof(it->second.c_str(), &end);
+    if (end == nullptr || *end != '\0' || errno == ERANGE ||
+        !std::isfinite(parsed) || parsed < 0.0f) {
+        error = std::string("probe has invalid ") + key;
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+static bool parse_probe_vector(const std::map<std::string, std::string> & fields,
+                               const char * key, size_t expected,
+                               std::vector<float> & values, std::string & error) {
+    const auto it = fields.find(key);
+    if (it == fields.end()) {
+        error = std::string("probe is missing ") + key;
+        return false;
+    }
+    if (it->second == "-" || it->second.empty()) {
+        error = std::string("probe has an empty ") + key;
+        return false;
+    }
+    values.clear();
+    size_t begin = 0;
+    while (begin <= it->second.size()) {
+        const size_t end = it->second.find(',', begin);
+        const std::string token = it->second.substr(begin, end == std::string::npos
+            ? std::string::npos : end - begin);
+        if (token.empty()) {
+            error = std::string("probe has an invalid ") + key + " vector";
+            return false;
+        }
+        char * end_ptr = nullptr;
+        errno = 0;
+        const float value = std::strtof(token.c_str(), &end_ptr);
+        if (end_ptr == nullptr || *end_ptr != '\0' || errno == ERANGE ||
+            !std::isfinite(value) || value < 0.0f) {
+            error = std::string("probe has an invalid ") + key + " value";
+            return false;
+        }
+        values.push_back(value);
+        if (values.size() > expected) {
+            error = std::string("probe has too many ") + key + " values";
+            return false;
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (values.size() != expected) {
+        error = std::string("probe has the wrong ") + key + " vector length";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_probe_types(const std::map<std::string, std::string> & fields,
+                              const std::vector<ggml_type> & expected,
+                              std::string & error) {
+    const auto it = fields.find("types");
+    if (it == fields.end()) {
+        error = "probe is missing types";
+        return false;
+    }
+    size_t begin = 0;
+    size_t count = 0;
+    while (begin <= it->second.size()) {
+        const size_t end = it->second.find(',', begin);
+        const std::string token = it->second.substr(begin, end == std::string::npos
+            ? std::string::npos : end - begin);
+        if (count >= expected.size() || token != ggml_type_name(expected[count])) {
+            error = "probe GGML type order does not match the request";
+            return false;
+        }
+        ++count;
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    if (count != expected.size()) {
+        error = "probe type count does not match the request";
+        return false;
+    }
+    return true;
+}
+
+static bool parse_probe_line(const std::string & line, potluck::device_profile & profile,
+                             std::string & error,
+                             const std::vector<ggml_type> & requested_types = {},
+                             bool pressure_only = false) {
+    std::istringstream input(line);
+    std::string prefix;
+    if (!(input >> prefix) || prefix != "potluck-probe") {
+        error = "invalid probe output prefix";
+        return false;
+    }
+    std::map<std::string, std::string> fields;
+    std::string token;
+    while (input >> token) {
+        const size_t equal = token.find('=');
+        if (equal == std::string::npos || equal == 0 || equal + 1 == token.size()) {
+            error = "invalid probe field";
+            return false;
+        }
+        const std::string key = token.substr(0, equal);
+        if (!fields.emplace(key, token.substr(equal + 1)).second) {
+            error = "duplicate probe field: " + key;
+            return false;
+        }
+    }
+    const auto required = [&](const char * key) {
+        return fields.find(key) != fields.end();
+    };
+    const auto protocol = fields.find("protocol");
+    if (protocol == fields.end() || protocol->second != "EDP3") {
+        error = "probe protocol/build mismatch";
+        return false;
+    }
+    const auto build = fields.find("build");
+    if (build == fields.end() || build->second != potluck_probe_build_id) {
+        error = "probe protocol/build mismatch";
+        return false;
+    }
+    const auto mode = fields.find("mode");
+    if (mode == fields.end() ||
+        (pressure_only ? mode->second != "pressure" : mode->second != "startup")) {
+        error = "probe mode does not match the request";
+        return false;
+    }
+    const auto os = fields.find("os");
+    if (os == fields.end()) {
+        error = "probe is missing operating system";
+        return false;
+    }
+    if (os->second == "macos") {
+        profile.os = potluck::os_kind::macos;
+    } else if (os->second == "linux") {
+        profile.os = potluck::os_kind::linux_os;
+    } else if (os->second == "windows") {
+        error = "Windows worker probes are not supported by Potluck yet";
+        return false;
+    } else {
+        error = "probe has an unknown operating system";
+        return false;
+    }
+    const auto kind = fields.find("kind");
+    if (kind == fields.end()) {
+        error = "probe is missing accelerator kind";
+        return false;
+    }
+    if (kind->second == "none") {
+        profile.kind = potluck::accel_kind::none;
+    } else if (kind->second == "metal") {
+        profile.kind = potluck::accel_kind::metal;
+    } else if (kind->second == "cuda") {
+        profile.kind = potluck::accel_kind::cuda;
+    } else if (kind->second == "other") {
+        profile.kind = potluck::accel_kind::other;
+    } else {
+        error = "unknown probe accelerator kind";
+        return false;
+    }
+    uint64_t rank = 0;
+    if (!parse_probe_u64(fields, "rank", rank, error) ||
+        rank > std::numeric_limits<uint32_t>::max()) {
+        error = "probe rank is invalid";
+        return false;
+    }
+    profile.rank = static_cast<uint32_t>(rank);
+    if (profile.rank != 0) {
+        error = "probe rank is not zero";
+        return false;
+    }
+    if (!parse_probe_u64(fields, "accel_free", profile.free_bytes, error) ||
+        !parse_probe_u64(fields, "accel_total", profile.total_bytes, error) ||
+        !parse_probe_u64(fields, "host_free", profile.host_free_bytes, error) ||
+        !parse_probe_u64(fields, "host_total", profile.host_total_bytes, error)) {
+        return false;
+    }
+    if (profile.host_total_bytes == 0 || profile.host_free_bytes > profile.host_total_bytes ||
+        profile.free_bytes > profile.total_bytes ||
+        (profile.kind == potluck::accel_kind::none && profile.total_bytes != 0) ||
+        (profile.kind != potluck::accel_kind::none && profile.total_bytes == 0)) {
+        error = "probe memory fields are inconsistent";
+        return false;
+    }
+    if (!pressure_only) {
+        uint64_t n_threads = 0;
+        if (!parse_probe_u64(fields, "n_cpu_threads", n_threads, error) ||
+            n_threads == 0 || n_threads > std::numeric_limits<uint32_t>::max()) {
+            error = "probe CPU thread count is invalid";
+            return false;
+        }
+        profile.n_cpu_threads = static_cast<uint32_t>(n_threads);
+    }
+    if (pressure_only) {
+        for (const char * key : { "n_cpu_threads", "types", "cpu_gflops",
+                                  "accel_gflops", "mem_copy_delay_ms",
+                                  "accel_copy_delay_ms",
+                                  "disk_read_seq_gbps", "disk_read_rnd_gbps" }) {
+            if (required(key)) {
+                error = "pressure probe contains benchmark fields";
+                return false;
+            }
+        }
+        return true;
+    }
+    const std::vector<ggml_type> expected = requested_types.empty()
+        ? default_probe_types() : requested_types;
+    if (expected.empty() || expected.size() > GGML_TYPE_COUNT ||
+        !parse_probe_types(fields, expected, error) ||
+        !parse_probe_vector(fields, "cpu_gflops", expected.size(),
+                            profile.cpu_gflops, error) ||
+        !parse_probe_vector(fields, "accel_gflops", expected.size(),
+                            profile.accel_gflops, error) ||
+        !parse_probe_f32(fields, "mem_copy_delay_ms", profile.mem_copy_delay_ms, error) ||
+        !parse_probe_f32(fields, "accel_copy_delay_ms",
+                         profile.accel_copy_delay_ms, error) ||
+        !parse_probe_f32(fields, "disk_read_seq_gbps",
+                         profile.disk_read_seq_gbps, error) ||
+        !parse_probe_f32(fields, "disk_read_rnd_gbps",
+                         profile.disk_read_rnd_gbps, error)) {
+        return false;
+    }
+    return true;
+}
+
+static std::string probe_type_argument(const std::vector<ggml_type> & requested_types) {
+    const std::vector<ggml_type> types = requested_types.empty()
+        ? default_probe_types() : requested_types;
+    std::string value;
+    for (size_t index = 0; index < types.size(); ++index) {
+        if (index != 0) {
+            value += ',';
+        }
+        value += ggml_type_name(types[index]);
+    }
+    return value;
+}
+
+static std::string probe_command_arguments(const std::vector<ggml_type> & requested_types,
+                                           uint64_t probe_bytes, bool pressure_only) {
+    std::string result = " --probe --probe-types " +
+        shell_quote(probe_type_argument(requested_types));
+    if (probe_bytes != 0) {
+        result += " --probe-bytes " + std::to_string(probe_bytes);
+    }
+    if (pressure_only) {
+        result += " --probe-pressure";
     }
     return result;
 }
 
-static bool parse_probe_line(const std::string & line, potluck::accel_profile & profile,
-                      std::string & error) {
-    char kind[32] = {};
-    unsigned long long accel_free = 0;
-    unsigned long long accel_total = 0;
-    unsigned long long host_free = 0;
-    unsigned long long host_total = 0;
-    if (std::sscanf(line.c_str(),
-                    "potluck-probe kind=%31s accel_free=%llu accel_total=%llu host_free=%llu host_total=%llu",
-                    kind, &accel_free, &accel_total, &host_free, &host_total) != 5) {
-        error = "invalid probe output";
-        return false;
-    }
-    potluck::accel_kind accel_kind = potluck::accel_kind::none;
-    if (std::strcmp(kind, "metal") == 0) {
-        accel_kind = potluck::accel_kind::metal;
-    } else if (std::strcmp(kind, "cuda") == 0) {
-        accel_kind = potluck::accel_kind::cuda;
-    } else if (std::strcmp(kind, "other") == 0) {
-        accel_kind = potluck::accel_kind::other;
-    } else if (std::strcmp(kind, "none") != 0) {
-        error = "unknown probe accelerator kind";
-        return false;
-    }
-    profile.kind = accel_kind;
-    profile.free_bytes = accel_free;
-    profile.total_bytes = accel_total;
-    profile.host_free_bytes = host_free;
-    profile.host_total_bytes = host_total;
-    return true;
-}
-
-static device_probe run_probe_command(const std::string & command, const std::string & host) {
+static device_probe run_probe_command(const std::string & command, const std::string & host,
+                                      const std::vector<ggml_type> & requested_types = {},
+                                      uint64_t probe_bytes = 0,
+                                      bool pressure_only = false) {
     device_probe result;
     result.host = host;
     int output_pipe[2] = {};
@@ -563,23 +908,163 @@ static device_probe run_probe_command(const std::string & command, const std::st
     }
     const size_t newline = output.find('\n');
     const std::string line = output.substr(0, newline);
-    result.profile.rank = 0;
-    result.ok = parse_probe_line(line, result.profile, result.error);
+    if (line.empty() || (newline != std::string::npos &&
+                         output.find_first_not_of(" \t\r\n", newline + 1) != std::string::npos)) {
+        result.error = "probe returned extra or empty output";
+        return result;
+    }
+    result.ok = parse_probe_line(line, result.profile, result.error,
+                                 requested_types, pressure_only);
     return result;
 }
 
-device_probe probe_local_worker(const std::string & worker_path) {
-    return run_probe_command(shell_quote(worker_path) + " --probe", "127.0.0.1");
+static std::mutex startup_probe_cache_mutex;
+static std::unordered_map<std::string, potluck::device_profile> startup_probe_cache;
+
+static std::string startup_probe_cache_key(const std::string & scope,
+                                           const std::string & identity,
+                                           const std::vector<ggml_type> & requested_types,
+                                           uint64_t probe_bytes) {
+    return scope + ":" + identity + ":" + probe_type_argument(requested_types) +
+           ":" + std::to_string(probe_bytes);
 }
 
-device_probe probe_remote_worker(const bootstrap_node & bootstrap) {
+static bool load_startup_probe(const std::string & key, potluck::device_profile & profile) {
+    std::lock_guard<std::mutex> lock(startup_probe_cache_mutex);
+    const auto it = startup_probe_cache.find(key);
+    if (it == startup_probe_cache.end()) {
+        return false;
+    }
+    profile = it->second;
+    return true;
+}
+
+static void save_startup_probe(const std::string & key,
+                               const potluck::device_profile & profile) {
+    std::lock_guard<std::mutex> lock(startup_probe_cache_mutex);
+    startup_probe_cache[key] = profile;
+}
+
+device_probe probe_local_worker(const std::string & worker_path,
+                                const std::vector<ggml_type> & requested_types,
+                                uint64_t probe_bytes) {
+    const std::string key = startup_probe_cache_key(
+        "local", worker_path, requested_types, probe_bytes);
+    potluck::device_profile cached;
+    if (load_startup_probe(key, cached)) {
+        device_probe result = probe_local_pressure(worker_path);
+        if (!result.ok) {
+            return result;
+        }
+        std::string error;
+        if (!merge_pressure_profile(cached, result.profile, error)) {
+            result.ok = false;
+            result.error = error;
+            return result;
+        }
+        result.profile = std::move(cached);
+        return result;
+    }
+    ensure_local_backend();
+    device_probe result = run_probe_command(
+        shell_quote(worker_path) +
+            probe_command_arguments(requested_types, probe_bytes, false),
+        "127.0.0.1", requested_types, probe_bytes, false);
+    if (result.ok) {
+        device_probe pressure = probe_local_pressure(worker_path);
+        if (!pressure.ok) {
+            return pressure;
+        }
+        std::string error;
+        if (!merge_pressure_profile(result.profile, pressure.profile, error)) {
+            result.ok = false;
+            result.error = error;
+            return result;
+        }
+        save_startup_probe(key, result.profile);
+    }
+    return result;
+}
+
+device_probe probe_remote_worker(const bootstrap_node & bootstrap,
+                                 const std::vector<ggml_type> & requested_types,
+                                 uint64_t probe_bytes) {
+    const std::string identity = bootstrap.ssh_target + ":" +
+        std::to_string(bootstrap.ssh_port) + ":" + bootstrap.known_hosts_file;
+    const std::string key = startup_probe_cache_key(
+        "remote", identity, requested_types, probe_bytes);
+    potluck::device_profile cached;
+    if (load_startup_probe(key, cached)) {
+        device_probe result = probe_remote_pressure(bootstrap);
+        if (!result.ok) {
+            return result;
+        }
+        std::string error;
+        if (!merge_pressure_profile(cached, result.profile, error)) {
+            result.ok = false;
+            result.error = error;
+            return result;
+        }
+        result.profile = std::move(cached);
+        return result;
+    }
+    const std::string inner = "cd ~/potluck || exit 1; "
+        "LD_LIBRARY_PATH=.${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ./potluck-worker" +
+        probe_command_arguments(requested_types, probe_bytes, false);
+    const std::string command = ssh_options(bootstrap) + " " +
+        shell_quote(bootstrap.ssh_target) + " " + shell_quote(inner);
+    device_probe result = run_probe_command(command, bootstrap.ring_host,
+                                            requested_types, probe_bytes, false);
+    if (result.ok) {
+        save_startup_probe(key, result.profile);
+    }
+    return result;
+}
+
+device_probe probe_local_pressure(const std::string & worker_path) {
+    (void) worker_path;
+    return probe_local_pressure_fast();
+}
+
+
+device_probe probe_remote_pressure(const bootstrap_node & bootstrap) {
+    const std::vector<ggml_type> types = default_probe_types();
+    const std::string inner = "cd ~/potluck || exit 1; "
+        "LD_LIBRARY_PATH=.${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ./potluck-worker" +
+        probe_command_arguments(types, 0, true);
     const std::string command = ssh_options(bootstrap) + " " + shell_quote(bootstrap.ssh_target) +
-        " " + shell_quote("cd ~/potluck || exit 1; LD_LIBRARY_PATH=.${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} ./potluck-worker --probe");
-    return run_probe_command(command, bootstrap.ring_host);
+        " " + shell_quote(inner);
+    device_probe result = run_probe_command(command, bootstrap.ring_host, types, 0, true);
+    result.bootstrap = bootstrap;
+    return result;
+}
+
+bool merge_pressure_profile(potluck::device_profile & target,
+                            const potluck::device_profile & pressure,
+                            std::string & error) {
+    if (target.rank != pressure.rank || target.os != pressure.os ||
+        pressure.os == potluck::os_kind::none ||
+        pressure.host_total_bytes == 0 ||
+        pressure.host_free_bytes > pressure.host_total_bytes ||
+        pressure.free_bytes > pressure.total_bytes ||
+        ((pressure.kind == potluck::accel_kind::none && pressure.total_bytes != 0) ||
+         (pressure.kind != potluck::accel_kind::none && pressure.total_bytes == 0))) {
+        error = "pressure profile is inconsistent with the static profile";
+        return false;
+    }
+    target.kind = pressure.kind;
+    target.free_bytes = pressure.free_bytes;
+    target.total_bytes = pressure.total_bytes;
+    target.host_free_bytes = pressure.host_free_bytes;
+    target.host_total_bytes = pressure.host_total_bytes;
+    error.clear();
+    return true;
 }
 
 std::vector<device_probe> probe_remote_candidates(
-    const std::vector<bootstrap_node> & candidates) {
+    const std::vector<bootstrap_node> & candidates,
+    const std::vector<ggml_type> & requested_types,
+    uint64_t probe_bytes) {
     struct probe_task {
         std::future<device_probe> future;
         std::thread thread;
@@ -591,9 +1076,10 @@ std::vector<device_probe> probe_remote_candidates(
         const auto started = std::chrono::steady_clock::now();
         std::promise<device_probe> promise;
         std::future<device_probe> future = promise.get_future();
-        std::thread thread([bootstrap, promise = std::move(promise)]() mutable {
+        std::thread thread([bootstrap, requested_types, probe_bytes,
+                            promise = std::move(promise)]() mutable {
             try {
-                promise.set_value(probe_remote_worker(bootstrap));
+                promise.set_value(probe_remote_worker(bootstrap, requested_types, probe_bytes));
             } catch (const std::exception & exception) {
                 device_probe failure;
                 failure.host = bootstrap.ring_host;
@@ -633,6 +1119,361 @@ std::vector<device_probe> probe_remote_candidates(
     return results;
 }
 
+std::vector<device_probe> probe_remote_pressure_candidates(
+    const std::vector<bootstrap_node> & candidates) {
+    std::vector<device_probe> results;
+    results.reserve(candidates.size());
+    for (const bootstrap_node & candidate : candidates) {
+        results.push_back(probe_remote_pressure(candidate));
+    }
+    return results;
+}
+
+struct halda_tensor_info {
+    ggml_type type = GGML_TYPE_COUNT;
+    std::array<int64_t, GGML_MAX_DIMS> ne {};
+    uint64_t bytes = 0;
+};
+
+static bool gguf_integer(const gguf_context * ctx, const std::string & key,
+                         uint64_t & value, std::string & error) {
+    const int64_t id = gguf_find_key(ctx, key.c_str());
+    if (id < 0) {
+        error = "GGUF is missing " + key;
+        return false;
+    }
+    switch (gguf_get_kv_type(ctx, id)) {
+        case GGUF_TYPE_UINT8: value = gguf_get_val_u8(ctx, id); return true;
+        case GGUF_TYPE_UINT16: value = gguf_get_val_u16(ctx, id); return true;
+        case GGUF_TYPE_UINT32: value = gguf_get_val_u32(ctx, id); return true;
+        case GGUF_TYPE_UINT64: value = gguf_get_val_u64(ctx, id); return true;
+        case GGUF_TYPE_INT8: {
+            const int8_t v = gguf_get_val_i8(ctx, id);
+            if (v >= 0) { value = static_cast<uint64_t>(v); return true; }
+            break;
+        }
+        case GGUF_TYPE_INT16: {
+            const int16_t v = gguf_get_val_i16(ctx, id);
+            if (v >= 0) { value = static_cast<uint64_t>(v); return true; }
+            break;
+        }
+        case GGUF_TYPE_INT32: {
+            const int32_t v = gguf_get_val_i32(ctx, id);
+            if (v >= 0) { value = static_cast<uint64_t>(v); return true; }
+            break;
+        }
+        case GGUF_TYPE_INT64: {
+            const int64_t v = gguf_get_val_i64(ctx, id);
+            if (v >= 0) { value = static_cast<uint64_t>(v); return true; }
+            break;
+        }
+        default:
+            break;
+    }
+    error = "GGUF metadata key is not a non-negative integer: " + key;
+    return false;
+}
+
+static bool checked_add_u64(uint64_t left, uint64_t right, uint64_t & result) {
+    if (right > std::numeric_limits<uint64_t>::max() - left) {
+        return false;
+    }
+    result = left + right;
+    return true;
+}
+
+static bool checked_product(const std::array<int64_t, GGML_MAX_DIMS> & values,
+                            uint64_t & result) {
+    result = 1;
+    for (const int64_t value : values) {
+        if (value <= 0 ||
+            static_cast<uint64_t>(value) >
+                std::numeric_limits<uint64_t>::max() / result) {
+            return false;
+        }
+        result *= static_cast<uint64_t>(value);
+    }
+    return true;
+}
+
+static bool block_name(const std::string & name, uint32_t & layer, std::string & suffix) {
+    if (name.rfind("blk.", 0) != 0) {
+        return false;
+    }
+    size_t pos = 4;
+    const size_t begin = pos;
+    while (pos < name.size() && std::isdigit(static_cast<unsigned char>(name[pos]))) {
+        ++pos;
+    }
+    if (pos == begin || pos >= name.size() || name[pos] != '.') {
+        return false;
+    }
+    try {
+        const unsigned long parsed = std::stoul(name.substr(begin, pos - begin));
+        if (parsed > std::numeric_limits<uint32_t>::max()) {
+            return false;
+        }
+        layer = static_cast<uint32_t>(parsed);
+    } catch (const std::exception &) {
+        return false;
+    }
+    suffix = name.substr(pos + 1);
+    return !suffix.empty();
+}
+
+bool extract_halda_model_metadata(const std::filesystem::path & model_path,
+                                  uint32_t n_ctx,
+                                  halda_model_metadata & metadata,
+                                  std::string & error) {
+    metadata = halda_model_metadata{};
+    error.clear();
+    if (n_ctx == 0) {
+        error = "HALDA metadata needs a non-zero context";
+        return false;
+    }
+    gguf_init_params params = {};
+    params.no_alloc = true;
+    gguf_context * ctx = gguf_init_from_file(model_path.string().c_str(), params);
+    if (ctx == nullptr) {
+        error = "cannot read GGUF metadata from " + model_path.string();
+        return false;
+    }
+    const auto cleanup = [&] { gguf_free(ctx); };
+    const int64_t arch_id = gguf_find_key(ctx, "general.architecture");
+    if (arch_id < 0 || gguf_get_kv_type(ctx, arch_id) != GGUF_TYPE_STRING) {
+        cleanup();
+        error = "GGUF is missing general.architecture";
+        return false;
+    }
+    const char * arch_value = gguf_get_val_str(ctx, arch_id);
+    if (arch_value == nullptr || arch_value[0] == '\0') {
+        cleanup();
+        error = "GGUF has an empty architecture";
+        return false;
+    }
+    const std::string arch = arch_value;
+    uint64_t n_embd = 0;
+    uint64_t n_ff = 0;
+    uint64_t n_head = 0;
+    if (!gguf_integer(ctx, arch + ".embedding_length", n_embd, error) ||
+        !gguf_integer(ctx, arch + ".feed_forward_length", n_ff, error) ||
+        !gguf_integer(ctx, arch + ".attention.head_count", n_head, error) ||
+        n_embd == 0 || n_ff == 0 || n_head == 0 ||
+        n_embd > std::numeric_limits<uint32_t>::max() ||
+        n_ff > std::numeric_limits<uint32_t>::max() ||
+        n_head > std::numeric_limits<uint32_t>::max()) {
+        cleanup();
+        if (error.empty()) {
+            error = "GGUF model dimensions are invalid";
+        }
+        return false;
+    }
+    const int64_t token_tensor = gguf_find_tensor(ctx, "token_embd.weight");
+    const int64_t * token_shape = token_tensor >= 0
+        ? gguf_get_tensor_ne(ctx, token_tensor) : nullptr;
+    if (token_shape == nullptr || token_shape[0] <= 0 || token_shape[1] <= 0 ||
+        static_cast<uint64_t>(token_shape[0]) != n_embd ||
+        static_cast<uint64_t>(token_shape[1]) > std::numeric_limits<uint32_t>::max()) {
+        cleanup();
+        error = "GGUF token embedding shape is invalid";
+        return false;
+    }
+    const uint32_t n_vocab = static_cast<uint32_t>(token_shape[1]);
+    uint64_t metadata_layers = 0;
+    if (!gguf_integer(ctx, arch + ".block_count", metadata_layers, error) ||
+        metadata_layers == 0 || metadata_layers > std::numeric_limits<uint32_t>::max()) {
+        cleanup();
+        if (error.empty()) {
+            error = "GGUF has an invalid block count";
+        }
+        return false;
+    }
+    std::map<uint32_t, std::map<std::string, halda_tensor_info>> blocks;
+    const int64_t tensor_count = gguf_get_n_tensors(ctx);
+    for (int64_t index = 0; index < tensor_count; ++index) {
+        const char * raw_name = gguf_get_tensor_name(ctx, index);
+        if (raw_name == nullptr) {
+            cleanup();
+            error = "GGUF contains an unnamed tensor";
+            return false;
+        }
+        uint32_t layer = 0;
+        std::string suffix;
+        if (!block_name(raw_name, layer, suffix)) {
+            continue;
+        }
+        if (layer >= metadata_layers) {
+            cleanup();
+            error = "GGUF block tensor is outside the declared layer range";
+            return false;
+        }
+        if (blocks[layer].find(suffix) != blocks[layer].end()) {
+            cleanup();
+            error = "GGUF contains a duplicate block tensor: " + std::string(raw_name);
+            return false;
+        }
+        halda_tensor_info info;
+        info.type = gguf_get_tensor_type(ctx, index);
+        const int64_t * ne = gguf_get_tensor_ne(ctx, index);
+        if (ne == nullptr || info.type < GGML_TYPE_F32 || info.type >= GGML_TYPE_COUNT) {
+            cleanup();
+            error = "GGUF block tensor has invalid shape or type: " + std::string(raw_name);
+            return false;
+        }
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            info.ne[dim] = ne[dim];
+        }
+        info.bytes = gguf_get_tensor_size(ctx, index);
+        if (info.bytes == 0) {
+            cleanup();
+            error = "GGUF block tensor has zero bytes: " + std::string(raw_name);
+            return false;
+        }
+        blocks[layer].emplace(std::move(suffix), info);
+    }
+    if (blocks.size() != metadata_layers) {
+        cleanup();
+        error = "GGUF block tensors are incomplete";
+        return false;
+    }
+    const auto first = blocks.find(0);
+    if (first == blocks.end() || first->second.empty()) {
+        cleanup();
+        error = "GGUF has no tensors for block 0";
+        return false;
+    }
+    uint64_t total_block_bytes = 0;
+    std::set<ggml_type> ordered_types;
+    std::map<ggml_type, uint64_t> flops;
+    for (uint64_t layer = 0; layer < metadata_layers; ++layer) {
+        const auto current = blocks.find(static_cast<uint32_t>(layer));
+        if (current == blocks.end() || current->second.empty()) {
+            cleanup();
+            error = "GGUF block tensors are incomplete";
+            return false;
+        }
+        uint64_t current_bytes = 0;
+        for (const auto & entry : current->second) {
+            if (!checked_add_u64(current_bytes, entry.second.bytes, current_bytes)) {
+                cleanup();
+                error = "GGUF block bytes overflow";
+                return false;
+            }
+            uint64_t elements = 0;
+            if (!checked_product(entry.second.ne, elements) ||
+                elements > (std::numeric_limits<uint64_t>::max() / 2)) {
+                cleanup();
+                error = "GGUF block FLOPs overflow";
+                return false;
+            }
+            const uint64_t tensor_flops = elements * 2;
+            uint64_t & type_flops = flops[entry.second.type];
+            if (!checked_add_u64(type_flops, tensor_flops, type_flops)) {
+                cleanup();
+                error = "GGUF per-type FLOPs overflow";
+                return false;
+            }
+            ordered_types.insert(entry.second.type);
+        }
+        if (!checked_add_u64(total_block_bytes, current_bytes, total_block_bytes)) {
+            cleanup();
+            error = "GGUF block bytes overflow";
+            return false;
+        }
+    }
+    const uint64_t average_block_bytes =
+        total_block_bytes / metadata_layers +
+        (total_block_bytes % metadata_layers != 0 ? 1 : 0);
+    if (average_block_bytes == 0) {
+        cleanup();
+        error = "GGUF block tensors have zero bytes";
+        return false;
+    }
+    const auto tensor_bytes = [&](const char * name, uint64_t & bytes) {
+        const int64_t id = gguf_find_tensor(ctx, name);
+        if (id < 0) {
+            error = std::string("GGUF is missing tensor ") + name;
+            return false;
+        }
+        bytes = gguf_get_tensor_size(ctx, id);
+        if (bytes == 0) {
+            error = std::string("GGUF tensor has zero bytes: ") + name;
+            return false;
+        }
+        return true;
+    };
+    uint64_t token_bytes = 0;
+    uint64_t output_norm_bytes = 0;
+    uint64_t output_bytes = 0;
+    if (!tensor_bytes("token_embd.weight", token_bytes) ||
+        !tensor_bytes("output_norm.weight", output_norm_bytes)) {
+        cleanup();
+        return false;
+    }
+    const int64_t output_id = gguf_find_tensor(ctx, "output.weight");
+    if (output_id < 0) {
+        output_bytes = token_bytes;
+    } else {
+        output_bytes = gguf_get_tensor_size(ctx, output_id);
+        if (output_bytes == 0) {
+            cleanup();
+            error = "GGUF tensor has zero bytes: output.weight";
+            return false;
+        }
+    }
+    uint64_t n_head_kv = 0;
+    uint64_t head_dim = 0;
+    if (!gguf_integer(ctx, arch + ".attention.head_count_kv", n_head_kv, error) ||
+        !gguf_integer(ctx, arch + ".attention.key_length", head_dim, error) ||
+        n_head_kv == 0 || head_dim == 0 ||
+        n_head_kv > std::numeric_limits<uint64_t>::max() / head_dim ||
+        n_head_kv * head_dim > std::numeric_limits<uint64_t>::max() / 4 ||
+        n_head_kv * head_dim * 4 > std::numeric_limits<uint64_t>::max() / n_ctx) {
+        cleanup();
+        if (error.empty()) {
+            error = "GGUF KV metadata is invalid";
+        }
+        return false;
+    }
+    uint64_t kv_per_layer = n_head_kv * head_dim * 4 * n_ctx;
+    uint64_t b_prime = 0;
+    uint64_t output_total = 0;
+    if (!checked_add_u64(output_norm_bytes, output_bytes, output_total) ||
+        !checked_add_u64(average_block_bytes, kv_per_layer, b_prime)) {
+        cleanup();
+        error = "HALDA model byte constants overflow";
+        return false;
+    }
+    const auto average_per_layer = [metadata_layers](uint64_t total) {
+        return total / metadata_layers + (total % metadata_layers != 0 ? 1 : 0);
+    };
+    metadata.n_layer = static_cast<uint32_t>(metadata_layers);
+    metadata.n_embd = static_cast<uint32_t>(n_embd);
+    metadata.n_ff = static_cast<uint32_t>(n_ff);
+    metadata.n_head = static_cast<uint32_t>(n_head);
+    metadata.n_head_kv = static_cast<uint32_t>(n_head_kv);
+    metadata.n_vocab = n_vocab;
+    metadata.n_ctx = n_ctx;
+    metadata.head_dim = static_cast<uint32_t>(head_dim);
+    metadata.b = average_block_bytes;
+    metadata.bi = token_bytes;
+    metadata.bo = output_total;
+    metadata.kv_per_layer = kv_per_layer;
+    metadata.b_prime = b_prime;
+    metadata.ordered_types.assign(ordered_types.begin(), ordered_types.end());
+    metadata.flops_per_type.reserve(metadata.ordered_types.size());
+    for (const ggml_type type : metadata.ordered_types) {
+        const uint64_t value = average_per_layer(flops[type]);
+        if (value == 0) {
+            cleanup();
+            error = "GGUF block FLOPs are too small to model";
+            return false;
+        }
+        metadata.flops_per_type.push_back(value);
+    }
+    cleanup();
+    return true;
+}
 static std::string local_sha256(const std::string & path) {
     const std::string command = "(command -v sha256sum >/dev/null && sha256sum " +
         shell_quote(path) + " || shasum -a 256 " + shell_quote(path) + ") 2>/dev/null";
@@ -927,6 +1768,130 @@ bool ensure_remote_artifact(const bootstrap_node & bootstrap,
     }
     return true;
 }
+bool ensure_remote_hf_artifact(const bootstrap_node & bootstrap,
+                               const std::filesystem::path & remote_path,
+                               const std::string & hf_repo,
+                               const std::string & hf_file,
+                               const std::string & hf_token,
+                               const std::string & digest, bool offline,
+                               std::string & error) {
+    error.clear();
+    if (remote_path.empty() || remote_path.is_absolute() || remote_path.filename().empty()) {
+        error = "remote artifact path must be a relative file";
+        return false;
+    }
+    for (const std::filesystem::path & part : remote_path) {
+        if (part == "..") {
+            error = "remote artifact path cannot contain '..'";
+            return false;
+        }
+    }
+    if (hf_repo.empty() || hf_file.empty()) {
+        error = "Hugging Face model source is incomplete";
+        return false;
+    }
+    const std::filesystem::path hf_file_path(hf_file);
+    if (hf_file_path.is_absolute()) {
+        error = "Hugging Face model file must be relative";
+        return false;
+    }
+    for (const std::filesystem::path & part : hf_file_path) {
+        if (part == "..") {
+            error = "Hugging Face model file cannot contain '..'";
+            return false;
+        }
+    }
+    if (!valid_sha256_digest(digest)) {
+        error = "Hugging Face model digest is invalid";
+        return false;
+    }
+
+    const std::string remote = remote_path.generic_string();
+    const std::string ssh = ssh_options(bootstrap);
+    const std::string remote_check =
+        "(cd ~/potluck && (sha256sum " + shell_quote(remote) +
+        " 2>/dev/null || shasum -a 256 " + shell_quote(remote) +
+        " 2>/dev/null) | cut -d' ' -f1)";
+    const std::string check = ssh + " " + shell_quote(bootstrap.ssh_target) + " " +
+        shell_quote(remote_check);
+    const auto remote_digest = [&]() {
+        FILE * pipe = popen(check.c_str(), "r");
+        if (pipe == nullptr) {
+            return std::string();
+        }
+        char buffer[256] = {};
+        std::string actual;
+        if (std::fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            actual = buffer;
+            while (!actual.empty() &&
+                   (actual.back() == '\n' || actual.back() == '\r')) {
+                actual.pop_back();
+            }
+        }
+        const int status = pclose(pipe);
+        return status == 0 ? actual : std::string();
+    };
+
+    if (remote_digest() == digest) {
+        std::printf("potluck-server: %s already has %s\n",
+                    bootstrap.ring_host.c_str(), remote.c_str());
+        return true;
+    }
+    if (offline) {
+        error = "remote model is missing and --offline is set";
+        return false;
+    }
+
+    const std::filesystem::path parent = remote_path.parent_path();
+    const std::string directory = "mkdir -p " +
+        shell_quote(parent.empty() ? "." : parent.generic_string());
+    const std::string url = "https://huggingface.co/" + hf_repo +
+        "/resolve/main/" + hf_file;
+    const std::string temporary = remote + ".part";
+    const std::string curl =
+        "curl -L --fail --retry 3 -o " + shell_quote(temporary) + " " +
+        shell_quote(url);
+    const std::string curl_authenticated =
+        "curl -L --fail --retry 3 -H \"Authorization: Bearer $HF_TOKEN\" -o " +
+        shell_quote(temporary) + " " + shell_quote(url);
+    const std::string fetch =
+        "set -eu; IFS= read -r HF_TOKEN; export HF_TOKEN; cd ~/potluck && " +
+        directory + " && rm -f " + shell_quote(temporary) + " && if [ -n " +
+        "\"$HF_TOKEN\" ]; then " + curl_authenticated + "; else " + curl +
+        "; fi; actual=\"$(sha256sum " + shell_quote(temporary) +
+        " 2>/dev/null || shasum -a 256 " + shell_quote(temporary) +
+        " 2>/dev/null)\"; actual=\"${actual%% *}\"; if [ \"$actual\" != " +
+        shell_quote(digest) + " ]; then rm -f " + shell_quote(temporary) +
+        "; exit 1; fi; mv " + shell_quote(temporary) + " " +
+        shell_quote(remote);
+    std::printf("potluck-server: fetching %s directly on %s\n",
+                remote.c_str(), bootstrap.ring_host.c_str());
+    std::fflush(stdout);
+    const std::string command = ssh + " " + shell_quote(bootstrap.ssh_target) +
+        " " + shell_quote(fetch);
+    FILE * fetch_pipe = popen(command.c_str(), "w");
+    if (fetch_pipe == nullptr) {
+        error = "cannot start remote Hugging Face download";
+        return false;
+    }
+    const std::string token_line = hf_token + '\n';
+    const bool token_sent =
+        std::fwrite(token_line.data(), 1, token_line.size(), fetch_pipe) ==
+        token_line.size() && std::fflush(fetch_pipe) == 0;
+    const int fetch_status = pclose(fetch_pipe);
+    if (!token_sent || fetch_status != 0) {
+        error = "remote Hugging Face download failed";
+        return false;
+    }
+    const std::string transferred = remote_digest();
+    if (transferred != digest) {
+        error = "remote checksum mismatch (expected " + digest + ", got " +
+            (transferred.empty() ? std::string("<unavailable>") : transferred) + ")";
+        return false;
+    }
+    return true;
+}
+
 
 std::string pinned_model_digest(const std::filesystem::path & model_path,
                                 const std::filesystem::path & repo_root) {
@@ -948,35 +1913,34 @@ std::string pinned_model_digest(const std::filesystem::path & model_path,
 }
 
 
-// Workers report their accelerator before asking for a schedule. Missing or
-// timed-out profiles mean CPU-only execution for that worker.
-std::vector<potluck::accel_profile> collect_accel_profiles(ServerRing & ring, uint32_t n_workers) {
+// Workers report their device profile before asking for a schedule.
+std::vector<potluck::device_profile> collect_device_profiles(ServerRing & ring, uint32_t n_workers) {
     constexpr int profile_timeout_ms = 120000;
     if (!ring.result.set_receive_timeout(profile_timeout_ms, ring.error)) {
         throw std::runtime_error("cannot set ring profile timeout: " + ring.error);
     }
-    std::vector<potluck::accel_profile> profiles(n_workers);
+    std::vector<potluck::device_profile> profiles(n_workers);
     std::vector<bool> seen(n_workers, false);
     for (uint32_t received = 0; received < n_workers; ++received) {
         potluck::message message;
         if (!ring.result.receive(message, ring.error)) {
-            throw std::runtime_error("accelerator profile collection stopped at " +
+            throw std::runtime_error("device profile collection stopped at " +
                                      std::to_string(received) + " of " +
                                      std::to_string(n_workers) + " workers: " + ring.error);
         }
         if (message.type != potluck::message_type::profile_result ||
             message.rank >= n_workers || seen[message.rank]) {
-            throw std::runtime_error("ring worker sent an unexpected accelerator profile");
+            throw std::runtime_error("ring worker sent an unexpected device profile");
         }
-        if (!potluck::decode_accel_profile(message.payload.data(), message.payload.size(),
-                                           profiles[message.rank], ring.error)) {
-            throw std::runtime_error("cannot decode accelerator profile: " + ring.error);
+        if (!potluck::decode_device_profile(message.payload.data(), message.payload.size(),
+                                            profiles[message.rank], ring.error)) {
+            throw std::runtime_error("cannot decode device profile: " + ring.error);
         }
         if (profiles[message.rank].rank != message.rank) {
-            throw std::runtime_error("accelerator profile rank mismatch");
+            throw std::runtime_error("device profile rank mismatch");
         }
         seen[message.rank] = true;
-        const potluck::accel_profile & profile = profiles[message.rank];
+        const potluck::device_profile & profile = profiles[message.rank];
         std::printf("potluck-server: worker %u accelerator %s free %llu MiB total %llu MiB\n",
                     message.rank, accel_kind_name(profile.kind),
                     static_cast<unsigned long long>(profile.free_bytes / (1024ull * 1024ull)),
@@ -984,42 +1948,4 @@ std::vector<potluck::accel_profile> collect_accel_profiles(ServerRing & ring, ui
     }
     std::fflush(stdout);
     return profiles;
-}
-
-// Spend each worker's usable accelerator memory across its own windows in ring
-// order. Layers stay on CPU when the device is absent, small, or busy.
-void assign_gpu_layers(std::vector<potluck::ring_window> & windows,
-                       const std::vector<potluck::accel_profile> & profiles,
-                       uint32_t n_workers, uint64_t model_bytes, uint32_t n_layer,
-                       uint32_t n_head_kv, uint32_t head_dim, uint32_t n_ctx) {
-    constexpr uint64_t mib = 1024ull * 1024ull;
-    constexpr uint64_t window_slack_bytes = 64 * mib;
-    constexpr uint64_t min_device_reserve_bytes = 512 * mib;
-    if (windows.empty() || profiles.size() != n_workers || n_layer == 0) {
-        throw std::runtime_error("cannot plan placement without a route and profiles");
-    }
-    std::vector<int64_t> budget(n_workers, 0);
-    for (uint32_t rank = 0; rank < n_workers; ++rank) {
-        const potluck::accel_profile & profile = profiles[rank];
-        if (profile.kind == potluck::accel_kind::none || profile.total_bytes == 0) {
-            continue;
-        }
-        // Keep desktop memory responsive on unified-memory hosts.
-        const uint64_t reserve = std::max(min_device_reserve_bytes, profile.total_bytes / 8);
-        budget[rank] = profile.free_bytes > reserve && profile.free_bytes - reserve > 0
-            ? static_cast<int64_t>(profile.free_bytes - reserve) : 0;
-    }
-    const uint64_t weights_per_layer = model_bytes / n_layer;
-    const uint64_t kv_per_layer = 2ull * n_head_kv * head_dim * 2ull * n_ctx; // K and V, f16
-    const uint64_t layer_cost = weights_per_layer + kv_per_layer;
-    for (potluck::ring_window & window : windows) {
-        int64_t affordable = static_cast<int64_t>(layer_cost) == 0
-            ? 0 : (budget[window.owner] - static_cast<int64_t>(window_slack_bytes)) /
-                      static_cast<int64_t>(layer_cost);
-        affordable = std::max<int64_t>(affordable, 0);
-        const int64_t span = window.end - window.start;
-        const int32_t n_gpu_layers = static_cast<int32_t>(std::min(affordable, span));
-        window.n_gpu_layers = n_gpu_layers;
-        budget[window.owner] -= static_cast<int64_t>(n_gpu_layers) * static_cast<int64_t>(layer_cost);
-    }
 }

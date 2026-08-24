@@ -1,17 +1,20 @@
 # Component verification and inference accuracy
 
-This document records evidence from the current unfinished implementation. It
-does not define the product architecture or a release gate. The binding
-decision is [ADR 0006](decisions/0006-piped-ring-server-product.md), amended by
+This document records component and integrated-run evidence. It does not define
+the product architecture or release gate. The binding decision is
+[ADR 0006](decisions/0006-piped-ring-server-product.md), amended by
 [ADR 0007](decisions/0007-prima-direct-ring-zeromq.md): Potluck is a
-resource-aware, direct-peer ZeroMQ piped-ring-only OpenAI-compatible server with
-automatic profiling and selection, heterogeneous window placement, per-window
-prefetch, per-device accelerator placement, shard-only loading, continuous
-batching, and conversation slots.
+resource-aware, direct-peer ZeroMQ piped-ring-only OpenAI-compatible server
+with automatic profiling and selection, HiGHS-solved heterogeneous window
+placement (HALDA, [ADR 0010](decisions/0010-prima-feature-parity-baseline.md)),
+per-window prefetch, per-device accelerator placement, complete-model
+window-bounded loading, continuous batching, conversation slots, speculative
+decoding, quantized-model support, and a potluck completion CLI beside the
+server.
 
 Any remaining static or alternate architecture check is removal work, not a
-product path. Passing a batch-protocol, shard, or HTTP component check does not
-make Potluck a finished product.
+product path. Passing a component check does not prove every large
+platform-specific release scenario.
 
 This document separates two component claims:
 
@@ -26,10 +29,10 @@ proof of the complete product contract.
 ## Verification scope
 
 Fixture accuracy is exercised with small model files that fit the test host.
-The current fixture is Qwen3.5 0.8B; other small models may exercise a
-component primitive. Verifying 27B correctness, performance, or end-to-end
-execution remains outside the fixture test scope. It does not change the
-ADR 0006 product architecture or release gate.
+The Qwen3.5 0.8B fixture provides exact token and component checks. A
+supervised Gemma 3 27B run provides integrated multi-device and performance
+evidence; it does not claim full reference-token parity. These results do not
+change the ADR 0006 product architecture or release gate.
 
 ## Direct-ring smoke evidence on 2026-08-21
 
@@ -45,18 +48,17 @@ execute a window and the result does not demonstrate heterogeneous placement.
 These observations establish the direct server transport, repeated-window
 route, local worker launch, and SSH bootstrap boundaries only. They do not
 establish automatic discovery, live profiling or selection, resource-aware
-placement, shard automation, continuous batching, conversation slots,
+placement, full-model distribution, continuous batching, conversation slots,
 resilience, security, or full API parity.
 
 | Component | Checked behavior | Check and product boundary |
 |---|---|---|
-| Direct server ring | Adjacent workers exchange hidden state directly over ZeroMQ; ingress enters rank 0 and final results return to the head | Local `potluck-server` smoke; direct product path, but not the complete release gate |
-| Repeated disjoint windows | The current route assigns two windows per worker where model layers permit | Server startup and completion smoke; fixed route, not live heterogeneous scheduling |
-| SSH bootstrap | The head launches an explicitly named Linux worker and forms the cyclic ring | M4-head to Linux-worker 0.8B smoke; functional launch evidence, not automatic discovery |
-| Mixed recurrent/attention window primitive | A worker window with no attention layers preserves fixture accuracy | Retained component check; not product completion |
-| Per-window GGUF shard primitive | Generated shards load and reject wrong assignments | `potluck-shard` component check; automatic creation and deployment remain missing |
-| Sampling primitive | Temperature, top-p, and seed meet the component contract | Retained component check; full request sampling controls remain missing |
-| Prompt, chat, and streaming component | Template, text, error, health, model, and stream behavior pass the component checks | `test_server.sh`; the OpenAI-compatible surface is still only a subset |
+| Direct server ring | Adjacent workers exchange hidden state directly over ZeroMQ; ingress enters rank 0 and final results return to the head | Local `potluck-server` smoke and integrated suite |
+| Repeated disjoint windows | HALDA assigns repeated windows from live profile data and the ring traverses them in cycle order | `test-potluck-halda` plus integrated server route |
+| SSH and DNS-SD bootstrap | The head discovers candidates, profiles them, and forms the cyclic ring through scoped SSH bootstrap | Discovery smoke and integrated server route |
+| Window-bounded full-model loading | Each worker loads assigned global layer bounds from one complete GGUF | Integrated route and `test-potluck-qwen35-stages` |
+| Sampling and speculative decoding | Temperature-zero output stays stable with draft state; accepted counts and trim state cross the ring | Speculative server smoke and integrated suite |
+| Prompt, chat, and streaming component | Template, text, error, health, model, and stream behavior pass the component checks | `test_server.sh`; the OpenAI-compatible surface is still a subset |
 | Protocol and transport components | Direct ZeroMQ messages and worker protocol behavior pass their named checks | `run_all.sh`; component evidence only |
 | Full-model reference | Small-fixture output can be compared with a monolithic reference | Test-only accuracy evidence; product workers must not load a full model as a reference |
 
@@ -67,45 +69,44 @@ the complete server contract.
 
 ## Platform and fixture limits
 
-The Qwen3.5 0.8B fixture fits the test hosts and is the current named smoke
-target. The M4-to-Linux check proves functional SSH bootstrap and direct
-ring communication only. It does not measure cross-machine throughput,
-automatic discovery, live selection, heterogeneous placement, or head work.
+The Qwen3.5 0.8B fixture fits the test hosts and is the named small-fixture
+target. The supervised Gemma 3 27B runs used the model file
+`/Users/carlstone/models/gemma-3-27b-it-Q4_K_M.gguf` on an M4 head, an M1,
+and a Linux CUDA device. The assignment log and measured streaming results
+are recorded in `docs/BENCHMARKS.md`.
 
-The fixture does not establish quantization breadth outside Q4_0, correctness
-or performance for 27B, or end-to-end product completion. No claim is made
-about PC GPU performance or other uninspected hardware.
+The fixture establishes exact small-model behavior and nonzero speculative
+acceptance. The 27B runs establish integrated three-device operation,
+full-model window loading, per-window prefetch, and measured performance.
+Neither result claims the full llama-server API surface or a general model
+compatibility matrix.
 
 ## Inherited or unverified
 
-These items remain unverified by the current smoke evidence:
+These items remain outside the current named evidence:
 
-- Quantization breadth outside the checked Q4_0 fixture. Modern llama.cpp owns
-  the quantization implementations, but no other distributed stage fixture is
-  named here.
-- Cross-machine throughput and resilience. SSH bootstrap and one functional
-  completion passed, but reconnect, topology rebuild, retry, and recovery are
-  not implemented.
-- Automatic discovery, live profiling, device selection, head resource
-  reservation, and per-device accelerator placement.
-- Shard creation, transfer, validation, selection, and caching automation.
-- Continuous HTTP batching, conversation slots, and full API parity.
+- Quantization breadth outside the checked fixtures. Quantized GGUF support is
+  implemented, but no complete distributed quantization matrix is claimed.
+- Cross-machine token-state migration and safe retry after a worker change.
+  The current recovery path is bounded and retryable, but it does not migrate
+  an active sequence.
+- Broader llama-server HTTP parity, model management, embeddings, tools, and
+  multimodal behavior.
+- Longer platform-specific runs beyond the supervised 27B operating point.
 
 ## Architecture status
 
-The current distributed window loader targets the `qwen35` dense path. The
-server now owns a direct adjacent-peer ZeroMQ ring with two repeated disjoint
-windows per worker where layers permit. Local worker launch and explicit SSH
-bootstrap are implemented.
+The current verification covers the `qwen35` dense fixture and the Gemma 3
+27B operating point. The server owns a direct adjacent-peer ZeroMQ ring with
+HALDA-solved repeated windows, local and SSH worker launch, DNS-SD discovery,
+per-window prefetch, per-device CPU, Metal, and CUDA placement, speculative
+decoding, continuous batching, and conversation slots.
 
-The remaining gaps are automatic discovery, live profiling and selection,
-resource-aware placement, per-window prefetch, independent per-device
-accelerator placement, shard automation, continuous batching, conversation
-slots, resilience, security, and full OpenAI-compatible API parity. The direct
-ring smoke is evidence for one server path, not product completion.
+The remaining scope is broader API and model coverage, longer platform runs,
+and token-state migration after a worker failure. The full-model reference
+remains test-only and explicit. Product binaries must not load the full model
+as a correctness reference.
 
-The full-model reference remains test-only and explicit. Product binaries must
-not load the full model as a correctness reference.
-
-A build without optional placement-solver support does not establish automatic
-placement; the release gate still requires the complete server lifecycle.
+A build without the HiGHS-backed HALDA placement required by
+[ADR 0010](decisions/0010-prima-feature-parity-baseline.md) does not establish
+automatic placement.

@@ -71,17 +71,15 @@ cmake -S "${REPO}" -B "${build_dir}" \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
     -DLLAMA_BUILD_APP=OFF \
-    -DPOTLUCK_HIGHS=OFF
-potluck_build "${build_dir}" --target potluck-node potluck-worker potluck-shard
+    -DPOTLUCK_HIGHS=ON
+potluck_build "${build_dir}" --target potluck-node potluck-worker
 
 worker="${build_dir}/bin/potluck-worker"
 node="${build_dir}/bin/potluck-node"
-shard="${build_dir}/bin/potluck-shard"
 [[ -x "${worker}" ]] || die "missing worker binary: ${worker}"
 [[ -x "${node}" ]] || die "missing node binary: ${node}"
-[[ -x "${shard}" ]] || die "missing shard binary: ${shard}"
 
-for binary in "${node}" "${worker}" "${shard}"; do
+for binary in "${node}" "${worker}"; do
     archs="$(lipo -archs "${binary}")" ||
         die "cannot inspect architecture: ${binary}"
     [[ "${archs}" == *arm64* ]] ||
@@ -133,11 +131,10 @@ trap cleanup EXIT
 
 cp "${node}" "${staging_dir}/potluck-node"
 cp "${worker}" "${staging_dir}/potluck-worker"
-cp "${shard}" "${staging_dir}/potluck-shard"
 cp "${zmq_path}" "${staging_dir}/libzmq.5.dylib"
-chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"
+chmod +x "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"
 
-shipped_files=(potluck-node potluck-worker potluck-shard libzmq.5.dylib)
+shipped_files=(potluck-node potluck-worker libzmq.5.dylib)
 sodium_dependency="$(otool -L "${zmq_path}" |
     awk '$1 ~ /libsodium[^[:space:]]*\.dylib$/ { print $1; exit }')"
 sodium_path="${POTLUCK_SODIUM:-}"
@@ -174,7 +171,7 @@ fi
 install_name_tool -id "@rpath/libzmq.5.dylib" "${staging_dir}/libzmq.5.dylib"
 codesign --force --sign - "${staging_dir}/libzmq.5.dylib"
 
-for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker" "${staging_dir}/potluck-shard"; do
+for binary in "${staging_dir}/potluck-node" "${staging_dir}/potluck-worker"; do
     zmq_dependency="$(otool -L "${binary}" |
         awk '$1 ~ /libzmq[^[:space:]]*\.dylib$/ { print $1; exit }')"
     if [[ -n "${zmq_dependency}" ]]; then
@@ -213,7 +210,7 @@ if [[ -e "${out_dir}" ]]; then
     for entry in "${out_dir}"/* "${out_dir}"/.[!.]*; do
         [[ -e "${entry}" || -L "${entry}" ]] || continue
         case "$(basename "${entry}")" in
-            potluck-node|potluck-worker|potluck-shard|libzmq.5.dylib|libsodium.26.dylib|potluck-build-id)
+            potluck-node|potluck-worker|libzmq.5.dylib|libsodium.26.dylib|potluck-build-id)
                 ;;
             *)
                 die "refusing to replace non-payload output directory: ${out_dir}"

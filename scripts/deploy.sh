@@ -228,7 +228,7 @@ if ! ssh_cmd "${verify_cmd}"; then
     fail "checksum verification failed on ${target}"
 fi
 
-# Keep model and shard files untouched. Replace only the files owned by the
+# Keep existing model files untouched. Replace only the files owned by the
 # portable payload, then leave the verified manifest as an install record.
 install_files=("${payload_files[@]}" potluck-build-id potluck-deploy.sha256)
 move_cmd="set -eu; mkdir -p ${remote_prefix_q};"

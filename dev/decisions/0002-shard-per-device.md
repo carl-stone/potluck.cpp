@@ -2,6 +2,7 @@
 
 - Date: 2026-08-20
 - Status: Superseded by ADR 0006
+- Shard storage superseded by: ADR 0013
 
 ## Context
 

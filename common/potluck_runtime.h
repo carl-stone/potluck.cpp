@@ -71,7 +71,7 @@ inline uint64_t model_file_bytes(const std::string & path) {
 
 inline llama_context_params stage_context_params(uint32_t start, uint32_t end, bool embeddings,
                                                  uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch,
-                                                 bool single_thread = false) {
+                                                 bool single_thread = false, uint32_t n_rs_seq = 0) {
     llama_context_params params = llama_context_default_params();
     if (single_thread || std::getenv("POTLUCK_SINGLE_THREAD") != nullptr) {
         params.n_threads = 1;
@@ -88,7 +88,8 @@ inline llama_context_params stage_context_params(uint32_t start, uint32_t end, b
     // total context across those sequences; forcing 64 slots silently reduced
     // the default server's per-request context to 1/64 (256 tokens at 4096).
     params.n_seq_max = std::max<uint32_t>(1, n_seq_max);
-    params.n_outputs_max = embeddings ? params.n_batch : std::max<uint32_t>(1, n_seq_max);
+    params.n_rs_seq = n_rs_seq;
+    params.n_outputs_max = embeddings ? params.n_batch : std::max(n_seq_max, n_ubatch);
     params.embeddings = embeddings;
     params.swa_full = n_seq_max > 1;
     params.potluck_layer_start = start;
@@ -110,7 +111,8 @@ inline bool stage_load(stage_model & sm, const std::string & path, uint32_t star
                        bool embeddings, uint32_t n_ctx, uint32_t n_seq_max, uint32_t n_ubatch,
                        std::string & error, bool tail = false, int32_t n_gpu_layers = 0,
                        const std::vector<uint32_t> * explicit_gpu_layers = nullptr,
-                       bool explicit_gpu_head = false, bool single_thread = false) {
+                       bool explicit_gpu_head = false, bool single_thread = false,
+                       uint32_t n_rs_seq = 0) {
     sm.start = start;
     sm.end = end;
 
@@ -244,7 +246,7 @@ inline bool stage_load(stage_model & sm, const std::string & path, uint32_t star
 
     sm.ctx = llama_init_from_model(sm.model, stage_context_params(start, end, sm.compute_embeddings,
                                                                   n_ctx, n_seq_max, n_ubatch,
-                                                                  single_thread));
+                                                                  single_thread, n_rs_seq));
     if (sm.ctx == nullptr) {
         error = "failed to allocate context for stage " + std::to_string(start) + ":" + std::to_string(end);
         llama_model_free(sm.model);
@@ -287,12 +289,11 @@ inline int stage_decode_tokens_batch(stage_model & sm, const int32_t * tokens,
         b.pos[i] = pos[i];
         b.n_seq_id[i] = 1;
         b.seq_id[i][0] = seq[i];
-        // Only the trailing n_logits entries request logits: every requested
-        // row counts against the context's n_outputs_max, which is n_seq_max
-        // for a tail stage. A prefill therefore computes just the last entry's
-        // logits; dynamic-batching rounds request all of them. An emitter
-        // stage (stage 0 of a split) must instead pass n_logits = n: its
-        // embeddings context requires every entry to be an output.
+        // Only the trailing n_logits entries request logits. A tail stage
+        // reserves output rows up to the physical batch size so speculative
+        // draft rows can share the same sequence. An emitter stage (stage 0
+        // of a split) must instead pass n_logits = n: its embeddings context
+        // requires every entry to be an output.
         b.logits[i] = (i + n_logits >= n) ? 1 : 0;
     }
     const int rc = llama_decode(sm.ctx, b);
@@ -313,7 +314,7 @@ inline int stage_decode_tokens_batch(stage_model & sm, const int32_t * tokens,
 // requests logits for all entries. The windowed graph has no LM head, so no
 // logits rows are computed and the output buffer holds only the embeddings
 // rows (n_outputs_max = n_batch). A tail stage requests only the trailing
-// n_logits entries, which its n_outputs_max = n_seq_max covers.
+// n_logits entries, with capacity up to n_ubatch for speculative decoding.
 inline int stage_decode_hidden_batch(stage_model & sm, const float * hidden,
                                      const int32_t * pos, const int32_t * seq, uint32_t n,
                                      uint32_t n_logits) {

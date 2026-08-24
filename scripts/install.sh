@@ -176,16 +176,6 @@ if [[ -n "${payload_dir}" ]]; then
             "${expected_platform}" "${payload_platform:-missing}" >&2
         exit 2
     }
-    for required in potluck-node potluck-worker potluck-shard; do
-        found=0
-        for known in "${payload_files[@]}"; do
-            [[ "${known}" == "${required}" ]] && found=1
-        done
-        [[ "${found}" == 1 ]] || {
-            printf 'install: payload manifest does not checksum %s\n' "${required}" >&2
-            exit 2
-        }
-    done
     for name in "${payload_files[@]}"; do
         [[ -f "${payload_dir}/${name}" && ! -L "${payload_dir}/${name}" ]] || {
             printf 'install: payload missing %s\n' "${name}" >&2
@@ -193,8 +183,7 @@ if [[ -n "${payload_dir}" ]]; then
         }
     done
     [[ -x "${payload_dir}/potluck-node" &&
-       -x "${payload_dir}/potluck-worker" &&
-       -x "${payload_dir}/potluck-shard" ]] || {
+       -x "${payload_dir}/potluck-worker" ]] || {
         printf 'install: payload worker binaries are not executable\n' >&2
         exit 2
     }
@@ -218,10 +207,10 @@ if [[ "${skip_build}" != "1" ]]; then
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_APP=OFF \
-        -DPOTLUCK_HIGHS=OFF
-    targets=(potluck-node potluck-worker potluck-shard)
+        -DPOTLUCK_HIGHS=ON
+    targets=(potluck-node potluck-worker)
     if [[ "${build_server}" == "1" ]]; then
-        targets+=(potluck-server)
+        targets+=(potluck-server potluck-cli)
     fi
     printf 'install: building %s with %s jobs\n' "${targets[*]}" "${jobs}"
     POTLUCK_BUILD_JOBS="${jobs}" potluck_build "${build_dir}" --config Release \
@@ -234,10 +223,10 @@ if [[ -n "${payload_dir}" ]]; then
         cp -f "${payload_dir}/${name}" "${prefix}/${name}"
     done
     cp -f "${payload_dir}/potluck-build-id" "${prefix}/potluck-build-id"
-    chmod +x "${prefix}/potluck-node" "${prefix}/potluck-worker" "${prefix}/potluck-shard"
+    chmod +x "${prefix}/potluck-node" "${prefix}/potluck-worker"
 else
     bin_dir="${build_dir}/bin"
-    for name in potluck-node potluck-worker potluck-shard; do
+    for name in potluck-node potluck-worker; do
         [[ -x "${bin_dir}/${name}" ]] || {
             printf 'install: missing built binary: %s\n' "${bin_dir}/${name}" >&2
             exit 2
@@ -245,7 +234,7 @@ else
         cp -f "${bin_dir}/${name}" "${prefix}/${name}"
     done
     if [[ "${build_server}" == "1" ]]; then
-        for name in potluck-server; do
+        for name in potluck-server potluck-cli; do
             [[ -x "${bin_dir}/${name}" ]] || {
                 printf 'install: missing built binary: %s\n' "${bin_dir}/${name}" >&2
                 exit 2
@@ -268,6 +257,8 @@ printf '  worker device: %s/potluck-node\n' "${prefix}"
 if [[ -n "${model_path}" && -x "${prefix}/potluck-server" ]]; then
     model_file="$(basename "${model_path}")"
     printf '  head device:   %s/potluck-server -m %s/%s\n' \
+        "${prefix}" "${prefix}" "${model_file}"
+    printf '  completion:    %s/potluck-cli -m %s/%s -p \"...\"\n' \
         "${prefix}" "${prefix}" "${model_file}"
 fi
 

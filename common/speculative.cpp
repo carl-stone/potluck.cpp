@@ -2385,9 +2385,8 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-    //       the extra memory for small models is likely negligible?
-    cparams.n_rs_seq  = 0;
+    // Draft-simple removes its seed and draft tail before target verification.
+    cparams.n_rs_seq = params.speculative.need_n_rs_seq();
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;
