@@ -11,8 +11,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -135,6 +135,21 @@ std::string stop_text(const std::string & text, const std::vector<std::string> &
     }
     return text.substr(0, end);
 }
+
+std::string stop_sequence_at(const std::string & text, size_t stop_offset,
+                             const std::vector<std::string> & stops) {
+    if (stop_offset == std::string::npos) {
+        return {};
+    }
+    for (const std::string & stop : stops) {
+        if (stop_offset + stop.size() <= text.size() &&
+            text.compare(stop_offset, stop.size(), stop) == 0) {
+            return stop;
+        }
+    }
+    return {};
+}
+
 size_t visible_token_count(const llama_vocab * vocab,
                            const std::vector<llama_token> & generated,
                            size_t stop_offset) {
@@ -251,6 +266,36 @@ std::string request_id(uint64_t & created) {
     const uint64_t sequence = request_counter.fetch_add(1, std::memory_order_relaxed);
     return "chatcmpl-potluck-" + std::to_string(created) + "-" + std::to_string(sequence);
 }
+std::string conversation_id(const httplib::Request & request) {
+    const bool present = request.has_header("X-Conversation-Id");
+    const std::string value =
+        httplib::detail::trim_copy(request.get_header_value("X-Conversation-Id"));
+    if (value.empty()) {
+        if (present) {
+            throw std::runtime_error(
+                "invalid X-Conversation-Id: expected 1 to 128 characters");
+        }
+        return {};
+    }
+    if (value.size() > 128) {
+        throw std::runtime_error(
+            "invalid X-Conversation-Id: expected 1 to 128 characters");
+    }
+    for (const unsigned char character : value) {
+        const bool alpha = character >= 'A' && character <= 'Z';
+        const bool digit = character >= '0' && character <= '9';
+        const bool lower = character >= 'a' && character <= 'z';
+        const bool punctuation = character == '.' || character == '_' ||
+            character == ':' || character == '@' || character == '/' ||
+            character == '-';
+        if (!alpha && !digit && !lower && !punctuation) {
+            throw std::runtime_error(
+                "invalid X-Conversation-Id: unsupported character");
+        }
+    }
+    return value;
+}
+
 
 json chat_logprobs_json(const llama_vocab * vocab,
                         const std::vector<llama_token> & generated,
@@ -323,6 +368,332 @@ json text_logprobs_json(const llama_vocab * vocab,
     };
 }
 
+json anthropic_to_openai(const json & body) {
+    static const std::unordered_set<std::string> supported = {
+        "model", "messages", "system", "max_tokens", "metadata", "stop_sequences",
+        "stream", "temperature", "top_p", "top_k", "tools", "tool_choice",
+        "thinking"
+    };
+    for (auto it = body.begin(); it != body.end(); ++it) {
+        if (supported.find(it.key()) == supported.end()) {
+            throw std::runtime_error("unsupported field: " + it.key());
+        }
+    }
+
+    json output = json::object();
+    if (body.contains("model")) {
+        output["model"] = body.at("model");
+    }
+
+    json messages = json::array();
+    if (!body.contains("messages")) {
+        throw std::runtime_error("missing messages");
+    }
+    if (!body["messages"].is_array() || body["messages"].empty()) {
+        throw std::runtime_error("invalid messages: expected a non-empty array");
+    }
+
+    if (body.contains("system")) {
+        const json & system = body.at("system");
+        std::string text;
+        if (system.is_string()) {
+            text = system.get<std::string>();
+        } else if (system.is_array()) {
+            for (const json & block : system) {
+                if (!block.is_object() || block.value("type", std::string()) != "text" ||
+                    !block.contains("text") || !block["text"].is_string()) {
+                    throw std::runtime_error("invalid system: expected text content blocks");
+                }
+                text += block["text"].get<std::string>();
+            }
+        } else {
+            throw std::runtime_error("invalid system: expected a string or text content blocks");
+        }
+        messages.push_back({ { "role", "system" }, { "content", text } });
+    }
+
+    for (const json & message : body["messages"]) {
+        if (!message.is_object() || !message.contains("role") ||
+            !message["role"].is_string()) {
+            throw std::runtime_error("invalid messages: each message needs a role");
+        }
+        const std::string role = message["role"].get<std::string>();
+        if (!message.contains("content")) {
+            if (role == "assistant") {
+                continue;
+            }
+            messages.push_back({ { "role", role }, { "content", "" } });
+            continue;
+        }
+
+        const json & content = message["content"];
+        if (content.is_string()) {
+            messages.push_back({ { "role", role }, { "content", content } });
+            continue;
+        }
+        if (!content.is_array()) {
+            throw std::runtime_error("invalid messages: content must be a string or array");
+        }
+
+        json converted_content = json::array();
+        json tool_calls = json::array();
+        std::vector<json> tool_results;
+        std::string reasoning_content;
+        for (const json & block : content) {
+            if (!block.is_object()) {
+                throw std::runtime_error("invalid messages: content block must be an object");
+            }
+            const std::string type = block.value("type", std::string());
+            if (type == "text") {
+                if (!block.contains("text") || !block["text"].is_string()) {
+                    throw std::runtime_error("invalid messages: text block needs text");
+                }
+                converted_content.push_back({
+                    { "type", "text" }, { "text", block["text"] }
+                });
+            } else if (type == "thinking") {
+                if (!block.contains("thinking") || !block["thinking"].is_string()) {
+                    throw std::runtime_error("invalid messages: thinking block needs thinking");
+                }
+                reasoning_content += block["thinking"].get<std::string>();
+            } else if (type == "image") {
+                const json source = block.value("source", json::object());
+                if (!source.is_object()) {
+                    throw std::runtime_error("invalid messages: image block needs a source");
+                }
+                const std::string source_type = source.value("type", std::string());
+                std::string url;
+                if (source_type == "base64") {
+                    url = "data:" + source.value("media_type", std::string("image/jpeg")) +
+                          ";base64," + source.value("data", std::string());
+                } else if (source_type == "url") {
+                    url = source.value("url", std::string());
+                } else {
+                    throw std::runtime_error("unsupported content block: image source");
+                }
+                converted_content.push_back({
+                    { "type", "image_url" }, { "image_url", { { "url", url } } }
+                });
+            } else if (type == "tool_use") {
+                if (!block.contains("name") || !block["name"].is_string() ||
+                    !block.contains("id") || !block["id"].is_string()) {
+                    throw std::runtime_error("invalid messages: tool_use needs id and name");
+                }
+                tool_calls.push_back({
+                    { "id", block["id"] }, { "type", "function" },
+                    { "function", {
+                        { "name", block["name"] },
+                        { "arguments", block.value("input", json::object()).dump() }
+                    } }
+                });
+            } else if (type == "tool_result") {
+                if (!block.contains("tool_use_id") || !block["tool_use_id"].is_string()) {
+                    throw std::runtime_error("invalid messages: tool_result needs tool_use_id");
+                }
+                const json result = block.value("content", json(""));
+                if (result.is_string()) {
+                    tool_results.push_back({
+                        { "role", "tool" },
+                        { "tool_call_id", block["tool_use_id"] },
+                        { "content", result }
+                    });
+                } else if (result.is_array()) {
+                    std::string result_text;
+                    json result_parts = json::array();
+                    for (const json & part : result) {
+                        if (!part.is_object()) {
+                            throw std::runtime_error("invalid messages: tool_result block must be an object");
+                        }
+                        const std::string part_type = part.value("type", std::string());
+                        if (part_type == "text") {
+                            const std::string text = part.value("text", std::string());
+                            result_text += text;
+                            result_parts.push_back({ { "type", "text" }, { "text", text } });
+                        } else if (part_type == "image") {
+                            const json source = part.value("source", json::object());
+                            const std::string source_type = source.value("type", std::string());
+                            std::string url;
+                            if (source_type == "base64") {
+                                url = "data:" + source.value("media_type", std::string("image/jpeg")) +
+                                      ";base64," + source.value("data", std::string());
+                            } else if (source_type == "url") {
+                                url = source.value("url", std::string());
+                            } else {
+                                throw std::runtime_error("unsupported content block: image source");
+                            }
+                            result_parts.push_back({
+                                { "type", "image_url" }, { "image_url", { { "url", url } } }
+                            });
+                        } else {
+                            throw std::runtime_error("unsupported content block: tool_result");
+                        }
+                    }
+                    tool_results.push_back({
+                        { "role", "tool" },
+                        { "tool_call_id", block["tool_use_id"] },
+                        { "content", result_parts.empty() ? json(result_text) : result_parts }
+                    });
+                } else {
+                    throw std::runtime_error("invalid messages: tool_result content");
+                }
+            } else {
+                throw std::runtime_error("unsupported content block: " + type);
+            }
+        }
+
+        if (!converted_content.empty() || !tool_calls.empty() || !reasoning_content.empty()) {
+            json converted = { { "role", role } };
+            if (!converted_content.empty()) {
+                converted["content"] = converted_content;
+            } else {
+                converted["content"] = "";
+            }
+            if (!tool_calls.empty()) {
+                converted["tool_calls"] = tool_calls;
+            }
+            if (!reasoning_content.empty()) {
+                converted["reasoning_content"] = reasoning_content;
+            }
+            messages.push_back(std::move(converted));
+        }
+        for (json & tool_result : tool_results) {
+            messages.push_back(std::move(tool_result));
+        }
+    }
+    output["messages"] = std::move(messages);
+
+    if (body.contains("tools")) {
+        if (!body["tools"].is_array()) {
+            throw std::runtime_error("invalid tools: expected an array");
+        }
+        json tools = json::array();
+        for (const json & tool : body["tools"]) {
+            if (!tool.is_object() || !tool.contains("name") || !tool["name"].is_string()) {
+                throw std::runtime_error("invalid tools: each tool needs a name");
+            }
+            tools.push_back({
+                { "type", "function" },
+                { "function", {
+                    { "name", tool["name"] },
+                    { "description", tool.value("description", std::string()) },
+                    { "parameters", tool.value("input_schema", json::object()) }
+                } }
+            });
+        }
+        output["tools"] = std::move(tools);
+    }
+
+    if (body.contains("tool_choice")) {
+        const json & choice = body["tool_choice"];
+        if (!choice.is_object()) {
+            throw std::runtime_error("invalid tool_choice: expected an object");
+        }
+        const std::string type = choice.value("type", std::string());
+        if (type == "auto") {
+            output["tool_choice"] = "auto";
+        } else if (type == "any") {
+            output["tool_choice"] = "required";
+        } else if (type == "tool") {
+            const std::string name = choice.value("name", std::string());
+            if (name.empty()) {
+                throw std::runtime_error("invalid tool_choice: tool needs a name");
+            }
+            output["tool_choice"] = {
+                { "type", "function" }, { "function", { { "name", name } } }
+            };
+        } else {
+            throw std::runtime_error("invalid tool_choice: unsupported type");
+        }
+    }
+
+    if (body.contains("stop_sequences")) {
+        if (!body["stop_sequences"].is_array()) {
+            throw std::runtime_error("invalid stop_sequences: expected an array");
+        }
+        output["stop"] = body["stop_sequences"];
+    }
+    if (body.contains("max_tokens")) {
+        output["max_tokens"] = body.at("max_tokens");
+    } else {
+        output["max_tokens"] = 4096u;
+    }
+    for (const char * key : { "stream", "temperature", "top_p", "top_k" }) {
+        if (body.contains(key)) {
+            output[key] = body[key];
+        }
+    }
+    if (body.contains("thinking")) {
+        const json & thinking = body["thinking"];
+        if (!thinking.is_object() || !thinking.contains("type") ||
+            !thinking["type"].is_string()) {
+            throw std::runtime_error("invalid thinking: expected a type");
+        }
+        const std::string type = thinking["type"].get<std::string>();
+        if (type == "enabled") {
+            output["preserve_thinking"] = true;
+            output["chat_template_kwargs"] = {
+                { "enable_thinking", "true" }
+            };
+        } else if (type == "disabled") {
+            output["preserve_thinking"] = false;
+            output["reasoning_effort"] = "none";
+            output["chat_template_kwargs"] = {
+                { "enable_thinking", "false" }
+            };
+        } else {
+            throw std::runtime_error("invalid thinking: type must be enabled or disabled");
+        }
+    }
+    return output;
+}
+
+json anthropic_blocks_from_message(const json & message, const std::string & fallback) {
+    json blocks = json::array();
+    if (message.is_object() && message.contains("reasoning_content") &&
+        message["reasoning_content"].is_string() &&
+        !message["reasoning_content"].get<std::string>().empty()) {
+        blocks.push_back({
+            { "type", "thinking" },
+            { "thinking", message["reasoning_content"] },
+            { "signature", "" }
+        });
+    }
+    if (message.is_object() && message.contains("content") && message["content"].is_string() &&
+        !message["content"].get<std::string>().empty()) {
+        blocks.push_back({
+            { "type", "text" }, { "text", message["content"] }
+        });
+    }
+    if (message.is_object() && message.contains("tool_calls") && message["tool_calls"].is_array()) {
+        for (const json & call : message["tool_calls"]) {
+            if (!call.is_object()) {
+                continue;
+            }
+            const json function = call.value("function", json::object());
+            const std::string arguments = function.value("arguments", std::string("{}"));
+            json input = json::object();
+            try {
+                input = json::parse(arguments);
+            } catch (const std::exception &) {
+                input = json::object();
+            }
+            blocks.push_back({
+                { "type", "tool_use" },
+                { "id", call.value("id", std::string()) },
+                { "name", function.value("name", std::string()) },
+                { "input", std::move(input) }
+            });
+        }
+    }
+    if (blocks.empty()) {
+        blocks.push_back({ { "type", "text" }, { "text", fallback } });
+    }
+    return blocks;
+}
+
+std::string anthropic_sse(const std::string & event, const json & data) {
+    return "event: " + event + "\ndata: " + data.dump() + "\n\n";
+}
 } // namespace
 
 
@@ -349,8 +720,16 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 set_common_headers(response);
                 set_cors_header(request, response);
                 if (!api_key.empty()) {
-                    const std::string authorization =
-                        request.get_header_value("Authorization");
+                    std::string authorization = request.get_header_value("Authorization");
+                    if (authorization.empty() &&
+                        (request.path == "/v1/messages" ||
+                         request.path == "/v1/messages/count_tokens")) {
+                        const std::string anthropic_key =
+                            request.get_header_value("x-api-key");
+                        if (!anthropic_key.empty()) {
+                            authorization = "Bearer " + anthropic_key;
+                        }
+                    }
                     if (!constant_time_equal(authorization, expected_authorization)) {
                         response.status = 401;
                         response.set_content(
@@ -362,7 +741,7 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 if (request.method == "OPTIONS") {
                     response.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
                     response.set_header("Access-Control-Allow-Headers",
-                                         "Content-Type, Authorization");
+                                         "Content-Type, Authorization, x-api-key, anthropic-version");
                     response.status = 204;
                     return httplib::Server::HandlerResponse::Handled;
                 }
@@ -437,7 +816,7 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
             response.set_content(result.dump(), "application/json");
         });
 
-        auto handle = [vocab, model_name, &chat_templates, &session, &scheduler, n_predict_default, temp, top_p, seed, set_common_headers](const httplib::Request & request, httplib::Response & response, bool chat, bool openai_text) {
+        auto handle = [vocab, model_name, &chat_templates, &session, &scheduler, n_predict_default, temp, top_p, seed, set_common_headers](const httplib::Request & request, httplib::Response & response, bool chat, bool openai_text, bool anthropic_api) {
             std::vector<std::shared_ptr<scheduled_slot>> slots;
             std::shared_ptr<scheduled_slot> slot;
             bool healthy = false;
@@ -467,6 +846,11 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 if (!req.is_object()) {
                     throw std::runtime_error("invalid JSON: request must be an object");
                 }
+                if (anthropic_api) {
+                    req = anthropic_to_openai(req);
+                    chat = true;
+                    openai_text = false;
+                }
                 static const std::unordered_set<std::string> allowed = {
                     "model", "messages", "prompt", "max_tokens", "max_completion_tokens", "n_predict",
                     "n", "stop", "stream", "stream_options", "reasoning_effort", "temperature", "top_p",
@@ -483,7 +867,7 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     if (!req["model"].is_string()) {
                         throw std::runtime_error("invalid model: expected a string");
                     }
-                    if (req["model"].get<std::string>() != model_name) {
+                    if (!anthropic_api && req["model"].get<std::string>() != model_name) {
                         throw std::runtime_error("invalid model: model does not match the loaded model");
                     }
                 }
@@ -519,6 +903,11 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 const uint32_t n = json_u32(req, "n", 1);
                 if (n == 0 || n > scheduler.slot_count()) {
                     throw std::runtime_error("invalid n: must be between 1 and the available slot count");
+                }
+                const std::string conversation = conversation_id(request);
+                if (!conversation.empty() && n > 1) {
+                    throw std::runtime_error(
+                        "unsupported combination: conversation id with n > 1");
                 }
                 if (stream && n > 1) {
                     throw std::runtime_error("invalid n: streaming fan-out supports only n=1");
@@ -633,8 +1022,10 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     } catch (const std::exception & e) {
                         throw std::runtime_error(std::string("invalid chat template input: ") + e.what());
                     }
-                    parse_stream_output = !tools.empty() &&
-                        inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+                    parse_stream_output = anthropic_api
+                        ? (req.contains("tools") ||
+                           req.value("preserve_thinking", false))
+                        : (!tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
                     have_chat_params = true;
                     prompt_text = chat_params.prompt;
                 } else {
@@ -729,9 +1120,25 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 }
                 uint64_t created = 0;
                 const std::string id = request_id(created);
+                bool disconnect_logged = false;
+                const auto log_disconnect = [&]() {
+                    if (!disconnect_logged) {
+                        std::fprintf(stderr,
+                                     "potluck-server: client disconnected; cancelled request %s\n",
+                                     id.c_str());
+                        disconnect_logged = true;
+                    }
+                };
                 slots = scheduler.acquire_many(
-                    prompt, n_predict, sampling, stops, stream, chat, id, created, n);
+                    prompt, n_predict, sampling, stops, stream, chat, id, created, n,
+                    conversation, request.is_connection_closed);
                 if (slots.empty()) {
+                    if (request.is_connection_closed()) {
+                        log_disconnect();
+                        response.status = 499;
+                        set_common_headers(response);
+                        return;
+                    }
                     response.status = 503;
                     std::string message = "all conversation slots are busy";
                     if (scheduler.recovery_exhausted()) {
@@ -744,6 +1151,24 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     return;
                 }
                 slot = slots.front();
+                const auto cancel_slots = [&]() {
+                    for (const auto & pending : slots) {
+                        scheduler.cancel(pending);
+                    }
+                    for (const auto & pending : slots) {
+                        scheduler.acknowledge_cancel(pending);
+                    }
+                };
+                const auto abandon_disconnected = [&]() {
+                    if (!request.is_connection_closed()) {
+                        return false;
+                    }
+                    log_disconnect();
+                    cancel_slots();
+                    response.status = 499;
+                    set_common_headers(response);
+                    return true;
+                };
                 const auto parse_chat_output = [chat_params, have_chat_params](
                         const std::string & text, bool is_partial) {
                     common_chat_msg message;
@@ -774,8 +1199,64 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     }
                     return chunk.dump();
                 };
+                const auto stream_slots = slots;
+                const auto stream_is_connection_closed = request.is_connection_closed;
+                const auto stream_terminal =
+                    std::make_shared<std::atomic<bool>>(false);
+                const auto stream_cancel_slots =
+                    [scheduler_ptr = &scheduler, stream_slots, stream_terminal]() {
+                        if (stream_terminal->exchange(true)) {
+                            return;
+                        }
+                        for (const auto & pending : stream_slots) {
+                            scheduler_ptr->cancel(pending);
+                        }
+                        for (const auto & pending : stream_slots) {
+                            scheduler_ptr->acknowledge_cancel(pending);
+                        }
+                    };
+                const auto stream_release_slots =
+                    [scheduler_ptr = &scheduler, stream_slots, stream_terminal]() {
+                        if (stream_terminal->exchange(true)) {
+                            return true;
+                        }
+                        bool released = true;
+                        for (const auto & pending : stream_slots) {
+                            released = scheduler_ptr->release(pending) && released;
+                        }
+                        return released;
+                    };
+                const auto stream_disconnect_logged =
+                    std::make_shared<std::atomic<bool>>(false);
+                const auto stream_log_disconnect =
+                    [id, stream_disconnect_logged]() {
+                        bool expected = false;
+                        if (stream_disconnect_logged->compare_exchange_strong(expected, true)) {
+                            std::fprintf(stderr,
+                                         "potluck-server: client disconnected; cancelled request %s\n",
+                                         id.c_str());
+                        }
+                    };
+                const auto stream_resource_releaser =
+                    [stream_cancel_slots, stream_is_connection_closed,
+                     stream_log_disconnect](bool success) {
+                        if (!success) {
+                            if (stream_is_connection_closed()) {
+                                stream_log_disconnect();
+                            }
+                            stream_cancel_slots();
+                        }
+                    };
+
                 if (stream) {
-                    scheduler.wait_first(slot);
+                    while (!scheduler.wait_ready(slot, std::chrono::milliseconds(250))) {
+                        if (abandon_disconnected()) {
+                            return;
+                        }
+                    }
+                    if (abandon_disconnected()) {
+                        return;
+                    }
                     bool initial_cancelled = false;
                     std::string initial_error;
                     {
@@ -784,8 +1265,7 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                         initial_error = slot->error;
                     }
                     if (initial_cancelled) {
-                        scheduler.acknowledge_cancel(slot);
-                        scheduler.release(slot);
+                        cancel_slots();
                         response.status = 503;
                         set_common_headers(response);
                         response.set_content(error_json("request cancelled", "server_error").dump(),
@@ -799,18 +1279,42 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     set_common_headers(response);
                     response.set_chunked_content_provider(
                         "text/event-stream; charset=utf-8",
-                        [&, slot, chat, openai_text, include_usage, parse_stream_output, common_chunk, parse_chat_output, prompt, stops, n_predict, id](size_t, httplib::DataSink & sink) mutable {
+                        [slot, chat, openai_text, anthropic_api, include_usage, parse_stream_output, common_chunk, parse_chat_output, prompt, stops, n_predict, id, created, model_name, scheduler_ptr = &scheduler, stream_is_connection_closed, stream_cancel_slots, stream_release_slots, stream_log_disconnect](size_t, httplib::DataSink & sink) mutable {
                             auto write = [&](const std::string & event) {
                                 return sink.write(event.data(), event.size());
                             };
                             auto abort = [&]() {
-                                scheduler.cancel(slot);
-                                scheduler.acknowledge_cancel(slot);
+                                if (stream_is_connection_closed()) {
+                                    stream_log_disconnect();
+                                }
+                                stream_cancel_slots();
                                 sink.done();
                                 return false;
                             };
                             try {
-                                if (chat) {
+                                if (anthropic_api) {
+                                    const json message_start = {
+                                        { "type", "message_start" },
+                                        { "message", {
+                                            { "id", id }, { "type", "message" }, { "role", "assistant" },
+                                            { "model", model_name }, { "content", json::array() },
+                                            { "stop_reason", nullptr }, { "stop_sequence", nullptr },
+                                            { "usage", { { "input_tokens", prompt.size() },
+                                                         { "output_tokens", 0 },
+                                                         { "cache_read_input_tokens", 0 } } }
+                                        } }
+                                    };
+                                    if (!write(anthropic_sse("message_start", message_start))) {
+                                        return abort();
+                                    }
+                                    if (!parse_stream_output &&
+                                        !write(anthropic_sse("content_block_start", {
+                                            { "type", "content_block_start" }, { "index", 0 },
+                                            { "content_block", { { "type", "text" }, { "text", "" } } }
+                                        }))) {
+                                        return abort();
+                                    }
+                                } else if (chat) {
                                     const json role = {
                                         { "index", 0 },
                                         { "delta", { { "role", "assistant" } } },
@@ -972,21 +1476,33 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                     if (cancelled) {
                                         return abort();
                                     }
+                                    if (!scheduler_ptr->wait_ready(
+                                            slot, std::chrono::milliseconds(250))) {
+                                        if (stream_is_connection_closed()) {
+                                            return abort();
+                                        }
+                                        continue;
+                                    }
+                                    if (stream_is_connection_closed()) {
+                                        return abort();
+                                    }
                                     std::string piece;
-                                    if (!scheduler.take_piece(slot, piece)) {
+                                    if (!scheduler_ptr->take_piece(slot, piece)) {
                                         break;
                                     }
                                     generated_text += piece;
                                     const std::string limited = stream_text(generated_text, stops);
                                     if (parse_stream_output && chat) {
-                                        common_chat_msg message = parse_chat_output(limited, true);
-                                        if (!message.empty() &&
-                                            message.tool_calls.size() >= stream_message.tool_calls.size()) {
-                                            set_stream_tool_call_ids(message);
-                                            const auto diffs = common_chat_msg_diff::compute_diffs(stream_message, message);
-                                            stream_message = std::move(message);
-                                            if (!emit_chat_diffs(diffs, stream_message, true)) {
-                                                return abort();
+                                        if (!anthropic_api) {
+                                            common_chat_msg message = parse_chat_output(limited, true);
+                                            if (!message.empty() &&
+                                                message.tool_calls.size() >= stream_message.tool_calls.size()) {
+                                                set_stream_tool_call_ids(message);
+                                                const auto diffs = common_chat_msg_diff::compute_diffs(stream_message, message);
+                                                stream_message = std::move(message);
+                                                if (!emit_chat_diffs(diffs, stream_message, true)) {
+                                                    return abort();
+                                                }
                                             }
                                         }
                                         continue;
@@ -996,24 +1512,50 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                     }
                                     const std::string output = limited.substr(emitted_text.size());
                                     emitted_text = limited;
-                                    json choice = chat
-                                        ? json{ { "index", 0 }, { "delta", { { "content", output } } },
-                                                { "finish_reason", nullptr } }
-                                        : openai_text
-                                        ? json{ { "index", 0 }, { "text", output }, { "logprobs", nullptr },
-                                                { "finish_reason", nullptr } }
-                                        : json{ { "content", output } };
-                                    if (include_usage && !chat && !openai_text) {
-                                        choice["usage"] = nullptr;
+                                    if (anthropic_api) {
+                                        const std::string event = anthropic_sse("content_block_delta", {
+                                            { "type", "content_block_delta" }, { "index", 0 },
+                                            { "delta", { { "type", "text_delta" }, { "text", output } } }
+                                        });
+                                        if (!write(event)) {
+                                            return abort();
+                                        }
+                                    } else {
+                                        json choice = chat
+                                            ? json{ { "index", 0 }, { "delta", { { "content", output } } },
+                                                    { "finish_reason", nullptr } }
+                                            : openai_text
+                                            ? json{ { "index", 0 }, { "text", output }, { "logprobs", nullptr },
+                                                    { "finish_reason", nullptr } }
+                                            : json{ { "content", output } };
+                                        if (include_usage && !chat && !openai_text) {
+                                            choice["usage"] = nullptr;
+                                        }
+                                        const std::string event = chat || openai_text
+                                            ? "data: " + common_chunk(choice) + "\n\n"
+                                            : "data: " + choice.dump() + "\n\n";
+                                        if (!write(event)) {
+                                            return abort();
+                                        }
                                     }
-                                    const std::string event = chat || openai_text
-                                        ? "data: " + common_chunk(choice) + "\n\n"
-                                        : "data: " + choice.dump() + "\n\n";
-                                    if (!write(event)) {
+                                }
+                                for (;;) {
+                                    if (scheduler_ptr->wait_done(
+                                            slot, std::chrono::milliseconds(250))) {
+                                        break;
+                                    }
+                                    if (stream_is_connection_closed()) {
                                         return abort();
                                     }
                                 }
-                                scheduler.wait_done(slot);
+                                bool cancelled = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(slot->mutex);
+                                    cancelled = slot->cancelled;
+                                }
+                                if (cancelled || stream_is_connection_closed()) {
+                                    return abort();
+                                }
                                 std::vector<llama_token> generated;
                                 size_t stop_offset = std::string::npos;
                                 std::string error;
@@ -1024,36 +1566,54 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                     error = slot->error;
                                 }
                                 if (!error.empty()) {
-                                    write("data: " + error_json(error, "server_error").dump() + "\n\n");
+                                    if (anthropic_api) {
+                                        write(anthropic_sse("error", {
+                                            { "type", "error" },
+                                            { "error", { { "type", "api_error" }, { "message", error } } }
+                                        }));
+                                    } else {
+                                        write("data: " + error_json(error, "server_error").dump() + "\n\n");
+                                    }
                                     sink.done();
-                                    scheduler.release(slot);
+                                    stream_release_slots();
                                     return false;
                                 }
                                 const bool stopped = stop_offset != std::string::npos;
                                 const std::string final_text = stopped
                                     ? generated_text.substr(0, std::min(stop_offset, generated_text.size()))
                                     : generated_text;
+                                common_chat_msg parsed = chat
+                                    ? parse_chat_output(final_text, false)
+                                    : common_chat_msg{};
                                 if (!parse_stream_output && final_text.size() > emitted_text.size()) {
                                     const std::string output = final_text.substr(emitted_text.size());
-                                    json choice = chat
-                                        ? json{ { "index", 0 }, { "delta", { { "content", output } } },
-                                                { "finish_reason", nullptr } }
-                                        : openai_text
-                                        ? json{ { "index", 0 }, { "text", output }, { "logprobs", nullptr },
-                                                { "finish_reason", nullptr } }
-                                        : json{ { "content", output } };
-                                    if (include_usage && !chat && !openai_text) {
-                                        choice["usage"] = nullptr;
-                                    }
-                                    const std::string event = chat || openai_text
-                                        ? "data: " + common_chunk(choice) + "\n\n"
-                                        : "data: " + choice.dump() + "\n\n";
-                                    if (!write(event)) {
-                                        return abort();
+                                    if (anthropic_api) {
+                                        if (!write(anthropic_sse("content_block_delta", {
+                                            { "type", "content_block_delta" }, { "index", 0 },
+                                            { "delta", { { "type", "text_delta" }, { "text", output } } }
+                                        }))) {
+                                            return abort();
+                                        }
+                                    } else {
+                                        json choice = chat
+                                            ? json{ { "index", 0 }, { "delta", { { "content", output } } },
+                                                    { "finish_reason", nullptr } }
+                                            : openai_text
+                                            ? json{ { "index", 0 }, { "text", output }, { "logprobs", nullptr },
+                                                    { "finish_reason", nullptr } }
+                                            : json{ { "content", output } };
+                                        if (include_usage && !chat && !openai_text) {
+                                            choice["usage"] = nullptr;
+                                        }
+                                        const std::string event = chat || openai_text
+                                            ? "data: " + common_chunk(choice) + "\n\n"
+                                            : "data: " + choice.dump() + "\n\n";
+                                        if (!write(event)) {
+                                            return abort();
+                                        }
                                     }
                                 }
-                                common_chat_msg parsed = chat ? parse_chat_output(final_text, false) : common_chat_msg{};
-                                if (parse_stream_output && chat) {
+                                if (parse_stream_output && chat && !anthropic_api) {
                                     if (!parsed.empty() &&
                                         parsed.tool_calls.size() >= stream_message.tool_calls.size()) {
                                         set_stream_tool_call_ids(parsed);
@@ -1078,43 +1638,144 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                     }
                                     parsed = stream_message;
                                 }
+                                if (anthropic_api && parse_stream_output) {
+                                    const json message = parsed.empty()
+                                        ? json{ { "content", final_text } }
+                                        : parsed.to_json_oaicompat();
+                                    const json blocks = anthropic_blocks_from_message(message, final_text);
+                                    for (size_t index = 0; index < blocks.size(); ++index) {
+                                        const json & block = blocks[index];
+                                        const std::string type = block.value("type", std::string());
+                                        json start_block = block;
+                                        if (type == "text") {
+                                            start_block["text"] = "";
+                                        } else if (type == "thinking") {
+                                            start_block["thinking"] = "";
+                                        } else if (type == "tool_use") {
+                                            start_block["input"] = json::object();
+                                        }
+                                        if (!write(anthropic_sse("content_block_start", {
+                                            { "type", "content_block_start" }, { "index", index },
+                                            { "content_block", start_block }
+                                        }))) {
+                                            return abort();
+                                        }
+                                        if (type == "text" && !block.value("text", std::string()).empty()) {
+                                            if (!write(anthropic_sse("content_block_delta", {
+                                                { "type", "content_block_delta" }, { "index", index },
+                                                { "delta", { { "type", "text_delta" },
+                                                             { "text", block["text"] } } }
+                                            }))) {
+                                                return abort();
+                                            }
+                                        } else if (type == "thinking" &&
+                                                   !block.value("thinking", std::string()).empty()) {
+                                            if (!write(anthropic_sse("content_block_delta", {
+                                                { "type", "content_block_delta" }, { "index", index },
+                                                { "delta", { { "type", "thinking_delta" },
+                                                             { "thinking", block["thinking"] } } }
+                                            }))) {
+                                                return abort();
+                                            }
+                                            if (!write(anthropic_sse("content_block_delta", {
+                                                { "type", "content_block_delta" }, { "index", index },
+                                                { "delta", { { "type", "signature_delta" },
+                                                             { "signature", block.value("signature", std::string()) } } }
+                                            }))) {
+                                                return abort();
+                                            }
+                                        } else if (type == "tool_use") {
+                                            if (!write(anthropic_sse("content_block_delta", {
+                                                { "type", "content_block_delta" }, { "index", index },
+                                                { "delta", { { "type", "input_json_delta" },
+                                                             { "partial_json", block.value("input", json::object()).dump() } } }
+                                            }))) {
+                                                return abort();
+                                            }
+                                        }
+                                        if (!write(anthropic_sse("content_block_stop", {
+                                            { "type", "content_block_stop" }, { "index", index }
+                                        }))) {
+                                            return abort();
+                                        }
+                                    }
+                                }
+                                bool cancelled_before_finish = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(slot->mutex);
+                                    cancelled_before_finish = slot->cancelled;
+                                }
+                                if (cancelled_before_finish || stream_is_connection_closed()) {
+                                    return abort();
+                                }
                                 const std::string finish = chat && !parsed.tool_calls.empty()
                                     ? "tool_calls"
                                     : stopped || generated.size() < n_predict ? "stop" : "length";
-                                if (chat) {
-                                    const json final_choice = {
-                                        { "index", 0 }, { "delta", json::object() }, { "finish_reason", finish }
-                                    };
-                                    if (!write("data: " + common_chunk(final_choice) + "\n\n")) {
+                                if (anthropic_api) {
+                                    if (!parse_stream_output &&
+                                        !write(anthropic_sse("content_block_stop", {
+                                            { "type", "content_block_stop" }, { "index", 0 }
+                                        }))) {
                                         return abort();
                                     }
-                                } else if (openai_text) {
-                                    const json final_choice = {
-                                        { "index", 0 }, { "text", "" }, { "logprobs", nullptr },
-                                        { "finish_reason", finish }
-                                    };
-                                    if (!write("data: " + common_chunk(final_choice) + "\n\n")) {
+                                    const std::string anthropic_finish = !parsed.tool_calls.empty()
+                                        ? "tool_use"
+                                        : stopped ? "stop_sequence"
+                                        : generated.size() < n_predict ? "end_turn" : "max_tokens";
+                                    const std::string stop_sequence =
+                                        stop_sequence_at(generated_text, stop_offset, stops);
+                                    if (!write(anthropic_sse("message_delta", {
+                                        { "type", "message_delta" },
+                                        { "delta", {
+                                            { "stop_reason", anthropic_finish },
+                                            { "stop_sequence", stop_sequence.empty()
+                                                ? nullptr : json(stop_sequence) }
+                                        } },
+                                        { "usage", { { "output_tokens", generated.size() },
+                                                     { "cache_read_input_tokens", 0 } } }
+                                    }))) {
                                         return abort();
                                     }
-                                }
-                                if (include_usage) {
-                                    const json usage_chunk = {
-                                        { "id", id },
-                                        { "object", chat ? "chat.completion.chunk" : "text_completion" },
-                                        { "created", created }, { "model", model_name },
-                                        { "choices", json::array() },
-                                        { "usage", usage_json(prompt.size(), generated.size()) }
-                                    };
-                                    if (!write("data: " + usage_chunk.dump() + "\n\n")) {
+                                    if (!write(anthropic_sse("message_stop", {
+                                        { "type", "message_stop" }
+                                    }))) {
                                         return abort();
                                     }
-                                }
-                                if (!write("data: [DONE]\n\n")) {
-                                    return abort();
+                                } else {
+                                    if (chat) {
+                                        const json final_choice = {
+                                            { "index", 0 }, { "delta", json::object() }, { "finish_reason", finish }
+                                        };
+                                        if (!write("data: " + common_chunk(final_choice) + "\n\n")) {
+                                            return abort();
+                                        }
+                                    } else if (openai_text) {
+                                        const json final_choice = {
+                                            { "index", 0 }, { "text", "" }, { "logprobs", nullptr },
+                                            { "finish_reason", finish }
+                                        };
+                                        if (!write("data: " + common_chunk(final_choice) + "\n\n")) {
+                                            return abort();
+                                        }
+                                    }
+                                    if (include_usage) {
+                                        const json usage_chunk = {
+                                            { "id", id },
+                                            { "object", chat ? "chat.completion.chunk" : "text_completion" },
+                                            { "created", created }, { "model", model_name },
+                                            { "choices", json::array() },
+                                            { "usage", usage_json(prompt.size(), generated.size()) }
+                                        };
+                                        if (!write("data: " + usage_chunk.dump() + "\n\n")) {
+                                            return abort();
+                                        }
+                                    }
+                                    if (!write("data: [DONE]\n\n")) {
+                                        return abort();
+                                    }
                                 }
                                 sink.done();
-                                scheduler.release(slot);
-                                return true;
+                                return stream_release_slots();
                             } catch (const std::exception & exception) {
                                 std::fprintf(stderr, "potluck-server: streaming response failed: %s\n",
                                              exception.what());
@@ -1123,7 +1784,7 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                                 std::fprintf(stderr, "potluck-server: streaming response failed\n");
                                 return abort();
                             }
-                        });
+                        }, stream_resource_releaser);
                     return;
                 }
                 std::vector<std::vector<llama_token>> generated_choices;
@@ -1133,7 +1794,29 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                 generated_choices.resize(slots.size());
                 generated_logprobs_choices.resize(slots.size());
                 for (size_t i = 0; i < slots.size(); ++i) {
-                    scheduler.wait_done(slots[i]);
+                    while (!scheduler.wait_done(
+                            slots[i], std::chrono::milliseconds(250))) {
+                        if (abandon_disconnected()) {
+                            return;
+                        }
+                    }
+                    if (abandon_disconnected()) {
+                        return;
+                    }
+                    bool cancelled = false;
+                    {
+                        std::lock_guard<std::mutex> lock(slots[i]->mutex);
+                        cancelled = slots[i]->cancelled;
+                    }
+                    if (cancelled) {
+                        cancel_slots();
+                        response.status = 503;
+                        set_common_headers(response);
+                        response.set_content(
+                            error_json("request cancelled", "server_error").dump(),
+                            "application/json");
+                        return;
+                    }
                     std::lock_guard<std::mutex> lock(slots[i]->mutex);
                     generated_choices[i] = slots[i]->generated;
                     generated_logprobs_choices[i] = slots[i]->generated_logprobs;
@@ -1142,11 +1825,6 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                         error = slots[i]->error;
                     }
                 }
-                for (const auto & pending : slots) {
-                    scheduler.release(pending);
-                }
-                slots.clear();
-                slot.reset();
                 if (!error.empty()) {
                     throw std::runtime_error(error);
                 }
@@ -1202,7 +1880,31 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     }
                 }
                 json result;
-                if (chat) {
+                if (anthropic_api) {
+                    const json & first = choices.at(0);
+                    const json & message = first.at("message");
+                    const std::string finish_reason = first.value("finish_reason", std::string("stop"));
+                    const std::string stop_reason = finish_reason == "tool_calls"
+                        ? "tool_use"
+                        : finish_reason == "length" ? "max_tokens"
+                        : "end_turn";
+                    const std::string anthropic_stop_sequence =
+                        stop_sequence_at(render_tokens(vocab, generated_choices.front()),
+                                         stop_offsets.front(), stops);
+                    const std::string fallback = message.value("content", std::string());
+                    result = {
+                        { "id", id }, { "type", "message" }, { "role", "assistant" },
+                        { "model", model_name },
+                        { "content", anthropic_blocks_from_message(message, fallback) },
+                        { "stop_reason", anthropic_stop_sequence.empty()
+                            ? stop_reason : "stop_sequence" },
+                        { "stop_sequence", anthropic_stop_sequence.empty()
+                            ? nullptr : json(anthropic_stop_sequence) },
+                        { "usage", { { "input_tokens", prompt.size() },
+                                     { "output_tokens", completion_tokens },
+                                     { "cache_read_input_tokens", 0 } } }
+                    };
+                } else if (chat) {
                     result = {
                         { "id", id }, { "object", "chat.completion" }, { "created", created },
                         { "model", model_name }, { "choices", std::move(choices) },
@@ -1219,6 +1921,25 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     result = { { "content", first.at("text") },
                                { "n_predict", generated_choices.front().size() },
                                { "finish_reason", first.at("finish_reason") } };
+                }
+                if (request.is_connection_closed()) {
+                    log_disconnect();
+                    cancel_slots();
+                    response.status = 499;
+                    set_common_headers(response);
+                    return;
+                }
+                bool released = true;
+                for (const auto & pending : slots) {
+                    released = scheduler.release(pending) && released;
+                }
+                if (!released) {
+                    response.status = 503;
+                    set_common_headers(response);
+                    response.set_content(
+                        error_json("request cancelled", "server_error").dump(),
+                        "application/json");
+                    return;
                 }
                 set_common_headers(response);
                 response.set_content(result.dump(), "application/json");
@@ -1237,7 +1958,8 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
                     message == "missing messages" || message.rfind("invalid ", 0) == 0 ||
                     message.rfind("unsupported field:", 0) == 0 ||
                     message.rfind("unsupported stream_options field:", 0) == 0 ||
-                    message.rfind("unsupported combination:", 0) == 0;
+                    message.rfind("unsupported combination:", 0) == 0 ||
+                    message.rfind("unsupported content block:", 0) == 0;
                 response.status = client_error ? 400 : 503;
                 set_common_headers(response);
                 response.set_content(error_json(message, client_error ? "invalid_request_error" : "server_error").dump(),
@@ -1246,13 +1968,16 @@ void setup_http_routes(httplib::Server & server, ring_session & session,
         };
 
         server.Post("/completion", [handle](const httplib::Request & request, httplib::Response & response) {
-            handle(request, response, false, false);
+            handle(request, response, false, false, false);
         });
         server.Post("/v1/completions", [handle](const httplib::Request & request, httplib::Response & response) {
-            handle(request, response, false, true);
+            handle(request, response, false, true, false);
         });
         server.Post("/v1/chat/completions", [handle](const httplib::Request & request, httplib::Response & response) {
-            handle(request, response, true, false);
+            handle(request, response, true, false, false);
+        });
+        server.Post("/v1/messages", [handle](const httplib::Request & request, httplib::Response & response) {
+            handle(request, response, true, false, true);
         });
         server.set_error_handler([set_common_headers](const httplib::Request &, httplib::Response & response) {
             set_common_headers(response);

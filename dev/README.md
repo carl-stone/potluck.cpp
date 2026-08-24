@@ -18,14 +18,17 @@ Read these files in order before changing Potluck:
    decoding, quantized models, platforms, the CLI family, and manual workload.
 4. [`architecture.md`](architecture.md) — the required runtime, data flow,
    scheduling, window-loading, head-resource, and server design.
-5. [`open-questions.md`](open-questions.md) — the current implementation gaps,
-   removal targets, and end-to-end release gate.
-6. [`completion-goals.md`](completion-goals.md) - the three decided product
-   goals that still need implementation.
-7. [`parity-and-accuracy.md`](parity-and-accuracy.md) - evidence from the current
-   component checks and the limits of that evidence.
+5. [`definition-of-done.md`](definition-of-done.md) - the draft package
+   completion contract, product goals, and end-to-end proof.
+6. [`open-questions.md`](open-questions.md) - decisions that still need an
+   answer before the completion contract can become final.
+7. [`parity-and-accuracy.md`](parity-and-accuracy.md) - evidence from the
+   current component checks and the limits of that evidence.
 8. [`decisions/`](decisions/) - accepted architectural decisions and their
    supersession history.
+
+`completion-goals.md` remains as a link for older notes; edit the goals only in
+`definition-of-done.md`.
 
 Repository-wide agent and test rules are in [`../AGENTS.md`](../AGENTS.md).
 Dated component measurements are in

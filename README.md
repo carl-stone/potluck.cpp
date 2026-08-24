@@ -6,6 +6,9 @@
 devices through a resource-aware piped ring. The head exposes one
 OpenAI-compatible server and may also compute when current user activity leaves
 safe CPU, memory, and accelerator capacity.
+The server also has an Anthropic Messages compatibility route at
+`POST /v1/messages`. It is optional and is not part of the current Pi
+completion gate.
 
 ## Current product status
 
@@ -143,6 +146,28 @@ First contact accepts a new SSH host key into
 `$XDG_CONFIG_HOME/potluck/known_hosts` or `~/.config/potluck/known_hosts`.
 Later key changes fail closed.
 
+### Conversations and cancellation
+
+Requests without `X-Conversation-Id` are stateless. To keep a chat, send an
+ID with each request. IDs are 1 to 128 characters from
+`A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, `@`, `/`, and `-`. The client sends the
+full message history in each later request; Potluck does not reuse prompt KV
+state between turns yet.
+
+Each ID stays on one slot and sequence while it is retained. Only one live
+request is allowed for an ID. A new request for the same ID preempts the old
+request; the old request gets HTTP 503 with `request cancelled`. Idle
+conversation slots are evicted in least-recently-used order when all free
+unbound slots are in use. If no slot can serve a request, the server waits up
+to 30 seconds and returns HTTP 503.
+
+Closing a streamed or non-streamed request cancels its work. The scheduler
+acknowledges the cancellation and reclaims the slot after the ring clears its
+sequence. During a worker rebuild, new requests get HTTP 503 with a retry
+message. Conversation IDs and slot bindings remain available after the
+rebuild, but clients must still send their full history.
+
+
 The model is not stored in this repository. The engineering fixture is pinned
 to `ggml-org/Qwen3.5-0.8B-GGUF` (`Qwen3.5-0.8B-Q4_0.gguf`, SHA256 checked), and
 `scripts/fetch-model.sh` downloads and verifies it on demand. Override the pin
@@ -159,8 +184,8 @@ operating point is recorded in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 The 27B result is a measured operating point, not a speedup claim or a
 regression threshold. It includes automatic placement, repeated windows,
 model distribution, per-window synchronization, and streamed HTTP output.
-Component checks and one operating point do not establish full llama-server
-API parity.
+Component checks and one operating point do not establish the full Pi agent
+contract or broader llama-server API parity.
 
 Full benchmark commands and raw output: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
@@ -169,8 +194,8 @@ Full benchmark commands and raw output: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.m
 Small fixture checks establish token parity and component behavior. The
 supervised Gemma 3 27B run establishes integrated three-device operation and a
 measured performance point; it does not claim reference-token parity or a
-speedup ratio. Broader model architectures and full llama-server API parity
-remain outside this release baseline.
+speedup ratio. Broader model architectures and llama-server API parity beyond
+the required Pi contract remain outside this release baseline.
 
 ## Relationship to prima.cpp
 
@@ -210,7 +235,8 @@ The integrated implementation now covers the ADR 0010 feature baseline:
 - CURVE protects direct ring peers, and the HTTP API supports the accepted
   bearer-key and exact-origin controls for a trusted LAN.
 
-The remaining gaps are broader llama-server API parity, wider distributed
+The remaining gaps include the Pi agent HTTP contract described in
+`dev/definition-of-done.md`, broader llama-server API parity, wider distributed
 model and modality coverage, adaptive token-state migration after a worker
 change, and additional long-running multi-device acceptance measurements.
 These are separate release work, not alternate execution paths.

@@ -399,6 +399,17 @@ target_link_libraries(test-potluck-protocol PRIVATE
     potluck-distributed
     potluck-discovery
     cpp-httplib)
+llama_build_and_test(test-potluck-refresh.cpp)
+target_include_directories(test-potluck-refresh PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/tools/potluck-server
+    ${PROJECT_SOURCE_DIR}/common
+    ${PROJECT_SOURCE_DIR}/vendor)
+target_link_libraries(test-potluck-refresh PRIVATE
+    potluck-core
+    potluck-distributed
+    potluck-discovery
+    cpp-httplib)
 llama_build_and_test(test-potluck-probe.cpp ARGS $<TARGET_FILE:potluck-worker>)
 target_link_libraries(test-potluck-probe PRIVATE potluck-core)
 llama_build_and_test(test-potluck-transport.cpp)

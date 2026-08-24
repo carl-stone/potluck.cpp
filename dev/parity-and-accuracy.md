@@ -62,6 +62,28 @@ resilience, security, or full API parity.
 | Protocol and transport components | Direct ZeroMQ messages and worker protocol behavior pass their named checks | `run_all.sh`; component evidence only |
 | Full-model reference | Small-fixture output can be compared with a monolithic reference | Test-only accuracy evidence; product workers must not load a full model as a reference |
 
+
+## Conversation, cancellation, and recovery evidence on 2026-08-24
+
+The integrated Qwen3.5 0.8B two-worker gate passed with
+`POTLUCK_TEST_WORKER_LOSS=1 bash tests/potluck/test_server.sh 2 8
+127.0.0.1`. It exercised the direct piped ring, two conversation IDs, two
+turns per ID, streamed and non-streamed disconnects, same-ID preemption, and
+worker loss followed by ring rebuild. The gate observed isolated outputs,
+stable conversation slot and sequence values, one disconnect log per request,
+freed slots, a retryable rebuild response, the expected worker count, old
+worker exit, and successful follow-ups after rebuild.
+
+`test-potluck-refresh` passed its staged remote refresh cases: fresh install,
+checksum failure, staged probe failure, installed start failure with rollback,
+equal build, and foreign platform. The transaction keeps the live worker
+directory unchanged until staged files pass digest and probe checks.
+
+This is evidence for the local Qwen3.5 route and the refresh transaction
+fixture. Clients still send full prior history on each conversation turn.
+Prompt KV reuse, token-state migration after worker loss, full server restart,
+and broader Pi or llama-server API coverage remain unproven.
+
 The available backend checks remain subject to numerical differences. Exact
 greedy parity on CPU and Metal is useful fixture evidence; CUDA may choose a
 near-tie token. No such component result establishes automatic placement or
@@ -78,8 +100,8 @@ are recorded in `docs/BENCHMARKS.md`.
 The fixture establishes exact small-model behavior and nonzero speculative
 acceptance. The 27B runs establish integrated three-device operation,
 full-model window loading, per-window prefetch, and measured performance.
-Neither result claims the full llama-server API surface or a general model
-compatibility matrix.
+Neither result claims the full Pi agent contract, the full llama-server API
+surface, or a general model compatibility matrix.
 
 ## Inherited or unverified
 
@@ -90,8 +112,8 @@ These items remain outside the current named evidence:
 - Cross-machine token-state migration and safe retry after a worker change.
   The current recovery path is bounded and retryable, but it does not migrate
   an active sequence.
-- Broader llama-server HTTP parity, model management, embeddings, tools, and
-  multimodal behavior.
+- Broader llama-server HTTP parity beyond the Pi agent contract, model
+  management, embeddings, reranking, and multimodal behavior.
 - Longer platform-specific runs beyond the supervised 27B operating point.
 
 ## Architecture status

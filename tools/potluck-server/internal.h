@@ -21,7 +21,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
-#include <set>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -125,6 +125,7 @@ struct planned_worker {
     ring_worker ring;
     pid_t local_pid = -1;
     pid_t remote_ssh_pid = -1;
+    bool remote_launch_attempted = false;
 };
 
 struct ServerRing {
@@ -422,6 +423,7 @@ struct slot_speculative_config {
 struct scheduled_slot {
     uint32_t index = 0;
     int32_t seq = 0;
+    std::string conversation;
     slot_state state = slot_state::free;
     std::vector<llama_token> prompt;
     size_t prefill_offset = 0;
@@ -542,7 +544,6 @@ public:
             std::fflush(stdout);
         }
     }
-
     std::vector<std::shared_ptr<scheduled_slot>> acquire_many(
             const std::vector<llama_token> & prompt,
             uint32_t n_predict,
@@ -550,32 +551,102 @@ public:
             const std::vector<std::string> & stops,
             bool stream, bool chat,
             const std::string & id, uint64_t created,
-            size_t count) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        if (count == 0 || count > slots_.size() || stopping_ || recovery_exhausted_) {
-            return {};
-        }
-        const auto free_count = [&] {
-            size_t result = 0;
-            for (const auto & slot : slots_) {
-                std::lock_guard<std::mutex> slot_lock(slot->mutex);
-                result += slot->state == slot_state::free ? 1 : 0;
-            }
-            return result;
-        };
-        if (!work_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
-                return stopping_ || recovery_exhausted_ ||
-                       (!rebuilding_ && free_count() >= count);
-            }) || stopping_ || recovery_exhausted_) {
-            return {};
-        }
+            size_t count, const std::string & conversation = {},
+            const std::function<bool()> & disconnected = {}) {
+        std::vector<std::string> notes;
         std::vector<std::shared_ptr<scheduled_slot>> acquired;
-        acquired.reserve(count);
-        for (const auto & slot : slots_) {
-            std::lock_guard<std::mutex> slot_lock(slot->mutex);
-            if (slot->state != slot_state::free) {
-                continue;
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (count == 0 || count > slots_.size() || stopping_ || recovery_exhausted_ ||
+            (!conversation.empty() && count != 1) ||
+            (disconnected && disconnected())) {
+            lock.unlock();
+            print_notes(notes);
+            return {};
+        }
+
+        std::shared_ptr<scheduled_slot> bound_slot;
+        if (!conversation.empty()) {
+            auto binding = conversations_.find(conversation);
+            if (binding != conversations_.end()) {
+                if (binding->second.slot_index < slots_.size()) {
+                    bound_slot = slots_[binding->second.slot_index];
+                } else {
+                    conversations_.erase(binding);
+                }
             }
+            if (bound_slot != nullptr) {
+                bool free = false;
+                {
+                    std::lock_guard<std::mutex> slot_lock(bound_slot->mutex);
+                    free = bound_slot->state == slot_state::free && !bound_slot->needs_clear;
+                }
+                if (!free) {
+                    preempt_locked(bound_slot, notes);
+                }
+            }
+            const bool ready = work_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
+                if (stopping_ || recovery_exhausted_ ||
+                    (disconnected && disconnected())) {
+                    return true;
+                }
+                if (rebuilding_) {
+                    return false;
+                }
+                const auto current = conversations_.find(conversation);
+                if (current != conversations_.end() &&
+                    current->second.slot_index < slots_.size()) {
+                    const auto candidate = slots_[current->second.slot_index];
+                    std::lock_guard<std::mutex> slot_lock(candidate->mutex);
+                    return candidate->state == slot_state::free && !candidate->needs_clear;
+                }
+                return free_slots_locked(count).size() >= count;
+            });
+            if (!ready || stopping_ || recovery_exhausted_ ||
+                (disconnected && disconnected())) {
+                lock.unlock();
+                print_notes(notes);
+                return {};
+            }
+            binding = conversations_.find(conversation);
+            if (binding != conversations_.end() && binding->second.slot_index < slots_.size()) {
+                bound_slot = slots_[binding->second.slot_index];
+                std::lock_guard<std::mutex> slot_lock(bound_slot->mutex);
+                if (bound_slot->state == slot_state::free && !bound_slot->needs_clear) {
+                    acquired.push_back(bound_slot);
+                }
+            } else {
+                acquired = free_slots_locked(count);
+            }
+        } else {
+            const bool ready = work_cv_.wait_for(lock, std::chrono::seconds(30), [&] {
+                return stopping_ || recovery_exhausted_ ||
+                       (disconnected && disconnected()) ||
+                       (!rebuilding_ && free_slots_locked(count).size() >= count);
+            });
+            if (!ready || stopping_ || recovery_exhausted_ ||
+                (disconnected && disconnected())) {
+                lock.unlock();
+                print_notes(notes);
+                return {};
+            }
+            acquired = free_slots_locked(count);
+        }
+        if (acquired.size() != count) {
+            lock.unlock();
+            print_notes(notes);
+            return {};
+        }
+
+        for (const auto & slot : acquired) {
+            std::string owner;
+            {
+                std::lock_guard<std::mutex> slot_lock(slot->mutex);
+                owner = slot->conversation;
+            }
+            if (!owner.empty() && owner != conversation) {
+                drop_binding_locked(slot, notes);
+            }
+            std::lock_guard<std::mutex> slot_lock(slot->mutex);
             slot->prompt = prompt;
             slot->prefill_offset = 0;
             slot->n_predict = n_predict;
@@ -604,12 +675,29 @@ public:
             slot->release_when_finished = false;
             slot->callback_done = false;
             slot->state = slot_state::queued;
-            acquired.push_back(slot);
-            if (acquired.size() == count) {
-                break;
+            if (!conversation.empty()) {
+                slot->conversation = conversation;
+                auto & binding = conversations_[conversation];
+                if (binding.slot_index == slot->index && binding.turns != 0) {
+                    ++binding.turns;
+                } else {
+                    binding.slot_index = slot->index;
+                    binding.turns = 1;
+                }
+                binding.last_use = ++conversation_clock_;
+                notes.push_back(
+                    "potluck-server: conversation " + conversation +
+                    " slot " + std::to_string(slot->index) +
+                    " seq " + std::to_string(slot->seq) +
+                    " turn " + std::to_string(binding.turns) +
+                    " prompt " + std::to_string(prompt.size()));
+            } else {
+                slot->conversation.clear();
             }
         }
         work_cv_.notify_all();
+        lock.unlock();
+        print_notes(notes);
         return acquired;
     }
     bool rebuilding() const {
@@ -630,9 +718,15 @@ public:
         std::unique_lock<std::mutex> lock(slot->mutex);
         slot->cv.wait(lock, [&] { return slot->finished; });
     }
-    void wait_first(const std::shared_ptr<scheduled_slot> & slot) {
+    bool wait_done(const std::shared_ptr<scheduled_slot> & slot,
+                   std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(slot->mutex);
-        slot->cv.wait(lock, [&] {
+        return slot->cv.wait_for(lock, timeout, [&] { return slot->finished; });
+    }
+    bool wait_ready(const std::shared_ptr<scheduled_slot> & slot,
+                    std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(slot->mutex);
+        return slot->cv.wait_for(lock, timeout, [&] {
             return slot->cancelled || !slot->pieces.empty() || slot->finished;
         });
     }
@@ -662,6 +756,9 @@ public:
     }
     void cancel(const std::shared_ptr<scheduled_slot> & slot) {
         std::lock_guard<std::mutex> lock(slot->mutex);
+        if (slot->state == slot_state::free) {
+            return;
+        }
         slot->cancelled = true;
         slot->release_when_finished = true;
         slot->state = slot_state::cancelled;
@@ -670,13 +767,26 @@ public:
     }
     void acknowledge_cancel(const std::shared_ptr<scheduled_slot> & slot) {
         std::lock_guard<std::mutex> lock(slot->mutex);
+        if (slot->state == slot_state::free) {
+            return;
+        }
         slot->callback_done = true;
         slot->cv.notify_all();
         work_cv_.notify_all();
     }
-    void release(const std::shared_ptr<scheduled_slot> & slot) {
+    bool release(const std::shared_ptr<scheduled_slot> & slot) {
+        std::lock_guard<std::mutex> scheduler_lock(mutex_);
         {
             std::lock_guard<std::mutex> lock(slot->mutex);
+            if (slot->state == slot_state::free) {
+                return true;
+            }
+            if (slot->cancelled && slot->release_when_finished) {
+                slot->callback_done = true;
+                slot->cv.notify_all();
+                work_cv_.notify_all();
+                return false;
+            }
             slot->prompt.clear();
             slot->pieces.clear();
             slot->piece_logprobs.clear();
@@ -691,12 +801,21 @@ public:
             slot->needs_trim = false;
             slot->trim_to = -1;
             slot->n_decoded = 0;
+            slot->needs_clear = slot->ever_used;
             slot->cancelled = false;
             slot->release_when_finished = false;
             slot->callback_done = false;
             slot->state = slot_state::free;
+            if (!slot->conversation.empty()) {
+                const auto binding = conversations_.find(slot->conversation);
+                if (binding != conversations_.end() &&
+                    binding->second.slot_index == slot->index) {
+                    binding->second.last_use = ++conversation_clock_;
+                }
+            }
         }
         work_cv_.notify_all();
+        return true;
     }
 
     json health() const {
@@ -707,6 +826,7 @@ public:
                 { "index", slot->index },
                 { "state", slot_state_name(slot->state) },
                 { "n_decoded", slot->n_decoded },
+                { "conversation", slot->conversation },
             });
         }
         return output;
@@ -727,6 +847,88 @@ private:
                !speculative_config_.draft_model.empty() ||
                !speculative_config_.types.empty();
     }
+    void print_notes(const std::vector<std::string> & notes) const {
+        if (notes.empty()) {
+            return;
+        }
+        for (const std::string & note : notes) {
+            std::printf("%s\n", note.c_str());
+        }
+        std::fflush(stdout);
+    }
+    void preempt_locked(const std::shared_ptr<scheduled_slot> & slot,
+                        std::vector<std::string> & notes) {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        if (slot->state == slot_state::free) {
+            return;
+        }
+        if (!slot->cancelled && !slot->conversation.empty()) {
+            notes.push_back(
+                "potluck-server: conversation " + slot->conversation +
+                " preempted slot " + std::to_string(slot->index));
+        }
+        slot->cancelled = true;
+        slot->release_when_finished = true;
+        slot->state = slot_state::cancelled;
+        slot->cv.notify_all();
+        work_cv_.notify_all();
+    }
+    void drop_binding_locked(const std::shared_ptr<scheduled_slot> & slot,
+                             std::vector<std::string> & notes) {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        if (slot->conversation.empty()) {
+            return;
+        }
+        const std::string conversation = slot->conversation;
+        const auto binding = conversations_.find(conversation);
+        if (binding != conversations_.end() &&
+            binding->second.slot_index == slot->index) {
+            conversations_.erase(binding);
+        }
+        slot->conversation.clear();
+        notes.push_back(
+            "potluck-server: conversation " + conversation +
+            " dropped from slot " + std::to_string(slot->index));
+    }
+    std::vector<std::shared_ptr<scheduled_slot>> free_slots_locked(size_t count) const {
+        std::vector<std::shared_ptr<scheduled_slot>> result;
+        result.reserve(count);
+        std::vector<std::pair<uint64_t, std::shared_ptr<scheduled_slot>>> bound;
+        for (const auto & slot : slots_) {
+            if (slot->state != slot_state::free || slot->needs_clear) {
+                continue;
+            }
+            if (slot->conversation.empty()) {
+                result.push_back(slot);
+                if (result.size() == count) {
+                    return result;
+                }
+                continue;
+            }
+            uint64_t last_use = 0;
+            const auto binding = conversations_.find(slot->conversation);
+            if (binding != conversations_.end() &&
+                binding->second.slot_index == slot->index) {
+                last_use = binding->second.last_use;
+            }
+            bound.emplace_back(last_use, slot);
+        }
+        std::sort(bound.begin(), bound.end(),
+                  [](const auto & left, const auto & right) {
+                      if (left.first != right.first) {
+                          return left.first < right.first;
+                      }
+                      return left.second->index < right.second->index;
+                  });
+        for (const auto & entry : bound) {
+            result.push_back(entry.second);
+            if (result.size() == count) {
+                break;
+            }
+        }
+        return result;
+    }
+
     void ensure_speculator(const std::shared_ptr<scheduled_slot> & slot);
     void process_speculative_batch(const std::shared_ptr<scheduled_slot> & slot,
                                    const std::vector<int32_t> & positions,
@@ -998,16 +1200,7 @@ private:
             decode.size() + prefill_logits.size() + speculative_items.size());
         const int32_t clear_seq = clear_slot ? clear_slot->seq : -1;
         const auto batch_cancelled = [&]() {
-            if (is_stopping()) {
-                return true;
-            }
-            for (const auto & slot : selected) {
-                std::lock_guard<std::mutex> lock(slot->mutex);
-                if (slot->cancelled) {
-                    return true;
-                }
-            }
-            return false;
+            return is_stopping();
         };
         bool batch_started = false;
         const auto fail_selected = [&]() {
@@ -1094,11 +1287,16 @@ private:
             if (slot_positions.empty()) {
                 continue;
             }
+            bool cancelled_slot = false;
             bool prompt_complete = false;
             {
                 std::lock_guard<std::mutex> lock(slot->mutex);
+                cancelled_slot = slot->cancelled;
                 prompt_complete = slot->state == slot_state::prefill &&
                     slot->prefill_offset == slot->prompt.size();
+            }
+            if (cancelled_slot) {
+                continue;
             }
             if (slot->speculative != nullptr) {
                 const bool is_speculative = slot == speculative_slot;
@@ -1145,6 +1343,16 @@ private:
                      static_cast<uint32_t>(speculative_items[i].position),
                      logprobs_at(spec_start + i));
             }
+        }
+        for (const auto & slot : selected) {
+            std::lock_guard<std::mutex> lock(slot->mutex);
+            if (!slot->cancelled) {
+                continue;
+            }
+            slot->finished = true;
+            slot->state = slot_state::cancelled;
+            slot->error = "request cancelled";
+            slot->cv.notify_all();
         }
         for (const auto & slot : cancelled) {
             std::lock_guard<std::mutex> lock(slot->mutex);
@@ -1197,11 +1405,13 @@ private:
             if (slot->state == slot_state::free || slot->finished) {
                 continue;
             }
-            slot->cancelled = false;
-            slot->state = slot_state::done;
+            const bool cancelled = slot->cancelled;
+            slot->state = cancelled ? slot_state::cancelled : slot_state::done;
             slot->finished = true;
-            slot->error = error.empty() ? "ring recovery exhausted" : error;
-            slot->release_when_finished = false;
+            if (!cancelled) {
+                slot->cancelled = false;
+                slot->error = error.empty() ? "ring recovery exhausted" : error;
+            }
             slot->cv.notify_all();
         }
     }
@@ -1278,7 +1488,10 @@ private:
                         if (slot->state == slot_state::queued ||
                             slot->state == slot_state::prefill ||
                             slot->state == slot_state::decode ||
-                            (slot->state == slot_state::cancelled && !slot->finished)) {
+                            (slot->state == slot_state::cancelled &&
+                             (!slot->finished ||
+                              (slot->release_when_finished && slot->callback_done))) ||
+                            (slot->state == slot_state::free && slot->needs_clear)) {
                             return true;
                         }
                     }
@@ -1294,7 +1507,10 @@ private:
                     if (slot->state == slot_state::queued ||
                         slot->state == slot_state::prefill ||
                         slot->state == slot_state::decode ||
-                        (slot->state == slot_state::cancelled && !slot->finished)) {
+                        (slot->state == slot_state::cancelled &&
+                         (!slot->finished ||
+                          (slot->release_when_finished && slot->callback_done))) ||
+                        (slot->state == slot_state::free && slot->needs_clear)) {
                         slots_idle = false;
                         break;
                     }
@@ -1322,7 +1538,8 @@ private:
                             }
                         } else if (slot->state == slot_state::prefill ||
                                    slot->state == slot_state::decode ||
-                                   (slot->state == slot_state::cancelled && !slot->finished)) {
+                                   (slot->state == slot_state::cancelled && !slot->finished) ||
+                                   (slot->state == slot_state::free && slot->needs_clear)) {
                             active.push_back(slot);
                         }
                     }
@@ -1387,6 +1604,7 @@ private:
                 continue;
             }
             if (active.empty()) {
+                reap_cancelled();
                 if (heartbeat_) {
                     std::string heartbeat_error;
                     if (!heartbeat_(heartbeat_error)) {
@@ -1465,6 +1683,13 @@ private:
     bool rebuilding_ = false;
     bool recovery_exhausted_ = false;
     std::string recovery_error_;
+    struct conversation_binding {
+        uint32_t slot_index = 0;
+        uint64_t turns = 0;
+        uint64_t last_use = 0;
+    };
+    std::map<std::string, conversation_binding> conversations_;
+    uint64_t conversation_clock_ = 0;
     uint64_t jitter_state_ = 0x9e3779b97f4a7c15ull;
     mutable std::mutex mutex_;
     std::condition_variable work_cv_;

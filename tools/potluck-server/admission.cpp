@@ -21,7 +21,8 @@
 #include <memory>
 #include <mutex>
 #include <poll.h>
-#include <stdexcept>
+#include <set>
+#include <system_error>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1669,18 +1670,133 @@ bool refresh_remote_binaries(const bootstrap_node & bootstrap,
     if (!local_build_id.empty() && local_build_id == remote_build_id) {
         return true;
     }
-    const std::string mkdir = ssh + " " + target + " " +
-        shell_quote("mkdir -p ~/potluck");
-    if (std::system(mkdir.c_str()) != 0) {
+
+    std::vector<std::pair<std::string, std::string>> staged_files;
+    try {
+        std::error_code iteration_error;
+        for (const std::filesystem::directory_entry & entry :
+             std::filesystem::directory_iterator(stage_dir, iteration_error)) {
+            if (iteration_error) {
+                break;
+            }
+            if (entry.is_symlink() || !entry.is_regular_file()) {
+                throw std::runtime_error("staged payload contains a non-file entry");
+            }
+            staged_files.emplace_back(entry.path().filename().string(),
+                                      local_sha256(entry.path().string()));
+        }
+        if (iteration_error) {
+            throw std::system_error(iteration_error);
+        }
+    } catch (const std::exception & exception) {
+        std::fprintf(stderr, "potluck-server: cannot inspect staged payload on %s: %s\n",
+                     bootstrap.ssh_target.c_str(), exception.what());
+        return false;
+    }
+    std::sort(staged_files.begin(), staged_files.end());
+    if (staged_files.empty()) {
+        std::fprintf(stderr, "potluck-server: staged payload is empty on %s\n",
+                     bootstrap.ssh_target.c_str());
+        return false;
+    }
+
+    const auto cleanup_remote = [&] {
+        const std::string cleanup = ssh + " " + target + " " +
+            shell_quote("rm -rf ~/potluck/.incoming ~/potluck/.previous");
+        (void) std::system(cleanup.c_str());
+    };
+    const std::string prepare = ssh + " " + target + " " +
+        shell_quote("set -eu; mkdir -p ~/potluck; "
+                    "rm -rf ~/potluck/.incoming ~/potluck/.previous; "
+                    "mkdir -p ~/potluck/.incoming");
+    if (std::system(prepare.c_str()) != 0) {
         std::fprintf(stderr, "potluck-server: cannot prepare payload directory on %s\n",
                      bootstrap.ssh_target.c_str());
         return false;
     }
     const std::string rsync = "rsync -a --whole-file -e " + shell_quote(ssh) + " " +
         shell_quote((stage_dir.string() + "/")) + " " +
-        shell_quote(bootstrap.ssh_target + ":potluck/");
+        shell_quote(bootstrap.ssh_target + ":potluck/.incoming/");
     if (std::system(rsync.c_str()) != 0) {
+        cleanup_remote();
         std::fprintf(stderr, "potluck-server: cannot refresh worker binaries on %s\n",
+                     bootstrap.ssh_target.c_str());
+        return false;
+    }
+
+    std::string verify_inner = "set -eu; cd ~/potluck/.incoming || exit 1; ";
+    for (const auto & staged : staged_files) {
+        const std::string name = shell_quote(staged.first);
+        verify_inner += "expected=" + shell_quote(staged.second) + "; ";
+        verify_inner += "actual=\"$( ("
+            "sha256sum " + name + " 2>/dev/null || "
+            "shasum -a 256 " + name + " 2>/dev/null) | cut -d' ' -f1)\"; ";
+        verify_inner += "test \"$actual\" = \"$expected\"; ";
+    }
+    const std::string verify = ssh + " " + target + " " + shell_quote(verify_inner);
+    if (std::system(verify.c_str()) != 0) {
+        cleanup_remote();
+        std::fprintf(stderr, "potluck-server: staged payload checksum failed on %s\n",
+                     bootstrap.ssh_target.c_str());
+        return false;
+    }
+
+    const std::string staged_probe_inner =
+        "set -eu; cd ~/potluck || exit 1; "
+        "LD_LIBRARY_PATH=.incoming${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} "
+        "~/potluck/.incoming/potluck-worker --probe --probe-pressure";
+    const std::string staged_probe = ssh + " " + target + " " +
+        shell_quote(staged_probe_inner);
+    if (std::system(staged_probe.c_str()) != 0) {
+        cleanup_remote();
+        std::fprintf(stderr, "potluck-server: staged worker start check failed on %s\n",
+                     bootstrap.ssh_target.c_str());
+        return false;
+    }
+
+    std::string install_inner =
+        "set -eu; cd ~/potluck || exit 1; "
+        "rollback() { status=$?; trap - 0; restore_status=0; "
+        "if [ ! -e .previous/.complete ]; then "
+        "rm -rf .incoming .previous || true; exit \"$status\"; fi; ";
+    for (const auto & staged : staged_files) {
+        const std::string name = shell_quote(staged.first);
+        const std::string previous = ".previous/" + name;
+        install_inner +=
+            "if [ -e " + previous + " ] || [ -L " + previous + " ]; then "
+            "if ! mv -f " + previous + " " + name +
+            "; then restore_status=1; fi; "
+            "else if ! rm -f " + name +
+            "; then restore_status=1; fi; fi; ";
+    }
+    install_inner +=
+        "if [ \"$restore_status\" -eq 0 ]; then "
+        "rm -rf .incoming .previous || restore_status=1; "
+        "else rm -rf .incoming || true; fi; "
+        "if [ \"$restore_status\" -ne 0 ]; then "
+        "echo 'potluck: worker binary rollback failed; .previous was kept' >&2; "
+        "exit 1; fi; exit \"$status\"; }; "
+        "trap rollback 0; rm -rf .previous; mkdir -p .previous; ";
+    for (const auto & staged : staged_files) {
+        const std::string name = shell_quote(staged.first);
+        const std::string previous = ".previous/" + name;
+        install_inner +=
+            "if [ -e " + name + " ] || [ -L " + name + " ]; then "
+            "cp -p " + name + " " + previous + "; fi; ";
+    }
+    install_inner += "touch .previous/.complete; ";
+    for (const auto & staged : staged_files) {
+        const std::string name = shell_quote(staged.first);
+        install_inner += "mv -f .incoming/" + name + " " + name + "; ";
+    }
+    install_inner +=
+        "if ! (LD_LIBRARY_PATH=.${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} "
+        "~/potluck/potluck-worker --probe --probe-pressure); then exit 1; fi; "
+        "trap - 0; rm -rf .incoming .previous";
+    const std::string install = ssh + " " + target + " " +
+        shell_quote(install_inner);
+    if (std::system(install.c_str()) != 0) {
+        std::fprintf(stderr, "potluck-server: cannot install worker binaries on %s\n",
                      bootstrap.ssh_target.c_str());
         return false;
     }

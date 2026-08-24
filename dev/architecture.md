@@ -95,7 +95,8 @@ DNS-SD candidate discovery, bounded pre-launch profiling and admission,
 HiGHS-backed HALDA placement, automatic SSH launch, full-model distribution
 with checksum validation, per-window prefetch, speculative decoding, and
 the integrated completion CLI are implemented. Adaptive load changes,
-token-state migration, and full llama-server API parity remain unfinished.
+token-state migration, and the Pi agent HTTP contract remain unfinished;
+broader llama-server API parity is outside the required Pi contract.
 The accepted trusted-LAN security baseline is defined by
 [ADR 0009](decisions/0009-trusted-lan-curve-http-controls.md).
 
@@ -177,15 +178,30 @@ capacity-weighted heuristic alone does not satisfy the contract.
 ## OpenAI-compatible server
 
 The head is the sole client-facing endpoint. The product server must provide
-the documented OpenAI-compatible chat/completion, streaming, model, error,
-usage, sampling, stop, and cancellation behavior required by ordinary
-harnesses. Unsupported request fields must be rejected explicitly rather than
+the documented native Pi discovery routes, OpenAI-compatible Chat Completions
+and Responses APIs, streaming, model, error, usage, sampling, stop, tool,
+reasoning, and cancellation behavior required by ordinary clients and the Pi
+agent. Unsupported request fields must be rejected explicitly rather than
 ignored.
 
 Conversation slots and continuous batching are implemented in the integrated
 server path. Slots own bounded sequence state, cache affinity, isolation,
-cancellation, and lifecycle. The API surface and live failure migration remain
-smaller than the full llama.cpp server contract.
+cancellation, and lifecycle. The API surface remains smaller than the full
+llama.cpp server contract outside the required Pi agent behavior.
+
+The `X-Conversation-Id` header binds one live request to one slot and sequence.
+Clients send the complete prior message history on each later request because
+prompt KV state is cleared between turns. A second live request with the same
+ID preempts the first. A closed client connection cancels the request,
+acknowledges the ring sequence, and releases the slot. Idle bindings use LRU
+eviction only after unbound free slots are exhausted.
+
+Remote worker refresh stages files in an incoming directory, verifies every
+digest, probes the staged worker, and then installs it. The live worker stays
+usable until those checks pass. An installed start failure restores the
+previous files. A failed worker causes a bounded ring rebuild without that
+worker, and discovery can add it again on a later refresh.
+
 
 A completion CLI completes the potluck command family. `potluck-cli` offers
 prima-style interactive completion and chat over the same integrated ring
@@ -220,8 +236,9 @@ Implemented lifecycle and reliability behavior:
 - Ring workers use sequence-checked control heartbeats. A lost worker fails
   active work with a retryable result and triggers a bounded rebuild.
 
-The remaining product gaps are broader llama-server API parity, wider
-distributed model and modality coverage, and token-state migration after a
-worker change. These are not supported alternate architectures.
+The remaining product gaps are the Pi agent HTTP contract, broader llama-server
+API parity, wider distributed model and modality coverage, and token-state
+migration after a worker change. These are not supported alternate
+architectures.
 
 Product tests must exercise the integrated piped-ring server.

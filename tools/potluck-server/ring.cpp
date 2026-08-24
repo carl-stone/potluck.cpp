@@ -58,6 +58,12 @@ bool worker_process_alive(pid_t pid, const std::string & label, std::string & er
     return true;
 }
 
+bool remote_host_reachable(const bootstrap_node & bootstrap) {
+    const std::string command = ssh_options(bootstrap) + " " +
+        shell_quote(bootstrap.ssh_target) + " " + shell_quote("true");
+    return std::system(command.c_str()) == 0;
+}
+
 double host_cpu_load() {
     double loads[1] = {0.0};
     if (getloadavg(loads, 1) != 1) {
@@ -475,8 +481,13 @@ void stop_planned_workers(const std::vector<planned_worker> & planned) {
             (void) waitpid(plan.local_pid, &status, 0);
             continue;
         }
+        if (!plan.remote_launch_attempted) {
+            continue;
+        }
         (void) stop_remote_workers(plan.device.bootstrap);
-        terminate_child_process(plan.remote_ssh_pid);
+        if (plan.remote_ssh_pid > 0) {
+            terminate_child_process(plan.remote_ssh_pid);
+        }
     }
 }
 
@@ -1096,13 +1107,13 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
                 continue;
             }
             plan.model = remote_model.generic_string();
-            if (!stop_remote_workers(plan.device.bootstrap)) {
-                throw std::runtime_error("remote worker cleanup failed for " +
-                                         plan.device.bootstrap.ssh_target);
-            }
             if (has_staged_payload &&
                 !refresh_remote_binaries(plan.device.bootstrap, stage_dir, local_platform)) {
                 throw std::runtime_error("worker binary refresh failed for " +
+                                         plan.device.bootstrap.ssh_target);
+            }
+            if (!stop_remote_workers(plan.device.bootstrap)) {
+                throw std::runtime_error("remote worker cleanup failed for " +
                                          plan.device.bootstrap.ssh_target);
             }
             if (!distributed_models.insert(plan.device.bootstrap.ssh_target).second) {
@@ -1125,6 +1136,7 @@ bool bring_up_ring(ring_session & target, ring_startup_options & options,
         for (uint32_t index = 0; index < n_workers; ++index) {
             planned_worker & plan = planned[index];
             if (plan.kind == worker_kind::remote) {
+                plan.remote_launch_attempted = true;
                 plan.remote_ssh_pid = launch_remote_worker(plan.device.bootstrap, plan.model,
                                                            ring.workers[index],
                                                            ring.result_endpoint, index,
@@ -1184,6 +1196,31 @@ bool rebuild_ring(ring_session & session, ring_startup_options & options,
                   bool restore_on_failure, std::string & error) {
     ServerRing old_ring;
     std::vector<planned_worker> old_workers;
+    if (options.has_staged_payload) {
+        std::set<std::string> refreshed_targets;
+        std::vector<bootstrap_node> current_nodes;
+        {
+            std::lock_guard<std::mutex> lock(session.mutex);
+            for (const planned_worker & worker : session.workers) {
+                if (worker.kind == worker_kind::remote &&
+                    refreshed_targets.insert(worker.device.bootstrap.ssh_target).second) {
+                    current_nodes.push_back(worker.device.bootstrap);
+                }
+            }
+        }
+        for (const bootstrap_node & bootstrap : current_nodes) {
+            if (!refresh_remote_binaries(bootstrap, options.stage_dir,
+                                         options.local_platform)) {
+                if (remote_host_reachable(bootstrap)) {
+                    error = "worker binary refresh failed for " + bootstrap.ssh_target;
+                    return false;
+                }
+                std::fprintf(stderr,
+                             "potluck-server: worker refresh skipped for unavailable %s\n",
+                             bootstrap.ssh_target.c_str());
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(session.mutex);
         session.healthy = false;
@@ -1233,6 +1270,7 @@ bool rebuild_ring(ring_session & session, ring_startup_options & options,
         ring_startup_options rollback_options = options;
         rollback_options.hosts_spec = "existing-ring";
         rollback_options.bootstrap_nodes = &rollback_nodes;
+        rollback_options.has_staged_payload = false;
         ring_session restored;
         std::string restore_error;
         if (bring_up_ring(restored, rollback_options, restore_error)) {
@@ -1285,14 +1323,15 @@ topology_refresh_result refresh_ring_if_needed(ring_session & session,
         return topology_refresh_result::unchanged;
     }
     const std::set<std::string> responding_remote = probe_targets(valid);
+    bool changed = responding_remote != current_remote;
     for (const std::string & target : current_remote) {
         if (responding_remote.count(target) == 0) {
-            error = "topology pressure probe deferred for current worker " + target;
-            return topology_refresh_result::unchanged;
+            std::fprintf(stderr, "potluck-server: current worker unavailable: %s\n",
+                         target.c_str());
+            changed = true;
         }
     }
 
-    bool changed = responding_remote != current_remote;
     for (const device_probe & probe : valid) {
         const auto current = std::find_if(
             current_workers.begin(), current_workers.end(),

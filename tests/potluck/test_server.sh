@@ -30,6 +30,9 @@ SRV=""
 FIXED_SPLIT_ACTIVE=0
 SHUTDOWN_CURL_PID=""
 SHUTDOWN_READER_PID=""
+PREEMPT_PID=""
+STREAM_ABORT_PID=""
+NONSTREAM_ABORT_PID=""
 
 wait_pid_bounded() {
     local pid="$1"
@@ -85,13 +88,17 @@ stop_server() {
 }
 cleanup_background_requests() {
     local pid=""
-    for pid in "${SHUTDOWN_CURL_PID}" "${SHUTDOWN_READER_PID}"; do
+    for pid in "${SHUTDOWN_CURL_PID}" "${SHUTDOWN_READER_PID}" \
+               "${PREEMPT_PID}" "${STREAM_ABORT_PID}" "${NONSTREAM_ABORT_PID}"; do
         if [[ -n "${pid}" ]]; then
             terminate_pid_bounded "${pid}" 5 || true
         fi
     done
     SHUTDOWN_CURL_PID=""
     SHUTDOWN_READER_PID=""
+    PREEMPT_PID=""
+    STREAM_ABORT_PID=""
+    NONSTREAM_ABORT_PID=""
 }
 cleanup() {
     local rc=$?
@@ -319,6 +326,43 @@ result = json.loads(sys.argv[1])
 assert result["object"] == "chat.completion"
 assert result["choices"][0]["message"]["role"] == "assistant"
 PY
+ANTHROPIC=$(curl -fsS "${auth_header[@]}" -d \
+    "{\"model\":\"$(basename "${MODEL}")\",\"max_tokens\":3,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" \
+    "http://${HOST}:${PORT}/v1/messages")
+python3 - "${ANTHROPIC}" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["type"] == "message"
+assert result["role"] == "assistant"
+assert isinstance(result["content"], list) and result["content"]
+assert all(block["type"] in {"text", "thinking", "tool_use"} for block in result["content"])
+assert result["stop_reason"] in {"end_turn", "max_tokens", "stop_sequence", "tool_use"}
+assert result["usage"]["input_tokens"] > 0
+assert result["usage"]["output_tokens"] > 0
+PY
+ANTHROPIC_BAD_STATUS=$(curl -sS -o "${WORK}/anthropic-invalid.json" -w '%{http_code}' \
+    "${auth_header[@]}" -d \
+    "{\"model\":\"$(basename "${MODEL}")\",\"max_tokens\":\"three\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" \
+    "http://${HOST}:${PORT}/v1/messages")
+[[ "${ANTHROPIC_BAD_STATUS}" == 400 ]]
+python3 - "${WORK}/anthropic-invalid.json" <<'PY'
+import json, sys
+body = json.load(open(sys.argv[1]))
+assert body["error"]["type"] == "invalid_request_error", body
+PY
+ANTHROPIC_TOOL=$(curl -fsS "${auth_header[@]}" -d \
+    "{\"model\":\"$(basename "${MODEL}")\",\"max_tokens\":48,\"temperature\":0,\"thinking\":{\"type\":\"disabled\"},\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Paris? Use the weather tool.\"}],\"tools\":[{\"name\":\"weather\",\"description\":\"Get current weather for a city\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"weather\"}}" \
+    "http://${HOST}:${PORT}/v1/messages")
+python3 - "${ANTHROPIC_TOOL}" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result["stop_reason"] == "tool_use", result
+tool = next(block for block in result["content"] if block["type"] == "tool_use")
+assert tool["name"] == "weather"
+assert tool["input"]["city"] == "Paris"
+PY
+
+
 V1_COMPLETION=$(curl -fsS "${auth_header[@]}" \
     -d "{\"model\":\"$(basename "${MODEL}")\",\"prompt\":\"A short fact:\",\"max_completion_tokens\":4,\"n\":2,\"stop\":[\"\\n\"],\"temperature\":0,\"top_p\":1,\"top_k\":1,\"min_p\":0,\"presence_penalty\":0,\"frequency_penalty\":0,\"repeat_penalty\":1,\"repeat_last_n\":64,\"logprobs\":1}" \
     "http://${HOST}:${PORT}/v1/completions")
@@ -364,6 +408,151 @@ assert props["ready"] is True
 assert props["rebuilding"] is False
 assert props["slot_count"] == 4
 PY
+ALPHA_ID="chat.alpha"
+BETA_ID="chat.beta"
+ALPHA_MARKER="POTLUCK_ALPHA_MARKER_7F3A"
+BETA_MARKER="POTLUCK_BETA_MARKER_91C2"
+ALPHA_FOLLOWUP_MARKER="POTLUCK_ALPHA_FOLLOWUP_4A9D"
+BETA_FOLLOWUP_MARKER="POTLUCK_BETA_FOLLOWUP_5B0E"
+ALPHA_ONE_BODY="${WORK}/alpha-one.json"
+BETA_ONE_BODY="${WORK}/beta-one.json"
+curl -fsS -o "${ALPHA_ONE_BODY}" "${auth_header[@]}" -H "X-Conversation-Id: ${ALPHA_ID}" -d \
+    "{\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly ${ALPHA_MARKER} and nothing else.\"}],\"max_tokens\":32,\"temperature\":0,\"seed\":123,\"reasoning_effort\":\"none\"}" \
+    "http://${HOST}:${PORT}/v1/chat/completions" &
+ALPHA_ONE_PID=$!
+curl -fsS -o "${BETA_ONE_BODY}" "${auth_header[@]}" -H "X-Conversation-Id: ${BETA_ID}" -d \
+    "{\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly ${BETA_MARKER} and nothing else.\"}],\"max_tokens\":32,\"temperature\":0,\"seed\":123,\"reasoning_effort\":\"none\"}" \
+    "http://${HOST}:${PORT}/v1/chat/completions" &
+BETA_ONE_PID=$!
+wait "${ALPHA_ONE_PID}"
+wait "${BETA_ONE_PID}"
+ALPHA_ONE="$(<"${ALPHA_ONE_BODY}")"
+BETA_ONE="$(<"${BETA_ONE_BODY}")"
+ALPHA_TWO=$(curl -fsS "${auth_header[@]}" -H "X-Conversation-Id: ${ALPHA_ID}" -d \
+    "{\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly ${ALPHA_MARKER} and nothing else.\"},{\"role\":\"assistant\",\"content\":\"${ALPHA_MARKER}\"},{\"role\":\"user\",\"content\":\"Reply with exactly ${ALPHA_FOLLOWUP_MARKER} and nothing else.\"}],\"max_tokens\":32,\"temperature\":0,\"seed\":123,\"reasoning_effort\":\"none\"}" \
+    "http://${HOST}:${PORT}/v1/chat/completions")
+BETA_TWO=$(curl -fsS "${auth_header[@]}" -H "X-Conversation-Id: ${BETA_ID}" -d \
+    "{\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly ${BETA_MARKER} and nothing else.\"},{\"role\":\"assistant\",\"content\":\"${BETA_MARKER}\"},{\"role\":\"user\",\"content\":\"Reply with exactly ${BETA_FOLLOWUP_MARKER} and nothing else.\"}],\"max_tokens\":32,\"temperature\":0,\"seed\":123,\"reasoning_effort\":\"none\"}" \
+    "http://${HOST}:${PORT}/v1/chat/completions")
+python3 - "${ALPHA_ONE}" "${BETA_ONE}" "${ALPHA_TWO}" "${BETA_TWO}" \
+    "${ALPHA_MARKER}" "${BETA_MARKER}" \
+    "${ALPHA_FOLLOWUP_MARKER}" "${BETA_FOLLOWUP_MARKER}" <<'PY'
+import json, sys
+alpha_one, beta_one, alpha_two, beta_two = sys.argv[1:5]
+alpha_marker, beta_marker, alpha_followup, beta_followup = sys.argv[5:]
+for value, expected, other in (
+    (alpha_one, alpha_marker, beta_marker),
+    (beta_one, beta_marker, alpha_marker),
+    (alpha_two, alpha_followup, beta_followup),
+    (beta_two, beta_followup, alpha_followup),
+):
+    result = json.loads(value)
+    content = result["choices"][0]["message"]["content"]
+    assert content == expected, result
+    assert other not in content, result
+PY
+CONVERSATION_HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
+python3 - "${CONVERSATION_HEALTH}" "${ALPHA_ID}" "${BETA_ID}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+ids = set(sys.argv[2:])
+slots = [slot for slot in health["slots"] if slot["conversation"] in ids]
+assert len(slots) == 2, health
+assert {slot["conversation"] for slot in slots} == ids
+assert slots[0]["index"] != slots[1]["index"], slots
+PY
+STATELESS=$(curl -fsS "${auth_header[@]}" -d \
+    '{"prompt":"The capital of France is","n_predict":2}' \
+    "http://${HOST}:${PORT}/completion")
+python3 - "${STATELESS}" <<'PY'
+import json, sys
+result = json.loads(sys.argv[1])
+assert result.get("content")
+PY
+STATELESS_HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
+python3 - "${STATELESS_HEALTH}" "${ALPHA_ID}" "${BETA_ID}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+expected = set(sys.argv[2:])
+bound = {slot["conversation"] for slot in health["slots"] if slot["conversation"]}
+assert bound == expected, health
+PY
+INVALID_CONVERSATION_STATUS=$(curl -sS -o "${WORK}/invalid-conversation.json" -w '%{http_code}' \
+    "${auth_header[@]}" -H 'X-Conversation-Id: bad id' \
+    -d '{"prompt":"hello","n_predict":2}' "http://${HOST}:${PORT}/completion")
+[[ "${INVALID_CONVERSATION_STATUS}" == 400 ]]
+python3 - "${WORK}/invalid-conversation.json" <<'PY'
+import json, sys
+error = json.load(open(sys.argv[1]))["error"]
+assert error["type"] == "invalid_request_error"
+assert error["message"].startswith("invalid X-Conversation-Id:")
+PY
+BLANK_CONVERSATION_STATUS=$(python3 - "${HOST}" "${PORT}" "${WORK}/blank-conversation.json" <<'PY'
+import socket, sys
+
+host, port, output = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+body = b'{"prompt":"hello","n_predict":2}'
+request = (
+    f"POST /completion HTTP/1.1\r\nHost: {host}:{port}\r\n"
+    "Content-Type: application/json\r\nX-Conversation-Id:\r\n"
+    f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n"
+).encode() + body
+with socket.create_connection((host, port), timeout=10) as connection:
+    connection.sendall(request)
+    response = b""
+    while True:
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        response += chunk
+status = int(response.split(b" ", 2)[1])
+payload = response.split(b"\r\n\r\n", 1)[1]
+open(output, "wb").write(payload)
+print(status)
+PY
+)
+[[ "${BLANK_CONVERSATION_STATUS}" == 400 ]]
+python3 - "${WORK}/blank-conversation.json" <<'PY'
+import json, sys
+error = json.load(open(sys.argv[1]))["error"]
+assert error["type"] == "invalid_request_error"
+assert error["message"].startswith("invalid X-Conversation-Id:")
+PY
+LONG_CONVERSATION_ID="$(python3 - <<'PY'
+print("a" * 129)
+PY
+)"
+LONG_CONVERSATION_STATUS=$(curl -sS -o "${WORK}/long-conversation.json" -w '%{http_code}' \
+    "${auth_header[@]}" -H "X-Conversation-Id: ${LONG_CONVERSATION_ID}" \
+    -d '{"prompt":"hello","n_predict":2}' "http://${HOST}:${PORT}/completion")
+[[ "${LONG_CONVERSATION_STATUS}" == 400 ]]
+CONVERSATION_N_STATUS=$(curl -sS -o "${WORK}/conversation-n.json" -w '%{http_code}' \
+    "${auth_header[@]}" -H "X-Conversation-Id: ${ALPHA_ID}" \
+    -d '{"prompt":"hello","n":2}' "http://${HOST}:${PORT}/completion")
+[[ "${CONVERSATION_N_STATUS}" == 400 ]]
+python3 - "${WORK}/conversation-n.json" <<'PY'
+import json, sys
+error = json.load(open(sys.argv[1]))["error"]
+assert error["type"] == "invalid_request_error"
+assert error["message"].startswith("unsupported combination:")
+PY
+python3 - "${WORK}/server.log" "${ALPHA_ID}" "${BETA_ID}" <<'PY'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+pattern = re.compile(r"conversation (\S+) slot (\d+) seq (-?\d+) turn (\d+) prompt (\d+)")
+for conversation in sys.argv[2:]:
+    entries = [pattern.search(line) for line in text
+               if f"conversation {conversation} slot" in line]
+    entries = [entry for entry in entries if entry]
+    assert len(entries) >= 2, conversation
+    first = entries[:2]
+    assert {entry.group(1) for entry in first} == {conversation}
+    assert len({entry.group(2) for entry in first}) == 1, first
+    assert len({entry.group(3) for entry in first}) == 1, first
+    assert [int(entry.group(4)) for entry in first] == [1, 2], first
+    assert int(first[1].group(5)) > int(first[0].group(5)), first
+PY
+
 
 TOOL_CHAT=$(curl -fsS "${auth_header[@]}" -d \
     '{"messages":[{"role":"user","content":"Say hello"}],"max_tokens":2,"temperature":0,"tools":[{"type":"function","function":{"name":"lookup","description":"Look up a value","parameters":{"type":"object","properties":{"key":{"type":"string"}},"required":["key"]}}}],"tool_choice":"none","parallel_tool_calls":false}' \
@@ -884,7 +1073,90 @@ for (seq, rank), stream in streams.items():
 PY
 
 
+PREEMPT_ID="chat.preempt"
+PREEMPT_FIRST_BODY="${WORK}/preempt-first.json"
+PREEMPT_FIRST_STATUS_FILE="${WORK}/preempt-first.status"
+curl -sS -o "${PREEMPT_FIRST_BODY}" -w '%{http_code}' \
+    "${auth_header[@]}" -H "X-Conversation-Id: ${PREEMPT_ID}" \
+    -d '{"prompt":"Write a long continuation about the history of the Moon and its geology","n_predict":2048,"temperature":0}' \
+    "http://${HOST}:${PORT}/completion" >"${PREEMPT_FIRST_STATUS_FILE}" 2>"${WORK}/preempt-first.curl" &
+PREEMPT_PID=$!
+PREEMPT_SLOT=""
+for _ in $(seq 1 120); do
+    CURRENT_HEALTH="$(curl -fsS "http://${HOST}:${PORT}/health" 2>/dev/null || true)"
+    if PREEMPT_SLOT="$(python3 - "${CURRENT_HEALTH}" "${PREEMPT_ID}" 2>/dev/null <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+conversation = sys.argv[2]
+for slot in health["slots"]:
+    if slot["conversation"] == conversation and slot["state"] != "free":
+        print(slot["index"])
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)"; then
+        break
+    fi
+    sleep 0.1
+done
+[[ -n "${PREEMPT_SLOT}" ]] || {
+    printf 'preemption request never became active\n' >&2
+    exit 1
+}
+PREEMPT_SECOND_STATUS=$(curl -sS -o "${WORK}/preempt-second.json" -w '%{http_code}' \
+    "${auth_header[@]}" -H "X-Conversation-Id: ${PREEMPT_ID}" \
+    -d '{"prompt":"Give one short fact about the Moon","n_predict":4,"temperature":0}' \
+    "http://${HOST}:${PORT}/completion")
+[[ "${PREEMPT_SECOND_STATUS}" == 200 ]]
+if ! wait_pid_exit_bounded "${PREEMPT_PID}" 120; then
+    printf 'preemption request did not exit after replacement\n' >&2
+    terminate_pid_bounded "${PREEMPT_PID}" 5 || true
+fi
+PREEMPT_PID=""
+[[ "$(<"${PREEMPT_FIRST_STATUS_FILE}")" == 503 ]]
+python3 - "${PREEMPT_FIRST_BODY}" "${WORK}/preempt-second.json" <<'PY'
+import json, sys
+first = json.load(open(sys.argv[1]))
+second = json.load(open(sys.argv[2]))
+assert first["error"]["message"] == "request cancelled", first
+assert first["error"]["type"] == "server_error", first
+assert second.get("content"), second
+PY
+grep -q "conversation ${PREEMPT_ID} preempted slot ${PREEMPT_SLOT}" "${WORK}/server.log"
+PREEMPT_AFTER_HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
+python3 - "${PREEMPT_AFTER_HEALTH}" "${PREEMPT_ID}" "${PREEMPT_SLOT}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+conversation, expected = sys.argv[2], int(sys.argv[3])
+slots = [slot for slot in health["slots"] if slot["conversation"] == conversation]
+assert len(slots) == 1, health
+assert slots[0]["index"] == expected, slots
+
+PY
 if [[ "${POTLUCK_TEST_WORKER_LOSS:-0}" == 1 ]]; then
+    RECOVERY_ALPHA_ID="chat.recovery.alpha"
+    RECOVERY_BETA_ID="chat.recovery.beta"
+    RECOVERY_ALPHA_BODY="${WORK}/recovery-alpha.json"
+    RECOVERY_BETA_BODY="${WORK}/recovery-beta.json"
+    curl -fsS -o "${RECOVERY_ALPHA_BODY}" "${auth_header[@]}" \
+        -H "X-Conversation-Id: ${RECOVERY_ALPHA_ID}" \
+        -d '{"prompt":"Remember the recovery alpha marker","n_predict":4,"temperature":0}' \
+        "http://${HOST}:${PORT}/completion" &
+    RECOVERY_ALPHA_PID=$!
+    curl -fsS -o "${RECOVERY_BETA_BODY}" "${auth_header[@]}" \
+        -H "X-Conversation-Id: ${RECOVERY_BETA_ID}" \
+        -d '{"prompt":"Remember the recovery beta marker","n_predict":4,"temperature":0}' \
+        "http://${HOST}:${PORT}/completion" &
+    RECOVERY_BETA_PID=$!
+    wait "${RECOVERY_ALPHA_PID}"
+    wait "${RECOVERY_BETA_PID}"
+    python3 "${RECOVERY_ALPHA_BODY}" "${RECOVERY_BETA_BODY}" <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    assert json.load(open(path)).get("content"), path
+PY
+    REBUILD_CONVERSATION_HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
+    REBUILD_SUCCESSES_BEFORE=$(grep -c 'ring rebuild succeeded' "${WORK}/server.log" || true)
     WORKER_PID="$(pgrep -P "${SRV}" -f '[p]otluck-worker' | sed -n '1p')"
     [[ -n "${WORKER_PID}" ]] || {
         printf 'worker-loss gate could not find a child worker\n' >&2
@@ -904,16 +1176,72 @@ assert body["error"]["type"] == "server_error"
 assert "retry" in error.lower(), error
 PY
     for _ in $(seq 1 60); do
-        grep -q 'ring rebuild succeeded' "${WORK}/server.log" && break
+        REBUILD_SUCCESSES_NOW=$(grep -c 'ring rebuild succeeded' "${WORK}/server.log" || true)
+        if (( REBUILD_SUCCESSES_NOW > REBUILD_SUCCESSES_BEFORE )); then
+            break
+        fi
         sleep 0.5
     done
-    grep -q 'ring rebuild succeeded' "${WORK}/server.log"
+    REBUILD_SUCCESSES_NOW=$(grep -c 'ring rebuild succeeded' "${WORK}/server.log" || true)
+    (( REBUILD_SUCCESSES_NOW > REBUILD_SUCCESSES_BEFORE ))
     RECOVERY_HEALTH=$(curl -fsS "http://${HOST}:${PORT}/health")
     python3 - "${RECOVERY_HEALTH}" <<'PY'
 import json, sys
 health = json.loads(sys.argv[1])
 assert health["status"] == "ok", health
-assert health["workers"] >= 1, health
+assert health["workers"] == 2, health
+assert len(health["windows"]) == 2, health
+PY
+    for _ in $(seq 1 20); do
+        if ! kill -0 "${WORKER_PID}" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if kill -0 "${WORKER_PID}" 2>/dev/null; then
+        printf 'worker-loss gate left the stopped worker alive: %s\n' "${WORKER_PID}" >&2
+        exit 1
+    fi
+    RECOVERY_ALPHA=$(curl -fsS "${auth_header[@]}" \
+        -H "X-Conversation-Id: ${RECOVERY_ALPHA_ID}" \
+        -d '{"prompt":"Remember the recovery alpha marker. Continue the recovery alpha conversation","n_predict":4,"temperature":0}' \
+        "http://${HOST}:${PORT}/completion")
+    RECOVERY_BETA=$(curl -fsS "${auth_header[@]}" \
+        -H "X-Conversation-Id: ${RECOVERY_BETA_ID}" \
+        -d '{"prompt":"Remember the recovery beta marker. Continue the recovery beta conversation","n_predict":4,"temperature":0}' \
+        "http://${HOST}:${PORT}/completion")
+    python3 - "${RECOVERY_ALPHA}" "${RECOVERY_BETA}" <<'PY'
+import json, sys
+for value in sys.argv[1:]:
+    assert json.loads(value).get("content"), value
+PY
+    RECOVERY_HEALTH_WITH_CONVERSATIONS=$(curl -fsS "http://${HOST}:${PORT}/health")
+    python3 - "${REBUILD_CONVERSATION_HEALTH}" "${RECOVERY_HEALTH_WITH_CONVERSATIONS}" \
+        "${RECOVERY_ALPHA_ID}" "${RECOVERY_BETA_ID}" <<'PY'
+import json, sys
+before = json.loads(sys.argv[1])
+after = json.loads(sys.argv[2])
+def slot_for(health, conversation):
+    matches = [slot["index"] for slot in health["slots"]
+               if slot["conversation"] == conversation]
+    assert len(matches) == 1, (conversation, health)
+    return matches[0]
+for conversation in sys.argv[3:]:
+    assert slot_for(before, conversation) == slot_for(after, conversation)
+PY
+    python3 - "${WORK}/server.log" "${RECOVERY_ALPHA_ID}" "${RECOVERY_BETA_ID}" <<'PY'
+import re, sys
+pattern = re.compile(r"conversation (\S+) slot (\d+) seq (-?\d+) turn (\d+) prompt (\d+)")
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+for conversation in sys.argv[2:]:
+    entries = [pattern.search(line) for line in lines
+               if f"conversation {conversation} slot" in line]
+    entries = [entry for entry in entries if entry]
+    assert len(entries) == 2, entries
+    assert [int(entry.group(4)) for entry in entries] == [1, 2], entries
+    assert len({entry.group(2) for entry in entries}) == 1, entries
+    assert len({entry.group(3) for entry in entries}) == 1, entries
+    assert int(entries[1].group(5)) > int(entries[0].group(5)), entries
 PY
 fi
 
@@ -941,7 +1269,174 @@ assert lines and lines[-1] == "[DONE]"
 chunks = [json.loads(line) for line in lines[:-1]]
 assert chunks and "".join(c.get("content", "") for c in chunks)
 PY
+ANTHROPIC_SSE=$(curl -fsS -N "${auth_header[@]}" -d \
+    "{\"model\":\"$(basename "${MODEL}")\",\"max_tokens\":3,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" \
+    "http://${HOST}:${PORT}/v1/messages")
+python3 - "${ANTHROPIC_SSE}" <<'PY'
+import json, sys
+events = []
+current = None
+for line in sys.argv[1].splitlines():
+    if line.startswith("event: "):
+        current = line[7:]
+    elif line.startswith("data: ") and current:
+        events.append((current, json.loads(line[6:])))
+        current = None
+names = [name for name, _ in events]
+assert names[0] == "message_start"
+assert "content_block_start" in names
+assert "content_block_delta" in names
+assert "content_block_stop" in names
+assert names[-2:] == ["message_delta", "message_stop"], names
+message_start = events[0][1]["message"]
+assert message_start["type"] == "message"
+assert message_start["role"] == "assistant"
+assert events[-2][1]["delta"]["stop_reason"] in {"end_turn", "max_tokens", "stop_sequence", "tool_use"}
+PY
 
+
+
+STREAM_ABORT_ID="abort.stream"
+STREAM_ABORT_OUTPUT="${WORK}/stream-abort.sse"
+curl -sS -N "${auth_header[@]}" -H "X-Conversation-Id: ${STREAM_ABORT_ID}" -d \
+    '{"prompt":"Write a long sentence about the Moon and its history","n_predict":512,"stream":true}' \
+    "http://${HOST}:${PORT}/completion" >"${STREAM_ABORT_OUTPUT}" 2>"${WORK}/stream-abort.curl" &
+STREAM_ABORT_PID=$!
+STREAM_ABORT_SLOT=""
+for _ in $(seq 1 120); do
+    if grep -q '^data: ' "${STREAM_ABORT_OUTPUT}" 2>/dev/null; then
+        CURRENT_HEALTH="$(curl -fsS "http://${HOST}:${PORT}/health" 2>/dev/null || true)"
+        if STREAM_ABORT_SLOT="$(python3 - "${CURRENT_HEALTH}" "${STREAM_ABORT_ID}" 2>/dev/null <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+conversation = sys.argv[2]
+for slot in health["slots"]:
+    if slot["conversation"] == conversation and slot["state"] != "free":
+        print(slot["index"])
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)"; then
+            break
+        fi
+    fi
+    sleep 0.1
+done
+[[ -n "${STREAM_ABORT_SLOT}" ]] || {
+    printf 'stream abort request never became active\n' >&2
+    exit 1
+}
+kill "${STREAM_ABORT_PID}" 2>/dev/null || true
+wait "${STREAM_ABORT_PID}" || true
+STREAM_ABORT_PID=""
+STREAM_ABORT_FREE=0
+for _ in $(seq 1 120); do
+    ABORT_HEALTH="$(curl -fsS "http://${HOST}:${PORT}/health" 2>/dev/null || true)"
+    if python3 - "${ABORT_HEALTH}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+assert all(slot["state"] == "free" for slot in health["slots"])
+PY
+    then
+        STREAM_ABORT_FREE=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "${STREAM_ABORT_FREE}" == 1 ]]
+STREAM_ABORT_FOLLOWUP=$(curl -fsS "${auth_header[@]}" \
+    -H "X-Conversation-Id: ${STREAM_ABORT_ID}" \
+    -d '{"prompt":"Give one short fact about the Moon","n_predict":4,"temperature":0}' \
+    "http://${HOST}:${PORT}/completion")
+python3 - "${STREAM_ABORT_FOLLOWUP}" "${HOST}" <<'PY'
+import json, sys
+assert json.loads(sys.argv[1]).get("content")
+PY
+STREAM_ABORT_AFTER=$(curl -fsS "http://${HOST}:${PORT}/health")
+python3 - "${STREAM_ABORT_AFTER}" "${STREAM_ABORT_ID}" "${STREAM_ABORT_SLOT}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+conversation, expected = sys.argv[2], int(sys.argv[3])
+slots = [slot for slot in health["slots"] if slot["conversation"] == conversation]
+assert len(slots) == 1, health
+assert slots[0]["index"] == expected, slots
+PY
+
+NONSTREAM_ABORT_ID="abort.nonstream"
+NONSTREAM_ABORT_BODY="${WORK}/nonstream-abort.json"
+NONSTREAM_ABORT_STATUS_FILE="${WORK}/nonstream-abort.status"
+curl -sS --max-time 2 -o "${NONSTREAM_ABORT_BODY}" -w '%{http_code}' \
+    "${auth_header[@]}" -H "X-Conversation-Id: ${NONSTREAM_ABORT_ID}" \
+    -d '{"prompt":"Write a very long detailed history of the Moon and its geology","n_predict":2048,"temperature":0}' \
+    "http://${HOST}:${PORT}/completion" >"${NONSTREAM_ABORT_STATUS_FILE}" 2>"${WORK}/nonstream-abort.curl" &
+NONSTREAM_ABORT_PID=$!
+NONSTREAM_ABORT_SLOT=""
+for _ in $(seq 1 40); do
+    CURRENT_HEALTH="$(curl -fsS "http://${HOST}:${PORT}/health" 2>/dev/null || true)"
+    if NONSTREAM_ABORT_SLOT="$(python3 - "${CURRENT_HEALTH}" "${NONSTREAM_ABORT_ID}" 2>/dev/null <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+conversation = sys.argv[2]
+for slot in health["slots"]:
+    if slot["conversation"] == conversation and slot["state"] != "free":
+        print(slot["index"])
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+)"; then
+        break
+    fi
+    sleep 0.1
+done
+[[ -n "${NONSTREAM_ABORT_SLOT}" ]] || {
+    printf 'non-stream abort request never became active\n' >&2
+    exit 1
+}
+NONSTREAM_ABORT_RC=0
+wait "${NONSTREAM_ABORT_PID}" || NONSTREAM_ABORT_RC=$?
+NONSTREAM_ABORT_PID=""
+[[ "${NONSTREAM_ABORT_RC}" -ne 0 ]]
+NONSTREAM_ABORT_FREE=0
+for _ in $(seq 1 120); do
+    ABORT_HEALTH="$(curl -fsS "http://${HOST}:${PORT}/health" 2>/dev/null || true)"
+    if python3 - "${ABORT_HEALTH}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+assert all(slot["state"] == "free" for slot in health["slots"])
+PY
+    then
+        NONSTREAM_ABORT_FREE=1
+        break
+    fi
+    sleep 0.25
+done
+[[ "${NONSTREAM_ABORT_FREE}" == 1 ]]
+NONSTREAM_ABORT_FOLLOWUP=$(curl -fsS "${auth_header[@]}" \
+    -H "X-Conversation-Id: ${NONSTREAM_ABORT_ID}" \
+    -d '{"prompt":"Give one short fact about the Moon","n_predict":4,"temperature":0}' \
+    "http://${HOST}:${PORT}/completion")
+python3 - "${NONSTREAM_ABORT_FOLLOWUP}" <<'PY'
+import json, sys
+assert json.loads(sys.argv[1]).get("content")
+PY
+NONSTREAM_ABORT_AFTER=$(curl -fsS "http://${HOST}:${PORT}/health")
+python3 - "${NONSTREAM_ABORT_AFTER}" "${NONSTREAM_ABORT_ID}" "${NONSTREAM_ABORT_SLOT}" <<'PY'
+import json, sys
+health = json.loads(sys.argv[1])
+conversation, expected = sys.argv[2], int(sys.argv[3])
+slots = [slot for slot in health["slots"] if slot["conversation"] == conversation]
+assert len(slots) == 1, health
+assert slots[0]["index"] == expected, slots
+PY
+python3 - "${WORK}/server.log" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+markers = [
+    line for line in text.splitlines()
+    if "client disconnected; cancelled request " in line
+]
+assert len(markers) == 2, markers
+PY
 
 SHUTDOWN_PIPE="${WORK}/shutdown.pipe"
 SHUTDOWN_READY="${WORK}/shutdown.ready"
@@ -1073,6 +1568,16 @@ import json, sys
 body = json.loads(sys.argv[1])
 assert isinstance(body["content"], str) and body["content"]
 assert body["finish_reason"] in {"stop", "length"}
+PY
+AUTH_ANTHROPIC=$(curl -fsS "${AUTH_JSON_HEADERS[@]}" -H "x-api-key: ${AUTH_KEY}" -d \
+    "{\"model\":\"$(basename "${MODEL}")\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}" \
+    "${AUTH_BASE}/v1/messages")
+python3 - "${AUTH_ANTHROPIC}" <<'PY'
+import json, sys
+body = json.loads(sys.argv[1])
+assert body["type"] == "message"
+assert body["role"] == "assistant"
+assert body["content"]
 PY
 AUTH_NOT_FOUND_STATUS=$(curl -sS -o "${WORK}/auth-valid-not-found.json" -w '%{http_code}' \
     "${AUTH_HEADERS[@]}" "${AUTH_BASE}/not-found")
